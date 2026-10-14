@@ -20,7 +20,7 @@ import { runWorkflowBootSweep } from "../src/domain/workflow-boot-sweep.js";
 import { makeEnsureStuckExceptionItem } from "../src/domain/workflow-exception-escalation.js";
 import { WORKFLOW_STEP_STUCK_THRESHOLD_SECONDS } from "../src/domain/workflow-deadline.js";
 import { SliceIndexer } from "../src/domain/slices/slice-indexer.js";
-import { normalizeWorkflowScope, workflowScopeTags, WorkflowScopeError } from "../src/domain/workflow-scope.js";
+import { normalizeWorkflowScope, readInstanceScope, workflowScopeTags, WorkflowScopeError } from "../src/domain/workflow-scope.js";
 import { workflowRoutes } from "../src/routes/workflow.js";
 
 const SCOPE = { project: "p1", mission: "m1", slice: "01-s1" };
@@ -149,6 +149,46 @@ describe("workflow scope tags", () => {
       expect(() => normalizeWorkflowScope({ tags: ["a,b"] })).toThrow(WorkflowScopeError);
       expect(() => normalizeWorkflowScope({ tags: ["has space"] })).toThrow(WorkflowScopeError);
       expect(() => normalizeWorkflowScope({ tags: ["project:"] })).toThrow(WorkflowScopeError);
+    });
+  });
+
+  describe("readInstanceScope", () => {
+    it("reads the stored scope", async () => {
+      const inst = await instantiate(spec(PIPELINE), { ...SCOPE, tags: ["ticket-7"] });
+      expect(readInstanceScope(db, inst.instance.instanceId)).toEqual({ scope: { ...SCOPE, tags: ["ticket-7"] } });
+    });
+
+    it("is unscoped for an instance with no scope, or no such instance", async () => {
+      const inst = await instantiate(spec(PIPELINE));
+      expect(readInstanceScope(db, inst.instance.instanceId)).toEqual({ scope: null });
+      expect(readInstanceScope(db, "no-such-instance")).toEqual({ scope: null });
+    });
+
+    it("is unscoped on a fixture database that has no scope_json column", () => {
+      const legacy = createDb();
+      try {
+        legacy.exec(`CREATE TABLE workflow_instances (instance_id TEXT PRIMARY KEY)`);
+        legacy.prepare(`INSERT INTO workflow_instances (instance_id) VALUES ('wi-1')`).run();
+        expect(readInstanceScope(legacy, "wi-1")).toEqual({ scope: null });
+      } finally {
+        legacy.close();
+      }
+    });
+
+    it("throws on malformed scope_json instead of reading it as unscoped", async () => {
+      const inst = await instantiate(spec(PIPELINE), SCOPE);
+      db.prepare(`UPDATE workflow_instances SET scope_json = '{not json' WHERE instance_id = ?`).run(inst.instance.instanceId);
+      expect(() => readInstanceScope(db, inst.instance.instanceId)).toThrow(SyntaxError);
+    });
+
+    it("throws when the query fails on a database that has the column", () => {
+      const broken = createDb();
+      try {
+        broken.exec(`CREATE TABLE workflow_instances (scope_json TEXT)`);
+        expect(() => readInstanceScope(broken, "wi-1")).toThrow(/instance_id/);
+      } finally {
+        broken.close();
+      }
     });
   });
 

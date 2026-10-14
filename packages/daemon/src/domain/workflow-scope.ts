@@ -4,6 +4,7 @@
 // Queue tab (exact project:<id> + slice:<id> match) lists them.
 
 import type Database from "better-sqlite3";
+import { detectInstanceColumn } from "./workflow-instance-store.js";
 
 export interface WorkflowScope {
   project?: string;
@@ -106,13 +107,11 @@ export function packetScopeTags(instance: { scope?: WorkflowScope | null }, step
   return workflowScopeTags(instance.scope, stepId ? (instance.scope?.stepSlices?.[stepId] ?? null) : null);
 }
 
-/** Read an instance's scope straight from the row (for code that holds only the db). */
+/** Read an instance's scope straight from the row (for code that holds only the db).
+ *  Fixture databases that skip the canonical migrations have no scope column and read as unscoped;
+ *  any other failure (a failed query, malformed scope_json) propagates, as it does on the store's read path. */
 export function readInstanceScope(db: Database.Database, instanceId: string): { scope: WorkflowScope | null } {
-  try {
-    const row = db.prepare(`SELECT scope_json FROM workflow_instances WHERE instance_id = ?`).get(instanceId) as { scope_json: string | null } | undefined;
-    return { scope: row?.scope_json ? (JSON.parse(row.scope_json) as WorkflowScope) : null };
-  } catch {
-    // Fixture databases that skip the canonical migrations have no scope column.
-    return { scope: null };
-  }
+  if (!detectInstanceColumn(db, "scope_json")) return { scope: null };
+  const row = db.prepare(`SELECT scope_json FROM workflow_instances WHERE instance_id = ?`).get(instanceId) as { scope_json: string | null } | undefined;
+  return { scope: row?.scope_json ? (JSON.parse(row.scope_json) as WorkflowScope) : null };
 }

@@ -50,7 +50,7 @@ interface InstanceRow {
  *  older test fixtures bypass the canonical migration list, so the
  *  version column (migration 049) may be absent; the guard degrades
  *  to legacy unguarded updates there. Production always migrates. */
-function detectInstanceColumn(db: Database.Database, columnName: string): boolean {
+export function detectInstanceColumn(db: Database.Database, columnName: string): boolean {
   try {
     return db
       .prepare("PRAGMA table_info(workflow_instances)")
