@@ -291,6 +291,75 @@ describe("queue routes", () => {
     expect(job).toMatchObject({ target_session: "b@r", interval_seconds: 45, state: "active" });
   });
 
+  describe("update --resolution", () => {
+    const update = (qitemId: string, body: Record<string, unknown>) => app.request(`/api/queue/${qitemId}/update`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+      body: JSON.stringify(body),
+    });
+    const show = async (qitemId: string) => (await app.request(`/api/queue/${qitemId}`)).json() as Promise<Record<string, any>>;
+    const claimed = async () => {
+      const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+      queueRepo.claim({ qitemId: row.qitemId, destinationSession: "b@r" });
+      return row;
+    };
+
+    it.each([
+      ["done", { closureReason: "no-follow-on" }],
+      ["canceled", {}],
+      ["denied", {}],
+      ["failed", {}],
+    ])("a %s close stores the resolution and show returns it", async (state, extra) => {
+      const row = await claimed();
+      const res = await update(row.qitemId, { state, ...extra, resolution: "Fixed in #42; verified on staging", transitionNote: "closing" });
+      expect(res.status).toBe(200);
+      expect((await res.json()).resolution).toBe("Fixed in #42; verified on staging");
+      expect(await show(row.qitemId)).toMatchObject({ state, resolution: "Fixed in #42; verified on staging" });
+    });
+
+    it.each(["in-progress", "blocked", "pending"])("is refused on a non-terminal update to %s, and nothing is written", async (state) => {
+      const row = await claimed();
+      const res = await update(row.qitemId, { state, resolution: "too early", blockedOn: state === "blocked" ? "external:x" : undefined, wakeAfterSeconds: state === "blocked" ? 60 : undefined, transitionNote: "n" });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("resolution_not_admitted");
+      expect(await show(row.qitemId)).toMatchObject({ state: "in-progress", resolution: null });
+    });
+
+    it("is refused on a note-only update and on a repeat of the row's closed state", async () => {
+      const row = await claimed();
+      expect((await update(row.qitemId, { transitionNote: "n", resolution: "r" })).status).toBe(400);
+      await update(row.qitemId, { state: "done", closureReason: "no-follow-on" });
+      expect((await update(row.qitemId, { state: "done", resolution: "late" })).status).toBe(400);
+      expect((await show(row.qitemId)).resolution).toBeNull();
+    });
+
+    it("is refused when blank, and a refused close leaves the row open", async () => {
+      const row = await claimed();
+      const res = await update(row.qitemId, { state: "done", closureReason: "no-follow-on", resolution: "   " });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("resolution_empty");
+      expect((await show(row.qitemId)).state).toBe("in-progress");
+    });
+
+    it("keeps a pod-fallback resolution and appends the closing resolution after it", async () => {
+      const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+      queueRepo.routeToFallback(row.qitemId, "c@r", "b@r unreachable");
+      expect((await show(row.qitemId)).resolution).toBe("fallback: b@r unreachable");
+      queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
+      const res = await app.request(`/api/queue/${row.qitemId}/update`, {
+        method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "c@r" },
+        body: JSON.stringify({ state: "done", closureReason: "no-follow-on", resolution: "Handled by c" }),
+      });
+      expect(res.status).toBe(200);
+      expect((await show(row.qitemId)).resolution).toBe("fallback: b@r unreachable\nHandled by c");
+    });
+
+    it("a close without --resolution leaves the column as it was", async () => {
+      const row = await claimed();
+      await update(row.qitemId, { state: "done", closureReason: "no-follow-on" });
+      expect((await show(row.qitemId)).resolution).toBeNull();
+    });
+  });
+
   // 0.5.1-54 DR-1 — the create-path failed-nudge surface (the NAMED, human/agent-visible read path).
   it("DR-1: GET /undelivered surfaces the failed-nudge pending strand, V1-only", async () => {
     const failed = await queueRepo.create({ sourceSession: "a@rig", destinationSession: "b@rig", body: "x" });

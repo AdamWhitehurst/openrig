@@ -343,6 +343,9 @@ export interface QueueUpdateInput {
   transitionNote?: string;
   closureReason?: string;
   closureTarget?: string;
+  /** The outcome text stored in queue_items.resolution with a terminal close. Appended after a
+   *  pod-fallback value the row already carries. */
+  resolution?: string;
   /**
    * PL-004 Phase D extension: when set, persists the queue_items.handed_off_to
    * column. Used by workflow-projector for state=handed-off transitions so
@@ -2482,6 +2485,7 @@ export class QueueRepository {
       const disallowed = input.reopen === true
         || input.closureReason != null
         || input.closureTarget != null
+        || input.resolution != null
         || input.handedOffTo != null
         || input.blockedOn != null
         || input.wakeWatchdogId != null
@@ -2525,6 +2529,16 @@ export class QueueRepository {
         "invalid_state",
         `state=${input.state} not valid; valid: ${QUEUE_STATES.join(", ")}`
       );
+    }
+    if (input.resolution != null && isBlockerLive(input.state)) {
+      throw new QueueRepositoryError(
+        "resolution_not_admitted",
+        `a resolution is stored with a close; the '${input.state}' transition leaves the row open. Close the item (--state done|canceled|denied|failed|handed-off) or drop --resolution.`,
+        { requestedState: input.state },
+      );
+    }
+    if (input.resolution != null && input.resolution.trim().length === 0) {
+      throw new QueueRepositoryError("resolution_empty", "--resolution needs text; nothing was written", {});
     }
     if ((input.wakeWatchdogId != null || input.wakeAfterSeconds != null) && input.state !== "blocked") {
       throw new QueueRepositoryError(
@@ -2830,6 +2844,11 @@ export class QueueRepository {
     // NULL. The prior `COALESCE(?, blocked_on)` preserved the blocker on every non-blocked
     // transition, leaving dead blockers that nothing audits (the root-cause strand).
     const nextBlockedOn = input.state === "blocked" ? effectiveBlockedOn : null;
+    // A pod-fallback reroute already put "fallback: <reason>" here; a closing resolution goes after it
+    // on its own line so neither is lost.
+    const nextResolution = input.resolution == null
+      ? qitem.resolution
+      : qitem.resolution ? `${qitem.resolution}\n${input.resolution}` : input.resolution;
     const notification = this.classifyOwnerNotification({
       action: "update",
       destinationSession: qitem.destinationSession,
@@ -2848,7 +2867,8 @@ export class QueueRepository {
                closure_reason = COALESCE(?, closure_reason),
                closure_target = COALESCE(?, closure_target),
                handed_off_to = COALESCE(?, handed_off_to),
-               blocked_on = ?
+               blocked_on = ?,
+               resolution = ?
          WHERE qitem_id = ?`
       )
       .run(
@@ -2858,6 +2878,7 @@ export class QueueRepository {
         validation.closureTarget,
         input.handedOffTo ?? null,
         nextBlockedOn,
+        nextResolution,
         input.qitemId
       );
 

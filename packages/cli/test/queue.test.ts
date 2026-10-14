@@ -1828,6 +1828,22 @@ describe("rig queue CLI", () => {
       expect(printed).not.toHaveProperty("bodyTruncated");
     });
 
+    it("update --resolution posts the text with the close", async () => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", "--state", "done", "--closure-reason", "no-follow-on", "--resolution", "Fixed in #42"]);
+      expect(calls.find((c) => c.path === "/api/queue/qitem-x/update")?.body).toMatchObject({ state: "done", resolution: "Fixed in #42" });
+    });
+
+    it("update without --resolution sends no resolution", async () => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", "--note", "n"]);
+      expect((calls.find((c) => c.path === "/api/queue/qitem-x/update")?.body as Record<string, unknown>).resolution).toBeUndefined();
+    });
+
     it("show --full (human): complete body, no preview fields, no marker", async () => {
       const full = "D".repeat(1000);
       const item = { qitemId: "qitem-1", body: full, chain_of_record: [] };
