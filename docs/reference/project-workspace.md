@@ -238,9 +238,13 @@ rig workflow instantiate ./spec.workflow.md \
   `project:`, `mission:` or `slice:` tag that contradicts its flag, or a second
   value of the same key.
 - `rig workflow instantiate-lifecycle` needs no flags: it takes the project and
-  mission from the lifecycle identity it compiles and tags each step's packets
-  with its slice directory name (`slice:<directory>`, the id the Queue tab keys
-  on, which can differ from the step id), each lifecycle step being one slice.
+  mission from the lifecycle identity it compiles. A step's packets also carry
+  `slice:<directory>` (the id the Queue tab keys on) when the step names an
+  active slice: by its exact directory name, else by a `metadata.id` that
+  exactly one active slice claims (an id two slices claim maps to nothing, with
+  a compile advisory). A step that names no slice, such as an authored closing
+  step, carries only `project:` and `mission:`, so it appears on no slice's
+  Queue tab.
 - The scope is stored on the instance when it is created and does not change.
   Instances created without it behave as before.
 
