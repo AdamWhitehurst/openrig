@@ -118,7 +118,6 @@ export function printWorkflowAdvisories(advisories: string[] | undefined): void 
   }
 }
 
-/** Preserve discovered workflow IDs while resolving explicit paths and local files. */
 /** The scope flags shared by `workflow instantiate` and `workflow run`, in the request shape the daemon takes. */
 function workflowScopeBody(opts: { project?: string; mission?: string; slice?: string; tags?: string }) {
   const tags = opts.tags ? opts.tags.split(",").map((t) => t.trim()).filter(Boolean) : undefined;
@@ -130,6 +129,7 @@ function workflowScopeBody(opts: { project?: string; mission?: string; slice?: s
   };
 }
 
+/** Preserve discovered workflow IDs while resolving explicit paths and local files. */
 function resolveWorkflowSource(source: string): string {
   if (isAbsolute(source) || source.includes("/") || source.includes("\\")) return resolve(source);
   try {

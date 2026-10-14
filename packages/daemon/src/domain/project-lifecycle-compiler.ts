@@ -38,6 +38,8 @@ export interface LifecycleCompilation {
   compiledInputDigest: string;
   sources: LifecycleSourceDigest[];
   dependencies: Array<{ stepId: string; dependsOn: string[] }>;
+  /** Step id -> its slice directory name, for steps compiled from a slice. The Queue tab keys on the directory, not the step id. */
+  sliceDirs: Record<string, string>;
   graphSource: LifecycleGraphSource;
   workflowSpec: WorkflowSpec | null;
   advisories: string[];
@@ -82,6 +84,7 @@ export function compileProjectLifecycle(input: {
 
   const sources: LifecycleSourceDigest[] = [digestSource("project", projectPath), digestSource("mission", missionPath)];
   const steps: WorkflowStepSpec[] = [];
+  const sliceDirs: Record<string, string> = {};
   const roles: WorkflowSpec["roles"] = {};
   const unknowns: string[] = [];
   const advisories: string[] = [];
@@ -178,6 +181,7 @@ export function compileProjectLifecycle(input: {
       return;
     }
     const stepId = optionalString(asMapping(slice.metadata, `${slicePath}: metadata`, true)?.id, `${slicePath}: metadata.id`) ?? basename(dirname(slicePath));
+    sliceDirs[stepId] = basename(dirname(slicePath));
     const actorRole = requiredString(execution.actor_role, `${slicePath}: execution.actor_role`);
     const preferredTargets = stringList(execution.preferred_targets, `${slicePath}: execution.preferred_targets`, true);
     roles[actorRole] ??= preferredTargets.length > 0 ? { preferred_targets: preferredTargets } : {};
@@ -242,6 +246,7 @@ export function compileProjectLifecycle(input: {
     sources,
     graphSource,
     dependencies: steps.map((step) => ({ stepId: step.id, dependsOn: step.depends_on ?? [] })),
+    sliceDirs,
     workflowSpec,
     advisories,
     unknowns,

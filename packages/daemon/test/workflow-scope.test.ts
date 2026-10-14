@@ -129,6 +129,20 @@ describe("workflow scope tags", () => {
       expect(() => normalizeWorkflowScope({ tags: ["slice:A", "slice:B"] })).toThrow(/slice/);
     });
 
+    it.each([
+      ["a string", "instance:evil"],
+      ["an object", {}],
+      ["a number", 7],
+      ["an array with a non-string", ["ok", 3]],
+    ])("refuses tags that are %s, not an array of strings", (_label, tags) => {
+      expect(() => normalizeWorkflowScope({ tags })).toThrow(/array of strings/);
+    });
+
+    it.each([["project"], ["mission"], ["slice"]])("refuses a non-string %s", (key) => {
+      expect(() => normalizeWorkflowScope({ [key]: 7 })).toThrow(WorkflowScopeError);
+      expect(() => normalizeWorkflowScope({ [key]: { x: 1 } })).toThrow(WorkflowScopeError);
+    });
+
     it("refuses malformed ids and tags the queue readers would split", () => {
       expect(() => normalizeWorkflowScope({ project: "../x" })).toThrow(WorkflowScopeError);
       expect(() => normalizeWorkflowScope({ slice: "a b" })).toThrow(WorkflowScopeError);
@@ -265,12 +279,19 @@ describe("workflow scope tags", () => {
       const created = await runtime.instantiateLifecycle({
         missionPath: missionDir, operationKey: "scope-op-1", rootObjective: "lifecycle", createdBySession: "ops@rig",
       });
-      expect(created.instance.scope).toEqual({ project: "demo", mission: "release-1.0.0" });
-      expect(tagsOf(created.entryQitemId).slice(-3)).toEqual(["project:demo", "mission:release-1.0.0", "slice:build"]);
+      expect(created.instance.scope).toEqual({
+        project: "demo", mission: "release-1.0.0", stepSlices: { build: "01-build", ship: "02-ship" },
+      });
+      // Step ids are build / ship (metadata.id); the slices' DIRECTORIES are 01-build / 02-ship,
+      // and the Queue tab keys on the directory.
+      expect(tagsOf(created.entryQitemId).slice(-3)).toEqual(["project:demo", "mission:release-1.0.0", "slice:01-build"]);
       const next = await runtime.project({
         instanceId: created.instance.instanceId, currentPacketId: created.entryQitemId, exit: "handoff", actorSession: "builder@rig",
       });
-      expect(tagsOf(next.nextQitemId!).slice(-3)).toEqual(["project:demo", "mission:release-1.0.0", "slice:ship"]);
+      expect(tagsOf(next.nextQitemId!).slice(-3)).toEqual(["project:demo", "mission:release-1.0.0", "slice:02-ship"]);
+      const indexer = new SliceIndexer({ db, slicesRoot: join(tmp, "missions"), dogfoodEvidenceRoot: null, projectId: "demo" });
+      expect(indexer.get("01-build")?.qitemIds).toContain(created.entryQitemId);
+      expect(indexer.get("02-ship")?.qitemIds).toContain(next.nextQitemId);
     });
   });
 
@@ -327,6 +348,26 @@ describe("workflow scope tags", () => {
       expect(response.status).toBe(201);
       const body = await response.json() as { entryQitemId: string };
       expect(tagsOf(body.entryQitemId).slice(-3)).toEqual(["project:p1", "slice:01-s1", "ticket-7"]);
+    });
+
+    it.each([
+      ["a string", "instance:evil"],
+      ["an object", {}],
+    ])("refuses tags sent as %s with a 400, creating nothing", async (_label, tags) => {
+      const response = await post(appFor(tmp), {
+        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", tags,
+      });
+      expect(response.status).toBe(400);
+      expect((await response.json() as { error: string }).error).toBe("scope_tag_invalid");
+      expect((db.prepare(`SELECT count(*) AS n FROM workflow_instances`).get() as { n: number }).n).toBe(0);
+    });
+
+    it("refuses a non-string project with a 400", async () => {
+      const response = await post(appFor(tmp), {
+        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", project: { id: "p1" },
+      });
+      expect(response.status).toBe(400);
+      expect((await response.json() as { error: string }).error).toBe("scope_id_invalid");
     });
 
     it("refuses a reserved tag with a 400", async () => {

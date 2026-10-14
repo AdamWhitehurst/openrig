@@ -416,7 +416,7 @@ export class WorkflowRuntime {
       }
     }
     const scope = input.compiledLifecycle
-      ? normalizeWorkflowScope({ project: input.compiledLifecycle.identity.project, mission: input.compiledLifecycle.identity.mission })
+      ? normalizeWorkflowScope({ project: input.compiledLifecycle.identity.project, mission: input.compiledLifecycle.identity.mission, stepSlices: input.compiledLifecycle.sliceDirs })
       : normalizeWorkflowScope(input.scope ?? {});
     // OPR.0.3.3.04.1 (AC-3 reachability): a fresh operator runs
     // `workflow instantiate <discovered-name>` (e.g. `conveyor`), not a hidden

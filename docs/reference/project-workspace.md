@@ -239,7 +239,8 @@ rig workflow instantiate ./spec.workflow.md \
   value of the same key.
 - `rig workflow instantiate-lifecycle` needs no flags: it takes the project and
   mission from the lifecycle identity it compiles and tags each step's packets
-  `slice:<step id>`, each lifecycle step being one slice.
+  with its slice directory name (`slice:<directory>`, the id the Queue tab keys
+  on, which can differ from the step id), each lifecycle step being one slice.
 - The scope is stored on the instance when it is created and does not change.
   Instances created without it behave as before.
 

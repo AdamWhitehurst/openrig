@@ -11,6 +11,9 @@ export interface WorkflowScope {
   slice?: string;
   /** Free-form tags, scope-key tags (project:/mission:/slice:) excluded. */
   tags?: string[];
+  /** Lifecycle instances: step id -> slice directory name, the slice a step's packets belong to.
+   *  The Queue tab keys on the directory name, which is not always the step id. */
+  stepSlices?: Record<string, string>;
 }
 
 export class WorkflowScopeError extends Error {
@@ -38,22 +41,27 @@ function refuse(code: string, message: string): never {
 }
 
 export function normalizeWorkflowScope(input: {
-  project?: string | null;
-  mission?: string | null;
-  slice?: string | null;
-  tags?: readonly string[] | null;
+  project?: unknown;
+  mission?: unknown;
+  slice?: unknown;
+  tags?: unknown;
+  stepSlices?: Record<string, string>;
 }): WorkflowScope | null {
   const scope: Partial<Record<ScopeKey, string>> = {};
   for (const key of SCOPE_KEYS) {
     const value = input[key];
     if (value === undefined || value === null) continue;
+    if (typeof value !== "string") refuse("scope_id_invalid", `${key} must be a string`);
     if (!KEY_PATTERN[key].test(value)) refuse("scope_id_invalid", `--${key} "${value}" is not a valid ${key} id (letters, digits, . _ -; must start with a letter or digit)`);
     scope[key] = value;
   }
   const flagged = { ...scope };
   const tags: string[] = [];
-  for (const raw of input.tags ?? []) {
-    if (typeof raw !== "string") refuse("scope_tag_invalid", "tags must be strings");
+  if (input.tags !== undefined && input.tags !== null && !Array.isArray(input.tags)) {
+    refuse("scope_tag_invalid", "tags must be an array of strings");
+  }
+  for (const raw of (input.tags ?? []) as unknown[]) {
+    if (typeof raw !== "string") refuse("scope_tag_invalid", "tags must be an array of strings");
     const tag = raw.trim();
     if (!tag) continue;
     if (/[\s,]/.test(tag)) refuse("scope_tag_invalid", `tag "${tag}" contains whitespace or a comma, which queue readers split on`);
@@ -75,12 +83,13 @@ export function normalizeWorkflowScope(input: {
     }
     if (!tags.includes(tag)) tags.push(tag);
   }
-  if (Object.keys(scope).length === 0 && tags.length === 0) return null;
-  return { ...scope, ...(tags.length > 0 ? { tags } : {}) };
+  const stepSlices = input.stepSlices && Object.keys(input.stepSlices).length > 0 ? input.stepSlices : undefined;
+  if (Object.keys(scope).length === 0 && tags.length === 0 && !stepSlices) return null;
+  return { ...scope, ...(tags.length > 0 ? { tags } : {}), ...(stepSlices ? { stepSlices } : {}) };
 }
 
 /** The tags stamped on a packet: scope keys first (project, mission, slice), free-form tags after.
- *  `stepId` supplies the slice for a lifecycle instance, where each step is one slice. */
+ *  `stepSlice` supplies the slice when the scope names none (a lifecycle step). */
 export function workflowScopeTags(scope: WorkflowScope | null | undefined, stepSlice?: string | null): string[] {
   const slice = scope?.slice ?? stepSlice ?? undefined;
   const out: string[] = [];
@@ -91,12 +100,14 @@ export function workflowScopeTags(scope: WorkflowScope | null | undefined, stepS
   return out;
 }
 
-/** The scope for packets of `stepId` on an instance: a lifecycle instance with no explicit slice tags each step's packets slice:<stepId>. */
+/** The tags for a packet of `stepId`. A lifecycle step is one slice: its packets carry the step's slice directory name
+ *  (the step id for a step compiled from no slice directory, such as one an authored boundary or a revision adds). */
 export function packetScopeTags(
   instance: { scope?: WorkflowScope | null; lifecycleOperationKey?: string | null },
   stepId: string | null | undefined,
 ): string[] {
-  return workflowScopeTags(instance.scope, instance.lifecycleOperationKey ? stepId : null);
+  const stepSlice = instance.lifecycleOperationKey && stepId ? (instance.scope?.stepSlices?.[stepId] ?? stepId) : null;
+  return workflowScopeTags(instance.scope, stepSlice);
 }
 
 /** Read an instance's scope straight from the row (for code that holds only the db). */
