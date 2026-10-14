@@ -246,7 +246,7 @@ export function workflowRoutes(): Hono {
         ...result,
         scopeIgnored: {
           fields: ignoredFields,
-          message: `${ignoredFields.join(", ")} in the request body ${ignoredFields.length === 1 ? "was" : "were"} ignored; scope is read only from a "scope" object ({ project, mission, slice, tags }). `
+          message: `Ignored request body fields: ${ignoredFields.join(", ")}. Send scope as an object ({ project, mission, slice, tags }) to apply it. `
             + (scope ? "The instance carries the scope object's scope." : "The instance was created unscoped."),
         },
       }, 201);

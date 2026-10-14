@@ -651,7 +651,7 @@ describe("workflow scope tags", () => {
       expect(tagsOf(body.entryQitemId)).toEqual(["workflow", "entry", "workflow:scope-pipeline", `instance:${body.instance.instanceId}`]);
       expect(runtime.instanceStore.getByIdOrThrow(body.instance.instanceId).scope ?? null).toBeNull();
       expect(body.scopeIgnored.fields).toEqual(Object.keys(fields));
-      expect(body.scopeIgnored.message).toMatch(/ignored.*created unscoped/);
+      expect(body.scopeIgnored.message).toBe(`Ignored request body fields: ${Object.keys(fields).join(", ")}. Send scope as an object ({ project, mission, slice, tags }) to apply it. The instance was created unscoped.`);
     });
 
     it("when the body carries both, the scope object applies and the note says the bare fields were ignored", async () => {
@@ -664,7 +664,7 @@ describe("workflow scope tags", () => {
       const body = await response.json() as { entryQitemId: string; scopeIgnored: { fields: string[]; message: string } };
       expect(tagsOf(body.entryQitemId).slice(-1)).toEqual(["project:p1"]);
       expect(body.scopeIgnored.fields).toEqual(["slice"]);
-      expect(body.scopeIgnored.message).toMatch(/scope object/);
+      expect(body.scopeIgnored.message).toBe("Ignored request body fields: slice. Send scope as an object ({ project, mission, slice, tags }) to apply it. The instance carries the scope object's scope.");
     });
 
     it("an instantiate with no scope fields has no scopeIgnored note", async () => {
