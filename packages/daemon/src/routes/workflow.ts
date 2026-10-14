@@ -8,6 +8,9 @@ import {
   WorkflowProjectorError,
   type WorkflowRuntime,
 } from "../domain/workflow-runtime.js";
+import { normalizeWorkflowScope, WorkflowScopeError } from "../domain/workflow-scope.js";
+import { ProjectReadError } from "../domain/workspace/project-catalog.js";
+import { declaredProject, projectReadResponse } from "../domain/workspace/project-read.js";
 import { WorkflowSpecError } from "../domain/workflow-spec-cache.js";
 import { WorkflowHumanDestinationError } from "../domain/workflow-human-destination.js";
 
@@ -42,6 +45,9 @@ export function workflowRoutes(): Hono {
     c: { json: (body: unknown, status?: number) => Response },
     err: unknown,
   ): Response {
+    if (err instanceof WorkflowScopeError) {
+      return c.json({ error: err.code, message: err.message }, 400);
+    }
     if (err instanceof WorkflowHumanDestinationError) {
       return c.json({ error: err.code, message: err.message, ...err.details }, 409);
     }
@@ -202,18 +208,31 @@ export function workflowRoutes(): Hono {
         entryOwnerSession?: string;
         /** OPR.0.4.6.FAC1: overrides the spec's target.rig default. */
         targetRig?: string;
+        /** Scope stamped on every packet the instance creates (migration 109). */
+        project?: string;
+        mission?: string;
+        slice?: string;
+        tags?: string[];
       }>()
       .catch(() => ({} as never));
     if (!body.specPath) return c.json({ error: "specPath is required" }, 400);
     if (!body.rootObjective) return c.json({ error: "rootObjective is required" }, 400);
     if (!body.createdBySession) return c.json({ error: "createdBySession is required" }, 400);
     try {
+      const scope = normalizeWorkflowScope({ project: body.project, mission: body.mission, slice: body.slice, tags: body.tags });
+      // A scope names a project the packets must show up under: refuse one the
+      // workspace catalog does not declare (same lookup as the project reads).
+      if (scope?.project) {
+        try { declaredProject(c, scope.project); }
+        catch (err) { if (err instanceof ProjectReadError) return projectReadResponse(err); throw err; }
+      }
       const result = await getRuntime(c).instantiate({
         specPath: body.specPath,
         rootObjective: body.rootObjective,
         createdBySession: body.createdBySession,
         entryOwnerSession: body.entryOwnerSession,
         targetRig: body.targetRig,
+        ...(scope ? { scope } : {}),
       });
       return c.json(result, 201);
     } catch (err) {

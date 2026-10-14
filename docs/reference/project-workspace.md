@@ -210,6 +210,39 @@ Slice: capture-product-ideas
 This makes Story, Queue, Tests, and Topology tabs line up with the filesystem
 slice without adding a separate project database schema.
 
+### Workflow packets
+
+Packets that `rig workflow` projects carry the scope of their instance. Pass the
+scope when the instance is created and every packet it creates (the entry, each
+hand-off and gate, exception items, and resume packets) is tagged, so they show
+on the slice's Queue tab:
+
+```bash
+rig workflow instantiate ./spec.workflow.md \
+  --root-objective "Build the capture flow" --created-by orch@my-rig \
+  --project my-project --mission idea-ledger --slice capture-product-ideas \
+  --tags ticket-7
+```
+
+- `--project` must name a project in the workspace catalog; an unknown project
+  is refused. `--mission` and `--slice` take the same ids as the slice routes.
+  `rig workflow run` takes the same flags.
+- Packets carry `project:<id>`, `mission:<id>` and `slice:<id>` for the parts
+  you set, then your `--tags`, after the tags the workflow system writes. Tags
+  compose as in `rig queue create`: duplicates collapse, so `--slice S --tags
+  slice:S` is one tag.
+- `--tags` refuses what the workflow runtime reads back to route packets:
+  `workflow`, `handoff`, `gate`, `entry`, `resume`, `re-route`,
+  `workflow-exception`, and the `workflow:`, `instance:`, `step:`,
+  `exception:`, `occurrence:` and `recovery-for:` prefixes. It also refuses a
+  `project:`, `mission:` or `slice:` tag that contradicts its flag, or a second
+  value of the same key.
+- `rig workflow instantiate-lifecycle` needs no flags: it takes the project and
+  mission from the lifecycle identity it compiles and tags each step's packets
+  `slice:<step id>`, each lifecycle step being one slice.
+- The scope is stored on the instance when it is created and does not change.
+  Instances created without it behave as before.
+
 ## Compatibility
 
 The default discovery root is `workspace.slices_root=<workspace.root>/missions`.

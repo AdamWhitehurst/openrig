@@ -1,0 +1,113 @@
+// A workflow instance's scope: the project / mission / slice it works for, plus
+// free-form tags. Stored on the instance (workflow_instances.scope_json) and
+// stamped on every packet the instance creates, so the Projects view's slice
+// Queue tab (exact project:<id> + slice:<id> match) lists them.
+
+import type Database from "better-sqlite3";
+
+export interface WorkflowScope {
+  project?: string;
+  mission?: string;
+  slice?: string;
+  /** Free-form tags, scope-key tags (project:/mission:/slice:) excluded. */
+  tags?: string[];
+}
+
+export class WorkflowScopeError extends Error {
+  constructor(public readonly code: string, message: string) {
+    super(message);
+    this.name = "WorkflowScopeError";
+  }
+}
+
+// Same id shapes the project and slice routes accept.
+const PROJECT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const NODE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const SCOPE_KEYS = ["project", "mission", "slice"] as const;
+type ScopeKey = (typeof SCOPE_KEYS)[number];
+const KEY_PATTERN: Record<ScopeKey, RegExp> = { project: PROJECT_ID, mission: NODE_ID, slice: NODE_ID };
+
+/** Tags the workflow system writes on its own packets. The runtime reads
+ *  `instance:` and `workflow:` back off packets to route them, so a caller
+ *  tag must never collide with any of these. */
+const RESERVED_TAGS = new Set(["workflow", "handoff", "gate", "entry", "resume", "re-route", "workflow-exception"]);
+const RESERVED_PREFIXES = ["workflow:", "instance:", "step:", "exception:", "occurrence:", "recovery-for:"];
+
+function refuse(code: string, message: string): never {
+  throw new WorkflowScopeError(code, message);
+}
+
+export function normalizeWorkflowScope(input: {
+  project?: string | null;
+  mission?: string | null;
+  slice?: string | null;
+  tags?: readonly string[] | null;
+}): WorkflowScope | null {
+  const scope: Partial<Record<ScopeKey, string>> = {};
+  for (const key of SCOPE_KEYS) {
+    const value = input[key];
+    if (value === undefined || value === null) continue;
+    if (!KEY_PATTERN[key].test(value)) refuse("scope_id_invalid", `--${key} "${value}" is not a valid ${key} id (letters, digits, . _ -; must start with a letter or digit)`);
+    scope[key] = value;
+  }
+  const flagged = { ...scope };
+  const tags: string[] = [];
+  for (const raw of input.tags ?? []) {
+    if (typeof raw !== "string") refuse("scope_tag_invalid", "tags must be strings");
+    const tag = raw.trim();
+    if (!tag) continue;
+    if (/[\s,]/.test(tag)) refuse("scope_tag_invalid", `tag "${tag}" contains whitespace or a comma, which queue readers split on`);
+    const key = SCOPE_KEYS.find((k) => tag.startsWith(`${k}:`));
+    if (key) {
+      const value = tag.slice(key.length + 1);
+      if (!KEY_PATTERN[key].test(value)) refuse("scope_tag_invalid", `tag "${tag}" does not carry a valid ${key} id`);
+      if (flagged[key] !== undefined && flagged[key] !== value) {
+        refuse("scope_tag_contradiction", `tag "${tag}" contradicts --${key} ${flagged[key]}`);
+      }
+      if (scope[key] !== undefined && scope[key] !== value) {
+        refuse("scope_tag_duplicate_key", `more than one ${key}: value given (${scope[key]}, ${value}); a packet carries one`);
+      }
+      scope[key] = value;
+      continue;
+    }
+    if (RESERVED_TAGS.has(tag) || RESERVED_PREFIXES.some((p) => tag.startsWith(p))) {
+      refuse("scope_tag_reserved", `tag "${tag}" is reserved: the workflow system writes it on its own packets and reads it back to route them`);
+    }
+    if (!tags.includes(tag)) tags.push(tag);
+  }
+  if (Object.keys(scope).length === 0 && tags.length === 0) return null;
+  return { ...scope, ...(tags.length > 0 ? { tags } : {}) };
+}
+
+/** The tags stamped on a packet: scope keys first (project, mission, slice), free-form tags after.
+ *  `stepId` supplies the slice for a lifecycle instance, where each step is one slice. */
+export function workflowScopeTags(scope: WorkflowScope | null | undefined, stepSlice?: string | null): string[] {
+  const slice = scope?.slice ?? stepSlice ?? undefined;
+  const out: string[] = [];
+  if (scope?.project) out.push(`project:${scope.project}`);
+  if (scope?.mission) out.push(`mission:${scope.mission}`);
+  if (slice) out.push(`slice:${slice}`);
+  for (const tag of scope?.tags ?? []) if (!out.includes(tag)) out.push(tag);
+  return out;
+}
+
+/** The scope for packets of `stepId` on an instance: a lifecycle instance with no explicit slice tags each step's packets slice:<stepId>. */
+export function packetScopeTags(
+  instance: { scope?: WorkflowScope | null; lifecycleOperationKey?: string | null },
+  stepId: string | null | undefined,
+): string[] {
+  return workflowScopeTags(instance.scope, instance.lifecycleOperationKey ? stepId : null);
+}
+
+/** Read an instance's scope straight from the row (for code that holds only the db). */
+export function readInstanceScope(db: Database.Database, instanceId: string): { scope: WorkflowScope | null; lifecycleOperationKey: string | null } {
+  try {
+    const row = db
+      .prepare(`SELECT scope_json, lifecycle_operation_key FROM workflow_instances WHERE instance_id = ?`)
+      .get(instanceId) as { scope_json: string | null; lifecycle_operation_key: string | null } | undefined;
+    return { scope: row?.scope_json ? (JSON.parse(row.scope_json) as WorkflowScope) : null, lifecycleOperationKey: row?.lifecycle_operation_key ?? null };
+  } catch {
+    // Fixture databases that skip the canonical migrations have no scope column.
+    return { scope: null, lifecycleOperationKey: null };
+  }
+}

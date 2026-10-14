@@ -119,6 +119,17 @@ export function printWorkflowAdvisories(advisories: string[] | undefined): void 
 }
 
 /** Preserve discovered workflow IDs while resolving explicit paths and local files. */
+/** The scope flags shared by `workflow instantiate` and `workflow run`, in the request shape the daemon takes. */
+function workflowScopeBody(opts: { project?: string; mission?: string; slice?: string; tags?: string }) {
+  const tags = opts.tags ? opts.tags.split(",").map((t) => t.trim()).filter(Boolean) : undefined;
+  return {
+    ...(opts.project ? { project: opts.project } : {}),
+    ...(opts.mission ? { mission: opts.mission } : {}),
+    ...(opts.slice ? { slice: opts.slice } : {}),
+    ...(tags && tags.length > 0 ? { tags } : {}),
+  };
+}
+
 function resolveWorkflowSource(source: string): string {
   if (isAbsolute(source) || source.includes("/") || source.includes("\\")) return resolve(source);
   try {
@@ -265,6 +276,10 @@ Examples:
     .requiredOption("--created-by <session>", "Session creating the instance (canonical <member>@<rig>)")
     .option("--entry-owner <session>", "Override default entry-step owner")
     .option("--rig <name>", "Bind the instance to this rig (overrides the spec's target.rig default; roles resolve to seats on this rig)")
+    .option("--project <id>", "Catalogued project this run works for; stamped as project:<id> on every packet it creates")
+    .option("--mission <id>", "Mission this run works for; stamped as mission:<id> on every packet")
+    .option("--slice <id>", "Slice this run works for; stamped as slice:<id> on every packet, so they show on the slice's Queue tab")
+    .option("--tags <tags>", "Comma-separated tags stamped on every packet (composes with --project/--mission/--slice; workflow-owned tags are refused)")
     .option("--json", "JSON output for agents")
     .addHelpText("after", `
 Examples:
@@ -276,12 +291,22 @@ Examples:
       --root-objective "Run dogfood" \\
       --created-by driver@my-rig \\
       --entry-owner qa@my-rig --json
+
+  # packets show on slice 01-build's Queue tab in the Projects view
+  $ rig workflow instantiate ./my-spec.workflow.md \\
+      --root-objective "Build it" \\
+      --created-by driver@my-rig \\
+      --project my-project --mission m1 --slice 01-build --tags ticket-7
 `)
     .action(async (specPath: string, opts: {
       rootObjective: string;
       createdBy: string;
       entryOwner?: string;
       rig?: string;
+      project?: string;
+      mission?: string;
+      slice?: string;
+      tags?: string;
       json?: boolean;
     }) => {
       const deps = getDeps();
@@ -297,6 +322,7 @@ Examples:
           createdBySession: opts.createdBy,
           entryOwnerSession: opts.entryOwner,
           targetRig: opts.rig,
+          ...workflowScopeBody(opts),
         });
         printResult(opts.json ?? false, res.data, res.status);
         printWorkflowAdvisories(res.data?.advisories);
@@ -685,6 +711,10 @@ Examples:
     .requiredOption("--created-by <session>", "Session creating the instance (canonical <member>@<rig>)")
     .option("--entry-owner <session>", "Override default entry-step owner")
     .option("--rig <name>", "Bind the instance to this rig (overrides the spec's target.rig default; roles resolve to seats on this rig)")
+    .option("--project <id>", "Catalogued project this run works for; stamped as project:<id> on every packet it creates")
+    .option("--mission <id>", "Mission this run works for; stamped as mission:<id> on every packet")
+    .option("--slice <id>", "Slice this run works for; stamped as slice:<id> on every packet, so they show on the slice's Queue tab")
+    .option("--tags <tags>", "Comma-separated tags stamped on every packet (composes with --project/--mission/--slice; workflow-owned tags are refused)")
     .option("--json", "Stream events as JSON lines for agents")
     .addHelpText("after", `
 Streams each step event as it happens; exits when the workflow reaches
@@ -703,6 +733,10 @@ Examples:
       createdBy: string;
       entryOwner?: string;
       rig?: string;
+      project?: string;
+      mission?: string;
+      slice?: string;
+      tags?: string;
       json?: boolean;
     }) => {
       const deps = getDeps();
@@ -717,6 +751,7 @@ Examples:
           createdBySession: opts.createdBy,
           entryOwnerSession: opts.entryOwner,
           targetRig: opts.rig,
+          ...workflowScopeBody(opts),
         });
         printWorkflowAdvisories(res.data?.advisories);
         // The daemon returns the nested InstantiateResult shape
