@@ -20,7 +20,7 @@ import { runWorkflowBootSweep } from "../src/domain/workflow-boot-sweep.js";
 import { makeEnsureStuckExceptionItem } from "../src/domain/workflow-exception-escalation.js";
 import { WORKFLOW_STEP_STUCK_THRESHOLD_SECONDS } from "../src/domain/workflow-deadline.js";
 import { SliceIndexer } from "../src/domain/slices/slice-indexer.js";
-import { normalizeWorkflowScope, readInstanceScope, workflowScopeTags, WorkflowScopeError } from "../src/domain/workflow-scope.js";
+import { normalizeWorkflowScope, packetScopeTags, readInstanceScope, workflowScopeTags, WorkflowScopeError } from "../src/domain/workflow-scope.js";
 import { workflowRoutes } from "../src/routes/workflow.js";
 
 const SCOPE = { project: "p1", mission: "m1", slice: "01-s1" };
@@ -181,6 +181,13 @@ describe("workflow scope tags", () => {
       expect(() => readInstanceScope(db, inst.instance.instanceId)).toThrow(SyntaxError);
     });
 
+    it("throws when the column probe itself fails, instead of reading as unscoped", async () => {
+      const inst = await instantiate(spec(PIPELINE), SCOPE);
+      db.close();
+      expect(() => readInstanceScope(db, inst.instance.instanceId)).toThrow();
+      db = createDb(); // afterEach closes whatever db holds
+    });
+
     it("throws when the query fails on a database that has the column", () => {
       const broken = createDb();
       try {
@@ -189,6 +196,16 @@ describe("workflow scope tags", () => {
       } finally {
         broken.close();
       }
+    });
+  });
+
+  describe("packetScopeTags", () => {
+    const scope = JSON.parse('{"project":"p1","stepSlices":{"build":"01-build"}}');
+    it("reads the slice of a step the scope maps", () => {
+      expect(packetScopeTags({ scope }, "build")).toEqual(["project:p1", "slice:01-build"]);
+    });
+    it.each(["constructor", "__proto__", "toString", "hasOwnProperty"])("gives a step named %s no slice tag", (name) => {
+      expect(packetScopeTags({ scope }, name)).toEqual(["project:p1"]);
     });
   });
 
@@ -321,7 +338,7 @@ describe("workflow scope tags", () => {
       });
       expect(created.instance.scope).toEqual({
         project: "demo", mission: "release-1.0.0",
-        stepSlices: { build: "01-build", "01-build": "01-build", ship: "02-ship", "02-ship": "02-ship" },
+        stepSlices: { build: "01-build", ship: "02-ship" },
       });
       // Step ids are build / ship (metadata.id); the slices' DIRECTORIES are 01-build / 02-ship,
       // and the Queue tab keys on the directory.
@@ -398,6 +415,139 @@ describe("workflow scope tags", () => {
     });
   });
 
+  describe("lifecycle inputs main already accepts", () => {
+    type Slice = { dir: string; yaml: string; active?: boolean };
+    const exec = (dependsOn: string[] = []) =>
+      `execution:\n  actor_role: builder\n  preferred_targets: [builder@rig]\n${dependsOn.length ? `  depends_on: [${dependsOn.join(", ")}]\n` : ""}  allowed_exits: [handoff, done, failed]\n`;
+    const slice = (metadata: string, execution = "") => `kind: slice\nmetadata: ${metadata}\ncomposition: { mission: ../../mission.yaml }\n${execution}`;
+    const mission = (name: string, slices: Slice[], opts: { project?: string; missionName?: string; steps?: string[] } = {}) => {
+      const missionDir = join(tmp, "missions", name);
+      for (const { dir, yaml } of slices) {
+        mkdirSync(join(missionDir, "slices", dir), { recursive: true });
+        writeFileSync(join(missionDir, "slices", dir, "slice.yaml"), yaml);
+      }
+      writeFileSync(join(tmp, "project.yaml"), `kind: project\nmetadata: { id: ${opts.project ?? "demo"} }\nmissions: { root: missions }\nlifecycle: { profile: authored-v0 }\n`);
+      const lifecycle = opts.steps
+        ? [`lifecycle:`, `  profile: authored-v0`, `  workflow:`, `    entry: { role: builder }`, `    roles:`, `      builder: { preferred_targets: [builder@rig] }`, `    steps:`,
+            ...opts.steps.map((id, i) => `      - { id: "${id}", actor_role: builder${i > 0 ? `, depends_on: ["${opts.steps![i - 1]}"]` : ""}, allowed_exits: [handoff, done, failed] }`)]
+        : [];
+      writeFileSync(join(missionDir, "mission.yaml"), [
+        `kind: mission`, `metadata: { name: ${opts.missionName ?? name} }`, `composition:`, `  slices:`,
+        ...slices.map(({ dir, active }, i) => `    - { ref: slices/${dir}/slice.yaml, order: ${(i + 1) * 10}${active === false ? ", active: false" : ""} }`),
+        ...lifecycle, ``,
+      ].join("\n"));
+      return missionDir;
+    };
+    const sliceTagsAlong = async (missionDir: string, key: string, length: number) => {
+      const created = await runtime.instantiateLifecycle({ missionPath: missionDir, operationKey: key, rootObjective: "x", createdBySession: "ops@rig" });
+      const out = [tagsOf(created.entryQitemId).filter((t) => t.startsWith("slice:"))];
+      let current = created.entryQitemId;
+      for (let i = 1; i < length; i++) {
+        const next = await runtime.project({ instanceId: created.instance.instanceId, currentPacketId: current, exit: "handoff", actorSession: "builder@rig" });
+        current = next.nextQitemId!;
+        out.push(tagsOf(current).filter((t) => t.startsWith("slice:")));
+      }
+      return { created, out };
+    };
+    const BAD_METADATA = [["a list", "[oops]"], ["a non-string id", "{ id: 7 }"], ["a blank id", '{ id: "" }']] as const;
+
+    // A1: metadata the lifecycle never runs is not read.
+    it.each(BAD_METADATA)("compiles and instantiates when an inactive slice has metadata with %s", async (_label, metadata) => {
+      const missionDir = mission("inactive-meta", [
+        { dir: "01-build", yaml: slice("{ id: build }", exec()) },
+        { dir: "02-old", yaml: slice(metadata, exec()), active: false },
+      ]);
+      const compiled = runtime.compileLifecycle(missionDir, "inactive-op");
+      expect(compiled.eligible).toBe(true);
+      expect(compiled.advisories.join("\n")).not.toMatch(/02-old/);
+      const { out } = await sliceTagsAlong(missionDir, "inactive-op", 1);
+      expect(out).toEqual([["slice:01-build"]]);
+    });
+
+    it.each(BAD_METADATA)("compiles and instantiates an authored graph when an active slice has metadata with %s, naming it in an advisory", async (_label, metadata) => {
+      const missionDir = mission("authored-meta", [
+        { dir: "01-build", yaml: slice("{ id: build }") },
+        { dir: "02-odd", yaml: slice(metadata) },
+      ], { steps: ["build", "02-odd"] });
+      const compiled = runtime.compileLifecycle(missionDir, "authored-meta-op");
+      expect(compiled.eligible).toBe(true);
+      expect(compiled.advisories.join("\n")).toMatch(/02-odd[\\/]slice\.yaml: metadata/);
+      // the odd slice keeps its directory-name alias; only its id alias is lost
+      const { out } = await sliceTagsAlong(missionDir, "authored-meta-op", 2);
+      expect(out).toEqual([["slice:01-build"], ["slice:02-odd"]]);
+    });
+
+    it("still refuses malformed metadata on an active compiled slice, as main does", () => {
+      const missionDir = mission("active-bad-meta", [{ dir: "01-build", yaml: slice("[oops]", exec()) }]);
+      expect(() => runtime.compileLifecycle(missionDir, "active-bad-op")).toThrow(/metadata/);
+    });
+
+    // A2: identities the compiler infers keep instantiating.
+    it.each([
+      ["a space in the project id", { project: '"my project"' }, /project id "my project" cannot be a packet tag/, "project:"],
+      ["a colon in the mission name", { missionName: '"rel: 1"' }, /mission name "rel: 1" cannot be a packet tag/, "mission:"],
+      ["a leading dot in the project id", { project: '".hidden"' }, /project id "\.hidden" cannot be a packet tag/, "project:"],
+      ["a leading underscore in the mission name", { missionName: "_wip" }, /mission name "_wip" cannot be a packet tag/, "mission:"],
+      ["a project id over 64 characters", { project: `"${"p".repeat(65)}"` }, /cannot be a packet tag/, "project:"],
+    ])("instantiates a lifecycle with %s, leaving that tag off with an advisory", async (_label, opts, advisory, omitted) => {
+      const missionDir = mission(`identity-${omitted.replace(":", "")}-${_label.length}`, [{ dir: "01-build", yaml: slice("{ id: build }", exec()) }], opts);
+      const compiled = runtime.compileLifecycle(missionDir, "identity-op");
+      expect(compiled.eligible).toBe(true);
+      expect(compiled.advisories.join("\n")).toMatch(advisory);
+      const created = await runtime.instantiateLifecycle({ missionPath: missionDir, operationKey: "identity-op", rootObjective: "x", createdBySession: "ops@rig" });
+      const tags = tagsOf(created.entryQitemId);
+      expect(tags.some((t) => t.startsWith(omitted))).toBe(false);
+      // the other half of the identity, and the slice, are still stamped
+      const kept = omitted === "project:" ? "mission:" : "project:";
+      expect(tags.some((t) => t.startsWith(kept))).toBe(true);
+      expect(tags).toContain("slice:01-build");
+      // not renamed: the recorded identity is exactly what the manifests say
+      expect(created.compilation.identity.project).toBe(opts.project ? opts.project.replace(/"/g, "") : "demo");
+    });
+
+    it("leaves a slice directory that cannot be a tag off the packet, with an advisory", async () => {
+      const missionDir = mission("odd-dir", [{ dir: "01 build", yaml: slice("{ id: build }", exec()) }]);
+      const compiled = runtime.compileLifecycle(missionDir, "odd-dir-op");
+      expect(compiled.eligible).toBe(true);
+      expect(compiled.advisories.join("\n")).toMatch(/slice directory "01 build" cannot be a packet tag/);
+      const { out } = await sliceTagsAlong(missionDir, "odd-dir-op", 1);
+      expect(out).toEqual([[]]);
+    });
+
+    // A4: a compiled step keeps its own slice.
+    it("tags a compiled step with its own slice even when its metadata.id is another slice's directory", async () => {
+      const missionDir = mission("own-slice", [
+        { dir: "01-build", yaml: slice("{ id: 02-check }", exec()) },
+        { dir: "02-check", yaml: slice("{ id: check }", exec(["02-check"])) },
+      ]);
+      const { created, out } = await sliceTagsAlong(missionDir, "own-slice-op", 2);
+      expect(out).toEqual([["slice:01-build"], ["slice:02-check"]]);
+      expect(created.compilation.sliceDirs).toEqual({ "02-check": "01-build", check: "02-check" });
+    });
+
+    // A5: the advisory and the tag agree.
+    it("an id two slices claim, that is also a third slice's directory, resolves to the directory with no contradicting advisory", async () => {
+      const missionDir = mission("alias-agree", [
+        { dir: "01-a", yaml: slice("{ id: dup }") },
+        { dir: "02-b", yaml: slice("{ id: dup }") },
+        { dir: "dup", yaml: slice("{ id: zed }") },
+      ], { steps: ["dup"] });
+      const compiled = runtime.compileLifecycle(missionDir, "alias-agree-op");
+      expect(compiled.advisories.join("\n")).not.toMatch(/"dup" is claimed/);
+      const { out } = await sliceTagsAlong(missionDir, "alias-agree-op", 1);
+      expect(out).toEqual([["slice:dup"]]);
+    });
+
+    // A6: own keys only.
+    it.each(["constructor", "__proto__", "toString"])("an authored step named %s gets no slice tag", async (name) => {
+      const missionDir = mission(`proto-${name.replace(/_/g, "")}`, [{ dir: "01-a", yaml: slice("{ id: a }") }], { steps: [name, "01-a"] });
+      const compiled = runtime.compileLifecycle(missionDir, `proto-op-${name}`);
+      expect(Object.hasOwn(compiled.sliceDirs, name)).toBe(false);
+      const { out } = await sliceTagsAlong(missionDir, `proto-op-${name}`, 2);
+      expect(out).toEqual([[], ["slice:01-a"]]);
+    });
+  });
+
   describe("slice indexer", () => {
     it("lists a projected packet on the slice's Queue tab for its project, and not for another project", async () => {
       const slices = join(tmp, "slices-root");
@@ -431,54 +581,107 @@ describe("workflow scope tags", () => {
     const post = (app: Hono, body: Record<string, unknown>) =>
       app.request("/api/workflow/instantiate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
-    it("refuses a project the workspace catalog does not declare, and creates nothing", async () => {
+    it("refuses a scope project the workspace catalog does not declare, and creates nothing", async () => {
       writeFileSync(join(tmp, "workspace.yaml"), "projects:\n  - id: p1\n    root: p1\n");
       mkdirSync(join(tmp, "p1", "missions"), { recursive: true });
       const response = await post(appFor(tmp), {
-        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", project: "nope",
+        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope: { project: "nope" },
       });
       expect(response.status).toBe(409);
       expect((await response.json() as { error: string }).error).toBe("project_not_found");
       expect((db.prepare(`SELECT count(*) AS n FROM workflow_instances`).get() as { n: number }).n).toBe(0);
     });
 
-    it("accepts a catalogued project and stamps it, with --tags", async () => {
+    it("accepts a scope with a catalogued project and stamps it, with tags", async () => {
       writeFileSync(join(tmp, "workspace.yaml"), "projects:\n  - id: p1\n    root: p1\n");
       mkdirSync(join(tmp, "p1", "missions"), { recursive: true });
       const response = await post(appFor(tmp), {
-        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", project: "p1", slice: "01-s1", tags: ["ticket-7"],
+        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope: { project: "p1", slice: "01-s1", tags: ["ticket-7"] },
       });
       expect(response.status).toBe(201);
       const body = await response.json() as { entryQitemId: string };
+      expect(body).not.toHaveProperty("scopeIgnored");
       expect(tagsOf(body.entryQitemId).slice(-3)).toEqual(["project:p1", "slice:01-s1", "ticket-7"]);
     });
 
     it.each([
       ["a string", "instance:evil"],
       ["an object", {}],
-    ])("refuses tags sent as %s with a 400, creating nothing", async (_label, tags) => {
+    ])("refuses scope tags sent as %s with a 400, creating nothing", async (_label, tags) => {
       const response = await post(appFor(tmp), {
-        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", tags,
+        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope: { tags },
       });
       expect(response.status).toBe(400);
       expect((await response.json() as { error: string }).error).toBe("scope_tag_invalid");
       expect((db.prepare(`SELECT count(*) AS n FROM workflow_instances`).get() as { n: number }).n).toBe(0);
     });
 
-    it("refuses a non-string project with a 400", async () => {
+    it("refuses a non-string scope project with a 400", async () => {
       const response = await post(appFor(tmp), {
-        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", project: { id: "p1" },
+        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope: { project: { id: "p1" } },
       });
       expect(response.status).toBe(400);
       expect((await response.json() as { error: string }).error).toBe("scope_id_invalid");
     });
 
-    it("refuses a reserved tag with a 400", async () => {
+    it("refuses a reserved scope tag with a 400", async () => {
       const response = await post(appFor(tmp), {
-        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", tags: ["gate"],
+        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope: { tags: ["gate"] },
       });
       expect(response.status).toBe(400);
       expect((await response.json() as { error: string }).error).toBe("scope_tag_reserved");
+    });
+
+    it.each([null, "p1", ["p1"]])("refuses a scope that is not an object (%j) with a 400", async (scope) => {
+      const response = await post(appFor(tmp), {
+        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope,
+      });
+      expect(response.status).toBe(400);
+      expect((await response.json() as { error: string }).error).toBe("scope_invalid");
+    });
+
+    // What main accepted and ignored: the bare fields. They still instantiate, unscoped, and the response says so.
+    it.each([
+      ["a project the catalog does not declare", { project: "nope" }],
+      ["a conflicting scope tag", { project: "a", tags: ["project:b"] }],
+      ["a reserved tag", { tags: ["gate"] }],
+      ["a reserved-prefix tag", { tags: ["instance:evil"] }],
+      ["tags that are a string", { tags: "instance:evil" }],
+      ["tags that are an object", { tags: {} }],
+      ["a malformed tag", { tags: ["has space"] }],
+      ["a non-string project", { project: { id: "p1" } }],
+      ["a valid project, mission, slice and tags", { project: "p1", mission: "m1", slice: "01-s1", tags: ["ticket-7"] }],
+    ])("instantiates unscoped, with a scopeIgnored note, when the body carries bare fields: %s", async (_label, fields) => {
+      writeFileSync(join(tmp, "workspace.yaml"), "projects:\n  - id: p1\n    root: p1\n");
+      mkdirSync(join(tmp, "p1", "missions"), { recursive: true });
+      const response = await post(appFor(tmp), {
+        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", ...fields,
+      });
+      expect(response.status).toBe(201);
+      const body = await response.json() as { entryQitemId: string; instance: { instanceId: string; scope?: unknown }; scopeIgnored: { fields: string[]; message: string } };
+      expect(tagsOf(body.entryQitemId)).toEqual(["workflow", "entry", "workflow:scope-pipeline", `instance:${body.instance.instanceId}`]);
+      expect(runtime.instanceStore.getByIdOrThrow(body.instance.instanceId).scope ?? null).toBeNull();
+      expect(body.scopeIgnored.fields).toEqual(Object.keys(fields));
+      expect(body.scopeIgnored.message).toMatch(/ignored.*created unscoped/);
+    });
+
+    it("when the body carries both, the scope object applies and the note says the bare fields were ignored", async () => {
+      writeFileSync(join(tmp, "workspace.yaml"), "projects:\n  - id: p1\n    root: p1\n");
+      mkdirSync(join(tmp, "p1", "missions"), { recursive: true });
+      const response = await post(appFor(tmp), {
+        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope: { project: "p1" }, slice: "01-s1",
+      });
+      expect(response.status).toBe(201);
+      const body = await response.json() as { entryQitemId: string; scopeIgnored: { fields: string[]; message: string } };
+      expect(tagsOf(body.entryQitemId).slice(-1)).toEqual(["project:p1"]);
+      expect(body.scopeIgnored.fields).toEqual(["slice"]);
+      expect(body.scopeIgnored.message).toMatch(/scope object/);
+    });
+
+    it("an instantiate with no scope fields has no scopeIgnored note", async () => {
+      const response = await post(appFor(tmp), { specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig" });
+      expect(response.status).toBe(201);
+      expect(await response.json()).not.toHaveProperty("scopeIgnored");
     });
   });
 });

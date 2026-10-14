@@ -118,15 +118,17 @@ export function printWorkflowAdvisories(advisories: string[] | undefined): void 
   }
 }
 
-/** The scope flags shared by `workflow instantiate` and `workflow run`, in the request shape the daemon takes. */
+/** The scope flags shared by `workflow instantiate` and `workflow run`. They travel as a `scope` object: the daemon
+ *  validates that strictly, while bare project/mission/slice/tags fields in the body keep their old meaning (ignored). */
 function workflowScopeBody(opts: { project?: string; mission?: string; slice?: string; tags?: string }) {
   const tags = opts.tags ? opts.tags.split(",").map((t) => t.trim()).filter(Boolean) : undefined;
-  return {
+  const scope = {
     ...(opts.project ? { project: opts.project } : {}),
     ...(opts.mission ? { mission: opts.mission } : {}),
     ...(opts.slice ? { slice: opts.slice } : {}),
     ...(tags && tags.length > 0 ? { tags } : {}),
   };
+  return Object.keys(scope).length > 0 ? { scope } : {};
 }
 
 /** Preserve discovered workflow IDs while resolving explicit paths and local files. */
@@ -278,7 +280,7 @@ Examples:
     .option("--rig <name>", "Bind the instance to this rig (overrides the spec's target.rig default; roles resolve to seats on this rig)")
     .option("--project <id>", "Catalogued project this run works for; stamped as project:<id> on every packet it creates")
     .option("--mission <id>", "Mission this run works for; stamped as mission:<id> on every packet")
-    .option("--slice <id>", "Slice this run works for; stamped as slice:<id> on every packet, so they show on the slice's Queue tab")
+    .option("--slice <id>", "Slice this run works for; stamped as slice:<id> on every packet. They show on the slice's Queue tab when the Projects view is scoped to the same project, so pass --project too")
     .option("--tags <tags>", "Comma-separated tags stamped on every packet (composes with --project/--mission/--slice; workflow-owned tags are refused)")
     .option("--json", "JSON output for agents")
     .addHelpText("after", `
@@ -713,7 +715,7 @@ Examples:
     .option("--rig <name>", "Bind the instance to this rig (overrides the spec's target.rig default; roles resolve to seats on this rig)")
     .option("--project <id>", "Catalogued project this run works for; stamped as project:<id> on every packet it creates")
     .option("--mission <id>", "Mission this run works for; stamped as mission:<id> on every packet")
-    .option("--slice <id>", "Slice this run works for; stamped as slice:<id> on every packet, so they show on the slice's Queue tab")
+    .option("--slice <id>", "Slice this run works for; stamped as slice:<id> on every packet. They show on the slice's Queue tab when the Projects view is scoped to the same project, so pass --project too")
     .option("--tags <tags>", "Comma-separated tags stamped on every packet (composes with --project/--mission/--slice; workflow-owned tags are refused)")
     .option("--json", "Stream events as JSON lines for agents")
     .addHelpText("after", `

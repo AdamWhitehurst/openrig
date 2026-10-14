@@ -3,8 +3,10 @@ import type { WorkflowDeps } from "../src/commands/workflow.js";
 import { createProgram } from "../src/index.js";
 
 // `rig workflow instantiate|run --project/--mission/--slice/--tags`: the scope a
-// run's packets carry, sent to the daemon as the same request fields on BOTH
-// verbs (run instantiates too). Unscoped invocations send none of them.
+// run's packets carry, sent to the daemon as a `scope` object on BOTH verbs (run
+// instantiates too). The object is what opts the request into the daemon's strict
+// validation; bare fields keep their old meaning there (ignored). Unscoped
+// invocations send no scope.
 
 vi.mock("../src/daemon-lifecycle.js", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("../src/daemon-lifecycle.js");
@@ -80,11 +82,24 @@ describe("workflow scope flags", () => {
 
   it.each(["instantiate", "run"] as const)("%s posts project, mission, slice and split tags", async (verb) => {
     const body = await run(verb, ["--project", "p1", "--mission", "m1", "--slice", "01-s1", "--tags", "ticket-7, area:db,"]);
-    expect(body).toMatchObject({ project: "p1", mission: "m1", slice: "01-s1", tags: ["ticket-7", "area:db"] });
+    expect(body.scope).toEqual({ project: "p1", mission: "m1", slice: "01-s1", tags: ["ticket-7", "area:db"] });
+    for (const key of ["project", "mission", "slice", "tags"]) expect(body).not.toHaveProperty(key);
+  });
+
+  it.each(["instantiate", "run"] as const)("%s sends only the flags given", async (verb) => {
+    const body = await run(verb, ["--slice", "01-s1"]);
+    expect(body.scope).toEqual({ slice: "01-s1" });
+  });
+
+  it.each(["instantiate", "run"] as const)("%s --slice help says the packets also need --project in a project-scoped view", (verb) => {
+    const program = createProgram({ workflowDeps: makeDeps().deps });
+    const command = program.commands.find((c) => c.name() === "workflow")!.commands.find((c) => c.name() === verb)!;
+    const slice = command.options.find((o) => o.long === "--slice")!;
+    expect(slice.description).toMatch(/--project/);
   });
 
   it.each(["instantiate", "run"] as const)("%s without scope flags sends none of the scope fields", async (verb) => {
     const body = await run(verb, []);
-    for (const key of ["project", "mission", "slice", "tags"]) expect(body).not.toHaveProperty(key);
+    for (const key of ["scope", "project", "mission", "slice", "tags"]) expect(body).not.toHaveProperty(key);
   });
 });

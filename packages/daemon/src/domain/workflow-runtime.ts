@@ -68,7 +68,7 @@ import type {
   WorkflowStepSpec,
   WorkflowStepTrailEntry,
 } from "./workflow-types.js";
-import { normalizeWorkflowScope, packetScopeTags, type WorkflowScope } from "./workflow-scope.js";
+import { lifecycleScope, normalizeWorkflowScope, packetScopeTags, type WorkflowScope } from "./workflow-scope.js";
 import { compileProjectLifecycle, type LifecycleCompilation } from "./project-lifecycle-compiler.js";
 
 export interface WorkflowRuntimeDeps {
@@ -416,7 +416,7 @@ export class WorkflowRuntime {
       }
     }
     const scope = input.compiledLifecycle
-      ? normalizeWorkflowScope({ project: input.compiledLifecycle.identity.project, mission: input.compiledLifecycle.identity.mission, stepSlices: input.compiledLifecycle.sliceDirs })
+      ? lifecycleScope(input.compiledLifecycle.identity, input.compiledLifecycle.sliceDirs)
       : normalizeWorkflowScope(input.scope ?? {});
     // OPR.0.3.3.04.1 (AC-3 reachability): a fresh operator runs
     // `workflow instantiate <discovered-name>` (e.g. `conveyor`), not a hidden

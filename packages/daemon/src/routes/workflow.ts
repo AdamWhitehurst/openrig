@@ -8,7 +8,7 @@ import {
   WorkflowProjectorError,
   type WorkflowRuntime,
 } from "../domain/workflow-runtime.js";
-import { normalizeWorkflowScope, WorkflowScopeError } from "../domain/workflow-scope.js";
+import { normalizeWorkflowScope, WorkflowScopeError, type WorkflowScope } from "../domain/workflow-scope.js";
 import { ProjectReadError } from "../domain/workspace/project-catalog.js";
 import { declaredProject, projectReadResponse } from "../domain/workspace/project-read.js";
 import { WorkflowSpecError } from "../domain/workflow-spec-cache.js";
@@ -208,24 +208,31 @@ export function workflowRoutes(): Hono {
         entryOwnerSession?: string;
         /** OPR.0.4.6.FAC1: overrides the spec's target.rig default. */
         targetRig?: string;
-        /** Scope stamped on every packet the instance creates (migration 109). */
-        project?: string;
-        mission?: string;
-        slice?: string;
-        tags?: string[];
-      }>()
+        /** Opt-in scope stamped on every packet the instance creates (migration 109). Validated strictly.
+         *  Bare project/mission/slice/tags fields keep their old meaning: ignored (see scopeIgnored). */
+        scope?: { project?: unknown; mission?: unknown; slice?: unknown; tags?: unknown };
+      } & Record<string, unknown>>()
       .catch(() => ({} as never));
     if (!body.specPath) return c.json({ error: "specPath is required" }, 400);
     if (!body.rootObjective) return c.json({ error: "rootObjective is required" }, 400);
     if (!body.createdBySession) return c.json({ error: "createdBySession is required" }, 400);
     try {
-      const scope = normalizeWorkflowScope({ project: body.project, mission: body.mission, slice: body.slice, tags: body.tags });
-      // A scope names a project the packets must show up under: refuse one the
-      // workspace catalog does not declare (same lookup as the project reads).
-      if (scope?.project) {
-        try { declaredProject(c, scope.project); }
-        catch (err) { if (err instanceof ProjectReadError) return projectReadResponse(err); throw err; }
+      // Scope is strict, and only for callers that ask for it with a `scope` object. A body that carries bare
+      // project/mission/slice/tags (what main accepted and ignored) still instantiates, unscoped, and says so.
+      let scope: WorkflowScope | null = null;
+      if (body.scope !== undefined) {
+        if (body.scope === null || typeof body.scope !== "object" || Array.isArray(body.scope)) {
+          return c.json({ error: "scope_invalid", message: "scope must be an object: { project?, mission?, slice?, tags? }" }, 400);
+        }
+        scope = normalizeWorkflowScope({ project: body.scope.project, mission: body.scope.mission, slice: body.scope.slice, tags: body.scope.tags });
+        // A scope names a project the packets must show up under: refuse one the
+        // workspace catalog does not declare (same lookup as the project reads).
+        if (scope?.project) {
+          try { declaredProject(c, scope.project); }
+          catch (err) { if (err instanceof ProjectReadError) return projectReadResponse(err); throw err; }
+        }
       }
+      const ignoredFields = ["project", "mission", "slice", "tags"].filter((field) => body[field] !== undefined);
       const result = await getRuntime(c).instantiate({
         specPath: body.specPath,
         rootObjective: body.rootObjective,
@@ -234,7 +241,15 @@ export function workflowRoutes(): Hono {
         targetRig: body.targetRig,
         ...(scope ? { scope } : {}),
       });
-      return c.json(result, 201);
+      if (ignoredFields.length === 0) return c.json(result, 201);
+      return c.json({
+        ...result,
+        scopeIgnored: {
+          fields: ignoredFields,
+          message: `${ignoredFields.join(", ")} in the request body ${ignoredFields.length === 1 ? "was" : "were"} ignored; scope is read only from a "scope" object ({ project, mission, slice, tags }). `
+            + (scope ? "The instance carries the scope object's scope." : "The instance was created unscoped."),
+        },
+      }, 201);
     } catch (err) {
       return errorResponse(c, err);
     }

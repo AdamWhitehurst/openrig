@@ -104,14 +104,40 @@ export function workflowScopeTags(scope: WorkflowScope | null | undefined, stepS
 /** The tags for a packet of `stepId`. A lifecycle step that is a slice carries its slice directory name; a step that
  *  matches no active slice (an authored closing step, one a revision adds) carries project and mission only. */
 export function packetScopeTags(instance: { scope?: WorkflowScope | null }, stepId: string | null | undefined): string[] {
-  return workflowScopeTags(instance.scope, stepId ? (instance.scope?.stepSlices?.[stepId] ?? null) : null);
+  const slices = instance.scope?.stepSlices;
+  // Own keys only: a step named `constructor` or `__proto__` must not read an inherited property.
+  return workflowScopeTags(instance.scope, stepId && slices && Object.hasOwn(slices, stepId) ? slices[stepId] : null);
+}
+
+export const isProjectId = (value: string): boolean => PROJECT_ID.test(value);
+export const isNodeId = (value: string): boolean => NODE_ID.test(value);
+
+/** The scope of a compiled lifecycle instance. Project and mission are identities the compiler inferred from the
+ *  manifests, not user input, so one that cannot be a tag is left out (and reported) rather than refused. */
+export function lifecycleScope(
+  identity: { project: string; mission: string },
+  stepSlices: Record<string, string>,
+): WorkflowScope | null {
+  return normalizeWorkflowScope({
+    ...(isProjectId(identity.project) ? { project: identity.project } : {}),
+    ...(isNodeId(identity.mission) ? { mission: identity.mission } : {}),
+    stepSlices,
+  });
+}
+
+/** Advisories for inferred identities and slice directories that cannot be written as a packet tag. */
+export function lifecycleScopeAdvisories(identity: { project: string; mission: string }): string[] {
+  const out: string[] = [];
+  if (!isProjectId(identity.project)) out.push(`project id "${identity.project}" cannot be a packet tag (letters, digits, . _ -; must start with a letter or digit; at most 64 characters); packets carry no project: tag`);
+  if (!isNodeId(identity.mission)) out.push(`mission name "${identity.mission}" cannot be a packet tag (letters, digits, . _ -; must start with a letter or digit; at most 128 characters); packets carry no mission: tag`);
+  return out;
 }
 
 /** Read an instance's scope straight from the row (for code that holds only the db).
- *  Fixture databases that skip the canonical migrations have no scope column and read as unscoped;
- *  any other failure (a failed query, malformed scope_json) propagates, as it does on the store's read path. */
+ *  Fixture databases that skip the canonical migrations have no scope column and read as unscoped. Anything else that
+ *  fails (the column probe, the query, malformed scope_json) propagates, as it does on the store's read path. */
 export function readInstanceScope(db: Database.Database, instanceId: string): { scope: WorkflowScope | null } {
-  if (!detectInstanceColumn(db, "scope_json")) return { scope: null };
+  if (!detectInstanceColumn(db, "scope_json", { strict: true })) return { scope: null };
   const row = db.prepare(`SELECT scope_json FROM workflow_instances WHERE instance_id = ?`).get(instanceId) as { scope_json: string | null } | undefined;
   return { scope: row?.scope_json ? (JSON.parse(row.scope_json) as WorkflowScope) : null };
 }

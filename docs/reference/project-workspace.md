@@ -238,13 +238,26 @@ rig workflow instantiate ./spec.workflow.md \
   `project:`, `mission:` or `slice:` tag that contradicts its flag, or a second
   value of the same key.
 - `rig workflow instantiate-lifecycle` needs no flags: it takes the project and
-  mission from the lifecycle identity it compiles. A step's packets also carry
-  `slice:<directory>` (the id the Queue tab keys on) when the step names an
-  active slice: by its exact directory name, else by a `metadata.id` that
-  exactly one active slice claims (an id two slices claim maps to nothing, with
-  a compile advisory). A step that names no slice, such as an authored closing
-  step, carries only `project:` and `mission:`, so it appears on no slice's
-  Queue tab.
+  mission from the lifecycle identity it compiles. A compiled step's packets
+  carry the `slice:<directory>` of the slice that step was compiled from, even
+  when another slice's directory has the same name as its `metadata.id`. A step
+  an authored graph names carries `slice:<directory>` when it names an active
+  slice: by its exact directory name, else by a `metadata.id` that exactly one
+  active slice claims (an id two slices claim maps to nothing, with a compile
+  advisory). A step that names no slice, such as an authored closing step,
+  carries only `project:` and `mission:`, so it appears on no slice's Queue tab.
+  A project id or mission name the compiler reads from the manifests that cannot
+  be a tag (a space, a `:`, a leading `.`, `_` or `-`, or too long) is left off
+  the packets with a compile advisory; the lifecycle still instantiates. Slice
+  metadata the lifecycle does not run is not read.
+- Over HTTP, `POST /api/workflow/instantiate` reads the scope from a `scope`
+  object (`{ project, mission, slice, tags }`) and validates it as above. Bare
+  `project`, `mission`, `slice` or `tags` fields in the body are ignored, as
+  before: the instance is created unscoped and the response carries a
+  `scopeIgnored` note saying so.
+- A Projects view scoped to a project lists a slice's packets only when they
+  carry `project:<id>` as well as `slice:<id>`, so pass `--project` with
+  `--slice`.
 - The scope is stored on the instance when it is created and does not change.
   Instances created without it behave as before.
 
