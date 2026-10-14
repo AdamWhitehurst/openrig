@@ -1,4 +1,4 @@
-// Migration 109 on a long-lived install: workflow instances created before it hold no
+// Migration 110 on a long-lived install: workflow instances created before it hold no
 // scope, read back unscoped, and keep projecting packets with the tags they always had.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -27,7 +27,7 @@ const SPEC = `workflow:
     - { id: ship, actor_role: reviewer, depends_on: [review], allowed_exits: [done, failed] }
 `;
 
-describe("migration 109 (workflow instance scope) on an install that already holds instances", () => {
+describe("migration 110 (workflow instance scope) on an install that already holds instances", () => {
   let db: Database.Database;
   let tmp: string;
 
@@ -50,7 +50,11 @@ describe("migration 109 (workflow instance scope) on an install that already hol
   });
 
   it("reads pre-existing instances back unscoped and keeps projecting their old tags", async () => {
-    migrate(db, ALL_MIGRATIONS.filter((m) => m.name !== "109_workflow_instance_scope.sql"));
+    // an install at upstream's head before this change: 109_mode_posture_coexist applied, 110 not yet
+    migrate(db, ALL_MIGRATIONS.filter((m) => m.name !== "110_workflow_instance_scope.sql"));
+    const applied = () => (db.prepare(`SELECT name FROM schema_migrations`).all() as Array<{ name: string }>).map((r) => r.name);
+    expect(applied()).toContain("109_mode_posture_coexist.sql");
+    expect(applied()).not.toContain("110_workflow_instance_scope.sql");
     db.prepare(`INSERT INTO rigs (id, name) VALUES ('r-1', 'rig')`).run();
     const specPath = join(tmp, "spec.yaml");
     writeFileSync(specPath, SPEC);
@@ -61,8 +65,9 @@ describe("migration 109 (workflow instance scope) on an install that already hol
     });
     expect(db.prepare(`PRAGMA table_info(workflow_instances)`).all().some((c) => (c as { name: string }).name === "scope_json")).toBe(false);
 
-    // the upgrade: the daemon restarts on a new build and applies 109 to the existing database
+    // the upgrade: the daemon restarts on a new build and applies 110 to the existing database
     migrate(db, ALL_MIGRATIONS);
+    expect(applied()).toEqual(expect.arrayContaining(["109_mode_posture_coexist.sql", "110_workflow_instance_scope.sql"]));
     const after = runtimeOver();
 
     const row = db.prepare(`SELECT scope_json FROM workflow_instances WHERE instance_id = ?`).get(old.instance.instanceId) as { scope_json: string | null };

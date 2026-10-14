@@ -204,7 +204,7 @@ export type WorkflowInstanceStatus = "active" | "waiting" | "completed" | "faile
 
 export interface WorkflowInstance {
   /** The project / mission / slice and free-form tags this instance works for
-   *  (migration 109); stamped on every packet it creates. null = unscoped. */
+   *  (migration 110); stamped on every packet it creates. null = unscoped. */
   scope?: WorkflowScope | null;
   instanceId: string;
   workflowName: string;

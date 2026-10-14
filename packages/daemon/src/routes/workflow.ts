@@ -208,7 +208,7 @@ export function workflowRoutes(): Hono {
         entryOwnerSession?: string;
         /** OPR.0.4.6.FAC1: overrides the spec's target.rig default. */
         targetRig?: string;
-        /** Opt-in scope stamped on every packet the instance creates (migration 109). Validated strictly.
+        /** Opt-in scope stamped on every packet the instance creates (migration 110). Validated strictly.
          *  Bare project/mission/slice/tags fields keep their old meaning: ignored (see scopeIgnored). */
         scope?: { project?: unknown; mission?: unknown; slice?: unknown; tags?: unknown };
       } & Record<string, unknown>>()

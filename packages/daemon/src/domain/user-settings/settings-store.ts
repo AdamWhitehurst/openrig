@@ -189,6 +189,8 @@ export const SETTINGS_VALID_KEYS = [
   "provider.usage_windows",
   "usage.pi_cost_facts",
   "usage.pi_openrouter_charge",
+  // A verified Claude Code or Codex send reports on input-box evidence; daemon-read, twin of the CLI key.
+  "transport.verify_input_box",
   // OPR.0.4.6.FS-1 W2 — queue-retention maintenance knobs (arch D3; closed-set,
   // arch-safe defaults BAKED in getDefaultValue, bounded validation in
   // KEY_CONSTRAINTS). CLI-settable twin: lockstep with cli/src/config-store.ts
@@ -297,6 +299,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "provider.usage_windows": { primary: "OPENRIG_PROVIDER_USAGE_WINDOWS" },
   "usage.pi_cost_facts": { primary: "OPENRIG_USAGE_PI_COST_FACTS" },
   "usage.pi_openrouter_charge": { primary: "OPENRIG_USAGE_PI_OPENROUTER_CHARGE" },
+  "transport.verify_input_box": { primary: "OPENRIG_TRANSPORT_VERIFY_INPUT_BOX" },
   // OPR.0.4.6.FS-1 W2 — retention knobs; net-new keys, OPENRIG_* primary only.
   "retention.enabled": { primary: "OPENRIG_RETENTION_ENABLED" },
   "retention.transitions_days": { primary: "OPENRIG_RETENTION_TRANSITIONS_DAYS" },
@@ -380,6 +383,7 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "provider.usage_windows": ["provider", "usageWindows"],
   "usage.pi_cost_facts": ["usage", "piCostFacts"],
   "usage.pi_openrouter_charge": ["usage", "piOpenRouterCharge"],
+  "transport.verify_input_box": ["transport", "verifyInputBox"],
   "retention.enabled": ["retention", "enabled"],
   "retention.transitions_days": ["retention", "transitionsDays"],
   "retention.watchdog_days": ["retention", "watchdogDays"],
@@ -659,6 +663,8 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     // Slice 02 — Pi cost facts from persisted entries; off until the switch is on.
     case "usage.pi_cost_facts": return false;
     case "usage.pi_openrouter_charge": return false;
+    // Input-box evidence for verified Claude Code and Codex sends; off until the switch is on.
+    case "transport.verify_input_box": return false;
     // OPR.0.4.6.FS-1 W2 — retention defaults (arch D3 safe values: archive
     // terminal+aged transitions >30d; prune watchdog_history >14d keep-50/job;
     // 500 rows/qitems per bounded batch; enabled by default).

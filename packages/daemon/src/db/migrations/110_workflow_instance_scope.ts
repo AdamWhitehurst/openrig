@@ -8,7 +8,7 @@ import type { Migration } from "../migrate.js";
  * packets exactly as before.
  */
 export const workflowInstanceScopeSchema: Migration = {
-  name: "109_workflow_instance_scope.sql",
+  name: "110_workflow_instance_scope.sql",
   sql: `
     ALTER TABLE workflow_instances ADD COLUMN scope_json TEXT;
   `,

@@ -44,6 +44,8 @@ for (const key of [
   "OUTPUT_COMPACT",
   // Slice 01: a seat with usage windows on must not change what the suite reads.
   "PROVIDER_USAGE_WINDOWS",
+  // A seat with input-box verification on must not change what the transport suites verify.
+  "TRANSPORT_VERIFY_INPUT_BOX",
 ]) {
   delete process.env[`OPENRIG_${key}`];
   delete process.env[`RIGGED_${key}`];

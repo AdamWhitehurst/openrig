@@ -109,7 +109,8 @@ import { sessionStopIntentSchema } from "./migrations/103_session_stop_intent.js
 import { usageSamplesClientCostSchema } from "./migrations/105_usage_samples_client_cost.js";
 import { piUsageEntriesSchema } from "./migrations/107_pi_usage_entries.js";
 import { piUsageChargesSchema } from "./migrations/108_pi_usage_charges.js";
-import { workflowInstanceScopeSchema } from "./migrations/109_workflow_instance_scope.js";
+import { modePostureCoexistSchema } from "./migrations/109_mode_posture_coexist.js";
+import { workflowInstanceScopeSchema } from "./migrations/110_workflow_instance_scope.js";
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
 
@@ -218,5 +219,6 @@ export const ALL_MIGRATIONS: Migration[] = [
   usageSamplesClientCostSchema,
   piUsageEntriesSchema,
   piUsageChargesSchema,
+  modePostureCoexistSchema,
   workflowInstanceScopeSchema,
 ];

@@ -42,7 +42,7 @@ interface InstanceRow {
   lifecycle_operation_key?: string | null;
   compiled_input_digest?: string | null;
   lifecycle_binding_json?: string | null;
-  /** Migration 109 — optional at the row layer: legacy fixtures map to null (unscoped). */
+  /** Migration 110 — optional at the row layer: legacy fixtures map to null (unscoped). */
   scope_json?: string | null;
 }
 
@@ -132,7 +132,7 @@ export class WorkflowInstanceStore {
       : "";
     const lifecycleVals = this.hasLifecycleColumns ? ", ?, ?, ?" : "";
     if (input.scope && !this.hasScopeColumn) {
-      throw new WorkflowScopeError("scope_unavailable", "workflow scope requires migration 109");
+      throw new WorkflowScopeError("scope_unavailable", "workflow scope requires migration 110");
     }
     const scopeCol = this.hasScopeColumn ? ", scope_json" : "";
     const scopeVal = this.hasScopeColumn ? ", ?" : "";
