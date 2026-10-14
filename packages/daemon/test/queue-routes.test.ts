@@ -332,6 +332,20 @@ describe("queue routes", () => {
       expect((await show(row.qitemId)).resolution).toBeNull();
     });
 
+    it.each([
+      ["failed", "failed"],
+      ["denied", "done"],
+      ["denied", "denied"],
+      ["failed", "canceled"],
+    ])("is refused on a row already closed %s when closing it again as %s, and the stored resolution stays", async (first, again) => {
+      const row = await claimed();
+      expect((await update(row.qitemId, { state: first, resolution: "first" })).status).toBe(200);
+      const res = await update(row.qitemId, { state: again, ...(again === "done" ? { closureReason: "no-follow-on" } : {}), resolution: "second" });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toBe("resolution_already_closed");
+      expect(await show(row.qitemId)).toMatchObject({ state: first, resolution: "first" });
+    });
+
     it("is refused when blank, and a refused close leaves the row open", async () => {
       const row = await claimed();
       const res = await update(row.qitemId, { state: "done", closureReason: "no-follow-on", resolution: "   " });

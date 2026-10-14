@@ -153,6 +153,7 @@ export function queueRoutes(): Hono {
         : err.code === "note_append_fields_not_admitted" ? 400
         : err.code === "resolution_not_admitted" ? 400
         : err.code === "resolution_empty" ? 400
+        : err.code === "resolution_already_closed" ? 400
         : err.code === "terminal_reopen_requires_ack" ? 409
         : err.code === "terminal_reopen_target_invalid" ? 400
         : err.code === "reopen_note_required" ? 400

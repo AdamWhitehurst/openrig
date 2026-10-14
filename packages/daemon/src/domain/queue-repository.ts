@@ -343,8 +343,8 @@ export interface QueueUpdateInput {
   transitionNote?: string;
   closureReason?: string;
   closureTarget?: string;
-  /** The outcome text stored in queue_items.resolution with a terminal close. Appended after a
-   *  pod-fallback value the row already carries. */
+  /** The outcome text stored in queue_items.resolution with a terminal close, on a row still open.
+   *  Appended after a pod-fallback value the row already carries. */
   resolution?: string;
   /**
    * PL-004 Phase D extension: when set, persists the queue_items.handed_off_to
@@ -2537,6 +2537,13 @@ export class QueueRepository {
         { requestedState: input.state },
       );
     }
+    if (input.resolution != null && !isBlockerLive(qitem.state)) {
+      throw new QueueRepositoryError(
+        "resolution_already_closed",
+        `qitem ${input.qitemId} is already '${qitem.state}'; a resolution is stored with the close and a closed row's resolution is not rewritten. Nothing was written.`,
+        { currentState: qitem.state },
+      );
+    }
     if (input.resolution != null && input.resolution.trim().length === 0) {
       throw new QueueRepositoryError("resolution_empty", "--resolution needs text; nothing was written", {});
     }
@@ -2845,7 +2852,7 @@ export class QueueRepository {
     // transition, leaving dead blockers that nothing audits (the root-cause strand).
     const nextBlockedOn = input.state === "blocked" ? effectiveBlockedOn : null;
     // A pod-fallback reroute already put "fallback: <reason>" here; a closing resolution goes after it
-    // on its own line so neither is lost.
+    // on its own line so neither is lost. Only an open row reaches this with a resolution (refused above once closed).
     const nextResolution = input.resolution == null
       ? qitem.resolution
       : qitem.resolution ? `${qitem.resolution}\n${input.resolution}` : input.resolution;
