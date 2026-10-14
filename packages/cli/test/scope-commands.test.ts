@@ -14,6 +14,7 @@ import YAML from "yaml";
 
 import { scopeCommand } from "../src/commands/scope.js";
 import { readFrontmatter } from "../src/lib/scope/scope-fs.js";
+import { readProjectReadiness, recordJudgment } from "../../daemon/src/domain/proof/judgments.js";
 
 function mktemp(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "rig-scope-cmd-"));
@@ -779,6 +780,76 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
     ], env.missionsRoot);
     expect(r.exitCode).toBe(1);
     expect(JSON.parse(r.stdout).ok).toBe(false);
+  });
+
+  it("seeds metadata.status: active so the mission counts toward the project rollup", async () => {
+    const r = await run(["mission", "create", "experiments-foo", "--json"], env.missionsRoot);
+    expect(r.exitCode).toBe(0);
+    const manifest = YAML.parse(
+      fs.readFileSync(path.join(JSON.parse(r.stdout).mission.path, "mission.yaml"), "utf8"),
+    ) as { metadata?: { status?: string }; composition: { slices: unknown[] } };
+    expect(manifest.metadata?.status).toBe("active");
+    expect(manifest.composition.slices).toEqual([]);
+  });
+
+  it("seeds active for the release template too, since an in-progress release is not yet a candidate", async () => {
+    const r = await run(["mission", "create", "release-0.6.0", "--json"], env.missionsRoot);
+    expect(JSON.parse(r.stdout).mission.template).toBe("release");
+    const manifest = YAML.parse(
+      fs.readFileSync(path.join(JSON.parse(r.stdout).mission.path, "mission.yaml"), "utf8"),
+    ) as { metadata?: { status?: string } };
+    expect(manifest.metadata?.status).toBe("active");
+  });
+
+  it("keeps metadata.status when a slice is later added to the mission", async () => {
+    await run(["mission", "create", "experiments-foo", "--json"], env.missionsRoot);
+    const slice = await run(["slice", "create", "experiments-foo", "first", "--json"], env.missionsRoot);
+    expect(slice.exitCode).toBe(0);
+    const manifest = YAML.parse(
+      fs.readFileSync(path.join(env.missionsRoot, "experiments-foo", "mission.yaml"), "utf8"),
+    ) as { metadata?: { status?: string }; composition: { slices: unknown[] } };
+    expect(manifest.composition.slices).toHaveLength(1);
+    expect(manifest.metadata?.status).toBe("active");
+  });
+
+  it("a freshly created mission whose only item is accepted makes the project read ready", async () => {
+    // Fresh project root so the pre-existing fixture missions (no manifest) stay out of the rollup.
+    const root = mktemp();
+    try {
+      const missions = path.join(root, "missions");
+      writeFile(path.join(root, "project.yaml"), YAML.stringify({
+        kind: "project",
+        metadata: { id: "trial" },
+        proofPolicy: { judges: ["judge@trial"] },
+        missions: { root: "missions" },
+      }));
+      fs.mkdirSync(missions, { recursive: true });
+      expect((await run(["mission", "create", "trial", "--json"], missions)).exitCode).toBe(0);
+      const sliceRun = await run(["slice", "create", "trial", "only", "--json"], missions);
+      expect(sliceRun.exitCode).toBe(0);
+      const sliceDir = JSON.parse(sliceRun.stdout).slice.path as string;
+      writeFile(
+        path.join(sliceDir, "SPEC.md"),
+        `---\nid: only\nstatus: done\n---\n# only\n\n## Proof contract\n- [x] Prove it.\n`,
+      );
+      writeFile(path.join(sliceDir, "proof", "evidence.md"), "Observed outcome.\n");
+      const scope = `trial/slices/${path.basename(sliceDir)}`;
+      expect(readProjectReadiness(missions).state).toBe("not-ready");
+      const { readSliceReadiness } = await import("../../daemon/src/domain/proof/judgments.js");
+      const item = readSliceReadiness(sliceDir).items[0]!;
+      recordJudgment(missions, {
+        scope,
+        item: item.id,
+        verdict: "accept",
+        reason: "Independent accept judgment",
+        evidence: ["proof/evidence.md"],
+        expectedRevision: item.revision,
+        expectedPrevious: null,
+      }, "judge@trial", "transport:v1");
+      expect(readProjectReadiness(missions).state).toBe("ready");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("mission create auto-scaffolds NOTES.md with placeholders substituted", async () => {

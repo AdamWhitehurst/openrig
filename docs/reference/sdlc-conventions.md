@@ -138,6 +138,15 @@ commit. Evidence capture (`proof add`), policy acceptance, higher outcome
 judgment and publication are distinct. This optional component does not select
 Part B or add a mandatory review gate.
 
+The project readiness that `rig proof show --project` reports counts only
+missions whose `mission.yaml` carries `metadata.status: active` or
+`metadata.status: release-candidate`. `rig scope mission create` writes
+`active`, including for a release mission, so a new mission counts from the
+start. Change it to `release-candidate` when a release is ready to judge, or to
+any other value (for example `paused`) to leave the mission out of the rollup.
+Missions created before this default carry no status; add the line by hand to
+include them.
+
 The three sections project into the UI's one review structure: a vertical
 stack of **INTENT → PLAN → DELIVERED**. A slice missing a section still
 renders (a missing Intent or Delivered source shows a muted "—", missing
