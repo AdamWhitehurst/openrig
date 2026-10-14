@@ -1833,6 +1833,14 @@ describe("rig queue CLI", () => {
       closingTransition: { transitionId: 7, ts: "2026-10-14T21:00:00.000Z", state: "done", closureReason: "no-follow-on", closureTarget: null, actorSession: "b@r", transitionNote: "shipped it" },
     };
 
+    it("show without --full: an open row's readView stays complete", async () => {
+      const { deps } = showRoute({ qitemId: "qitem-1", state: "pending", body: "work" });
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "show", "qitem-1", "--json"]);
+      expect(JSON.parse(logs[0]).readView).toMatchObject({ complete: true, omittedFields: [] });
+    });
+
     it("show --full: a closed row's closing transition (note and reason) is printed, as JSON and as text", async () => {
       for (const flags of [["--json"], []]) {
         logs.length = 0;
@@ -1855,6 +1863,10 @@ describe("rig queue CLI", () => {
         expect(printed.state).toBe("done");
         expect(printed).not.toHaveProperty("closingTransition");
         expect(logs.join("\n")).not.toContain("shipped it");
+        // The omission is declared, so a reader that trusts readView runs --full.
+        expect(printed.readView.complete).toBe(false);
+        expect(printed.readView.omittedFields).toEqual([{ path: "closingTransition", jsonBytes: JSON.stringify(closed.closingTransition).length }]);
+        expect(printed.readView.fullCommand).toBe("rig queue show 'qitem-1' --full --json");
       }
     });
 

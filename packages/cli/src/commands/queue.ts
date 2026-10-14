@@ -1336,12 +1336,17 @@ workspace home that is deferred/not-imminent belongs in its mission/slice.`)
           return;
         }
         // The closing transition is for --full; the bounded preview prints the record as it did before.
-        const { closingTransition: _closing, ...record } = item as typeof item & { closingTransition?: unknown };
+        const { closingTransition, ...record } = item as typeof item & { closingTransition?: unknown };
         const { preview, bodyBytes, bodyTruncated } = previewBody(item.body);
         // Append-only additions: keep `body` in place (now the preview) and add
         // the honest size + truncation flag. Object otherwise unchanged.
         const fullCommand = `rig queue show ${shellQuote(qitemId)} --full --json`;
-        const view = readView(item, fullCommand, bodyTruncated ? [omittedReadField("body (after preview)", item.body.slice(preview.length))] : []);
+        // Everything held back from this preview is declared, so a reader that trusts readView runs --full.
+        const omitted = [
+          ...(bodyTruncated ? [omittedReadField("body (after preview)", item.body.slice(preview.length))] : []),
+          ...(closingTransition === undefined ? [] : [omittedReadField("closingTransition", closingTransition)]),
+        ];
+        const view = readView(item, fullCommand, omitted);
         const transformed = { ...record, body: preview, bodyBytes, bodyTruncated, readView: view };
         // Slice 15 P2: with output.compact on, the empty fields are left out and counted.
         const compact = compactOutputEnabled() ? compactShow(transformed) : null;
