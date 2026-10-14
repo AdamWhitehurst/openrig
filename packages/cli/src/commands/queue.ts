@@ -935,7 +935,7 @@ export function queueCommand(depsOverride?: QueueDeps): Command {
     .option("--reopen", "Explicitly acknowledge a deliberate terminal-to-active repair; requires --state and --note")
     .option("--closure-reason <reason>", "Required for state=done; also 'superseded' on state=canceled (with --closure-target = the successor) records a supersession, distinct from an abandoned cancel")
     .option("--closure-target <target>", "Required for handed_off_to, blocked_on, escalation, and superseded")
-    .option("--resolution <text>", "With a close (done, canceled, denied, failed, handed-off): the outcome, stored on the row and shown by rig queue show. Appended after a pod-fallback resolution the row already has. Refused on a non-closing update")
+    .option("--resolution <text>", "With a close (done, canceled, denied, failed, handed-off): the outcome, stored on the row and shown by rig queue show. Appended after a pod-fallback resolution the row already has. Refused on a non-closing update (resolution_not_admitted) and on a row that is already closed (resolution_already_closed)")
     .option("--blocked-on <blocker>", "For state=blocked: the blocker — a qitem id (must exist and be live), a human seat (FR-6 park; requires summary + evidence_ref), or a typed non-qitem gate 'fold:<what>' / 'auth:<what>' / 'external:<what>'")
     .option("--wake-watchdog <jobId>", "For state=blocked: attach an existing live watchdog id targeting the row owner")
     .option("--wake-after <duration>", "For state=blocked: atomically arm a timer (for example 90s, 15m, 2h)", wakeDurationSeconds)
