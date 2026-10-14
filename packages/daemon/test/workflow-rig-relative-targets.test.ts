@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type Database from "better-sqlite3";
@@ -10,6 +10,9 @@ import { QueueRepository } from "../src/domain/queue-repository.js";
 import { WorkflowRuntime } from "../src/domain/workflow-runtime.js";
 import { WorkflowProjectorError } from "../src/domain/workflow-projector.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
+import { WorkflowSpecCache } from "../src/domain/workflow-spec-cache.js";
+import { SliceIndexer } from "../src/domain/slices/slice-indexer.js";
+import { SliceDetailProjector } from "../src/domain/slices/slice-detail-projector.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 
 // A reusable workflow spec can write `member@{rig}` in preferred_targets;
@@ -25,10 +28,10 @@ const SPEC_RIG_RELATIVE = `workflow:
   roles:
     watcher:
       preferred_targets:
-        - watcher@{rig}
+        - ops-watcher@{rig}
     finisher:
       preferred_targets:
-        - finisher@{rig}
+        - ops-finisher@{rig}
   steps:
     - id: watch
       actor_role: watcher
@@ -53,7 +56,7 @@ const SPEC_LITERAL = `workflow:
   roles:
     watcher:
       preferred_targets:
-        - watcher@rig-a
+        - ops-watcher@rig-a
   steps:
     - id: watch
       actor_role: watcher
@@ -71,9 +74,9 @@ describe("workflow preferred_targets: member@{rig}", () => {
   function seedRig(id: string, name: string, member: string, runtimeName: string): void {
     db.prepare(`INSERT INTO rigs (id, name) VALUES (?, ?)`).run(id, name);
     db.prepare(`INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES (?, ?, ?, ?)`)
-      .run(`n-${id}`, id, member, runtimeName);
+      .run(`n-${id}`, id, `ops.${member}`, runtimeName);
     db.prepare(`INSERT INTO sessions (id, node_id, session_name, status) VALUES (?, ?, ?, 'running')`)
-      .run(`s-${id}`, `n-${id}`, `${member}@${name}`);
+      .run(`s-${id}`, `n-${id}`, `ops-${member}@${name}`);
   }
 
   function entryOwner(instanceId: string): string {
@@ -109,14 +112,14 @@ describe("workflow preferred_targets: member@{rig}", () => {
   const instantiate = (specPath: string, targetRig?: string) =>
     runtime.instantiate({ specPath, rootObjective: "t", createdBySession: "orch@orch", ...(targetRig ? { targetRig } : {}) });
 
-  it("--rig A resolves watcher@{rig} to watcher@rig-a", async () => {
+  it("--rig A resolves ops-watcher@{rig} to ops-watcher@rig-a", async () => {
     const r = await instantiate(relativePath, "rig-a");
-    expect(entryOwner(r.instance.instanceId)).toBe("watcher@rig-a");
+    expect(entryOwner(r.instance.instanceId)).toBe("ops-watcher@rig-a");
   });
 
-  it("--rig B resolves the same spec to watcher@rig-b, a terminal member", async () => {
+  it("--rig B resolves the same spec to ops-watcher@rig-b, a terminal member", async () => {
     const r = await instantiate(relativePath, "rig-b");
-    expect(entryOwner(r.instance.instanceId)).toBe("watcher@rig-b");
+    expect(entryOwner(r.instance.instanceId)).toBe("ops-watcher@rig-b");
   });
 
   it("refuses {rig} with no bound rig, before creating an instance", async () => {
@@ -137,25 +140,25 @@ describe("workflow preferred_targets: member@{rig}", () => {
 
   it("literal member@rig entries behave as before, bound or not", async () => {
     const unbound = await instantiate(literalPath);
-    expect(entryOwner(unbound.instance.instanceId)).toBe("watcher@rig-a");
+    expect(entryOwner(unbound.instance.instanceId)).toBe("ops-watcher@rig-a");
     const bound = await instantiate(literalPath, "rig-b");
-    expect(entryOwner(bound.instance.instanceId)).toBe("watcher@rig-a");
+    expect(entryOwner(bound.instance.instanceId)).toBe("ops-watcher@rig-a");
   });
 
   it("later hops use the bound rig too (the stored binding drives every read)", async () => {
     const r = await instantiate(relativePath, "rig-b");
-    db.prepare(`INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES ('n-f', 'r-b', 'finisher', 'claude-code')`).run();
-    db.prepare(`INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s-f', 'n-f', 'finisher@rig-b', 'running')`).run();
+    db.prepare(`INSERT INTO nodes (id, rig_id, logical_id, runtime) VALUES ('n-f', 'r-b', 'ops.finisher', 'claude-code')`).run();
+    db.prepare(`INSERT INTO sessions (id, node_id, session_name, status) VALUES ('s-f', 'n-f', 'ops-finisher@rig-b', 'running')`).run();
     const packetId = r.instance.currentFrontier[0] ?? (db.prepare(`SELECT qitem_id FROM queue_items LIMIT 1`).get() as { qitem_id: string }).qitem_id;
     const projected = await runtime.project({
       instanceId: r.instance.instanceId,
       currentPacketId: packetId,
       exit: "handoff",
-      actorSession: "watcher@rig-b",
+      actorSession: "ops-watcher@rig-b",
       resultNote: "next",
     } as never);
     const next = (projected as { nextOwnerSession?: string | null }).nextOwnerSession;
-    expect(next).toBe("finisher@rig-b");
+    expect(next).toBe("ops-finisher@rig-b");
   });
 
   it("validate on an unbound spec says a {rig} exception target resolves at instantiate, not 'unregistered'", () => {
@@ -164,10 +167,150 @@ describe("workflow preferred_targets: member@{rig}", () => {
     const { exceptionReadiness } = runtime.validate(specPath);
     expect(exceptionReadiness.routes.length).toBeGreaterThan(0);
     for (const route of exceptionReadiness.routes) {
-      expect(route.destinationSession).toBe("watcher@{rig}");
+      expect(route.destinationSession).toBe("ops-watcher@{rig}");
       expect(route.identity).not.toBe("unregistered");
       expect(route.state).toBe("ready");
       expect(route.message).toMatch(/resolves at instantiate against the bound rig/);
     }
+  });
+
+  // --- instance reads: each path below reads the spec for a bound instance ---
+
+  const SPEC_FAILABLE = `workflow:
+  id: rig-relative-failable
+  version: 1
+  objective: a failed step re-resolves a {rig} target on resume
+  entry:
+    role: watcher
+  roles:
+    watcher:
+      preferred_targets:
+        - ops-watcher@{rig}
+  steps:
+    - id: watch
+      actor_role: watcher
+      allowed_exits:
+        - handoff
+        - failed
+        - done
+  exception_routing:
+    orchestrator_role: watcher
+`;
+
+  function failedInstance(targetRig: string) {
+    const specPath = join(tmp, "failable.yaml");
+    writeFileSync(specPath, SPEC_FAILABLE);
+    return instantiate(specPath, targetRig).then(async (r) => {
+      const packetId = r.instance.currentFrontier[0]!;
+      await runtime.project({
+        instanceId: r.instance.instanceId,
+        currentPacketId: packetId,
+        exit: "failed",
+        actorSession: `ops-watcher@${targetRig}`,
+        resultNote: "boom",
+      });
+      return { instanceId: r.instance.instanceId, packetId };
+    });
+  }
+
+  it("resume re-resolves the failed step's {rig} target on the bound rig", async () => {
+    const { instanceId } = await failedInstance("rig-b");
+    const resumed = await runtime.resume({ instanceId, actorSession: "orch@orch" });
+    expect(resumed.ownerSession).toBe("ops-watcher@rig-b");
+  });
+
+  it("an unmapped failure's exception item goes to the {rig} target on the bound rig", async () => {
+    const { instanceId } = await failedInstance("rig-b");
+    const row = db.prepare(`SELECT destination_session FROM queue_items WHERE json_valid(tags)
+      AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = 'workflow-exception')
+      AND EXISTS (SELECT 1 FROM json_each(tags) WHERE value = ?)`).get(`instance:${instanceId}`) as { destination_session: string } | undefined;
+    expect(row?.destination_session).toBe("ops-watcher@rig-b");
+  });
+
+  it("resolveExceptionRouteFor expands {rig} with the instance's bound rig", async () => {
+    await failedInstance("rig-a");
+    const route = runtime.resolveExceptionRouteFor("rig-relative-failable", "1", "unmapped_failed", "rig-b");
+    expect(route?.destinationSession).toBe("ops-watcher@rig-b");
+  });
+
+  it("exceptionReadiness reads the bound instance's target, not the literal {rig}", async () => {
+    const { instanceId } = await failedInstance("rig-b");
+    const readiness = runtime.exceptionReadiness(instanceId)!;
+    for (const route of readiness.routes) {
+      expect(route.destinationSession).toBe("ops-watcher@rig-b");
+      expect(route.identity).toBe("declared-member");
+    }
+  });
+
+  it("route re-targets a {rig} instance's frontier packet", async () => {
+    const r = await instantiate(relativePath, "rig-b");
+    const routed = await runtime.route({
+      instanceId: r.instance.instanceId, toSession: "other@orch", actorSession: "orch@orch", reason: "move",
+    });
+    expect(routed.fromSession).toBe("ops-watcher@rig-b");
+    expect(routed.toSession).toBe("other@orch");
+  });
+
+  it("abort closes a {rig} instance and records the step's role", async () => {
+    const r = await instantiate(relativePath, "rig-b");
+    const aborted = await runtime.abort({ instanceId: r.instance.instanceId, reason: "stop", actorSession: "orch@orch" });
+    expect(aborted.status).toBe("aborted");
+    const trail = db.prepare(`SELECT step_role FROM workflow_step_trails WHERE instance_id = ?`).get(r.instance.instanceId) as { step_role: string };
+    expect(trail.step_role).toBe("watcher");
+  });
+
+  it("an unknown spec-default target.rig leaves the instance unbound, so a {rig} spec is refused", async () => {
+    const specPath = join(tmp, "default-unknown.yaml");
+    writeFileSync(specPath, SPEC_RIG_RELATIVE.replace("  entry:", "  target:\n    rig: vanished-rig\n  entry:"));
+    await expect(instantiate(specPath)).rejects.toMatchObject({ code: "rig_placeholder_unbound" });
+    const n = db.prepare(`SELECT COUNT(*) AS c FROM workflow_instances`).get() as { c: number };
+    expect(n.c).toBe(0);
+  });
+
+  it("the slice view of a bound instance shows the seat the packet went to, not the literal {rig}", async () => {
+    const sliceRoot = join(tmp, "slices");
+    mkdirSync(join(sliceRoot, "rr-slice"), { recursive: true });
+    writeFileSync(join(sliceRoot, "rr-slice", "README.md"), "---\nslice: rr-slice\nrail-item: PL-test\nstatus: active\n---\n# rr-slice\n");
+    const r = await runtime.instantiate({ specPath: relativePath, rootObjective: "rr-slice work", createdBySession: "orch@orch", targetRig: "rig-b" });
+    const indexer = new SliceIndexer({ slicesRoot: sliceRoot, dogfoodEvidenceRoot: null, db });
+    const projector = new SliceDetailProjector({ db, indexer, workflowSpecCache: new WorkflowSpecCache(db) });
+    const detail = projector.project(indexer.get("rr-slice")!);
+    expect(detail.workflowBinding?.instanceId).toBe(r.instance.instanceId);
+    expect(detail.topology.specGraph?.nodes.find((n) => n.role === "watcher")?.preferredTarget).toBe("ops-watcher@rig-b");
+  });
+
+  it("an occurrence-local resume (dependency graph) re-resolves the {rig} target too", async () => {
+    const specPath = join(tmp, "graph.yaml");
+    writeFileSync(specPath, `workflow:
+  id: rig-relative-graph
+  version: 1
+  entry: {role: watcher}
+  roles:
+    watcher:
+      preferred_targets:
+        - ops-watcher@{rig}
+  exception_routing: {orchestrator_role: watcher}
+  steps:
+    - id: root
+      actor_role: watcher
+      depends_on: []
+      allowed_exits: [done, failed]
+    - id: left
+      actor_role: watcher
+      depends_on: [root]
+      allowed_exits: [done, failed]
+    - id: right
+      actor_role: watcher
+      depends_on: [root]
+      allowed_exits: [done, failed]
+`);
+    const started = await instantiate(specPath, "rig-b");
+    const instanceId = started.instance.instanceId;
+    await runtime.project({ instanceId, currentPacketId: started.entryQitemId, actorSession: "ops-watcher@rig-b", exit: "done" });
+    const left = runtime.inspect(instanceId).frontier.find((p) => p.stepId === "left")!.packetId;
+    await runtime.project({ instanceId, currentPacketId: left, actorSession: "ops-watcher@rig-b", exit: "failed", resultNote: "boom" });
+    expect(runtime.inspect(instanceId).failures).toHaveLength(1);
+    const resumed = await runtime.resume({ instanceId, occurrenceId: left, actorSession: "orch@orch" });
+    expect(resumed.ownerSession).toBe("ops-watcher@rig-b");
   });
 });
