@@ -8,12 +8,12 @@ import {
 
 const normalize = (text: string): string => text.replace(/\s+/g, "");
 // Claude 2.1.289 briefly replaces its mode bar after a bracketed paste.
-// Only the bare hint and medium-effort suffix are established by retained captures.
+// The hint is the bare line or carries an effort suffix, which depends on the seat's effort setting.
 // Vim mode puts `-- INSERT --` ahead of either footer, and a narrow pane truncates the mode bar's hint,
 // so a mode-bar line is also known by its leading marker.
 const VIM_MODE_PREFIX = /^-- INSERT --\s*/;
 const MODE_BAR_START = /^(?:⏵⏵|⏸)(?:\s|$)/;
-// The effort suffix is a filled-circle glyph and a level, e.g. `◐ medium` or `● high`; arbitrary text is not one.
+// The suffix is a circle glyph and an effort level, e.g. `◐ medium` or `● high`; arbitrary text is not one.
 const PASTE_HINT = /^paste again to expand(?:\s{2,}[◐●○◑◒◓] (?:low|medium|high|xhigh|max) · \/effort)?$/;
 const isComposerFooter = (line: string): boolean => {
   const bar = line.replace(VIM_MODE_PREFIX, "");
