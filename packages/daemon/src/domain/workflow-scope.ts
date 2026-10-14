@@ -100,25 +100,19 @@ export function workflowScopeTags(scope: WorkflowScope | null | undefined, stepS
   return out;
 }
 
-/** The tags for a packet of `stepId`. A lifecycle step is one slice: its packets carry the step's slice directory name
- *  (the step id for a step compiled from no slice directory, such as one an authored boundary or a revision adds). */
-export function packetScopeTags(
-  instance: { scope?: WorkflowScope | null; lifecycleOperationKey?: string | null },
-  stepId: string | null | undefined,
-): string[] {
-  const stepSlice = instance.lifecycleOperationKey && stepId ? (instance.scope?.stepSlices?.[stepId] ?? stepId) : null;
-  return workflowScopeTags(instance.scope, stepSlice);
+/** The tags for a packet of `stepId`. A lifecycle step that is a slice carries its slice directory name; a step that
+ *  matches no active slice (an authored closing step, one a revision adds) carries project and mission only. */
+export function packetScopeTags(instance: { scope?: WorkflowScope | null }, stepId: string | null | undefined): string[] {
+  return workflowScopeTags(instance.scope, stepId ? (instance.scope?.stepSlices?.[stepId] ?? null) : null);
 }
 
 /** Read an instance's scope straight from the row (for code that holds only the db). */
-export function readInstanceScope(db: Database.Database, instanceId: string): { scope: WorkflowScope | null; lifecycleOperationKey: string | null } {
+export function readInstanceScope(db: Database.Database, instanceId: string): { scope: WorkflowScope | null } {
   try {
-    const row = db
-      .prepare(`SELECT scope_json, lifecycle_operation_key FROM workflow_instances WHERE instance_id = ?`)
-      .get(instanceId) as { scope_json: string | null; lifecycle_operation_key: string | null } | undefined;
-    return { scope: row?.scope_json ? (JSON.parse(row.scope_json) as WorkflowScope) : null, lifecycleOperationKey: row?.lifecycle_operation_key ?? null };
+    const row = db.prepare(`SELECT scope_json FROM workflow_instances WHERE instance_id = ?`).get(instanceId) as { scope_json: string | null } | undefined;
+    return { scope: row?.scope_json ? (JSON.parse(row.scope_json) as WorkflowScope) : null };
   } catch {
     // Fixture databases that skip the canonical migrations have no scope column.
-    return { scope: null, lifecycleOperationKey: null };
+    return { scope: null };
   }
 }

@@ -173,9 +173,9 @@ describe.skipIf(process.platform === "win32")("makeRealStagingDocker — real pr
     { trigger: "SIGINT", host: "none", expectCode: null, expectSignal: "SIGINT" },
     { trigger: "SIGTERM", host: "none", expectCode: null, expectSignal: "SIGTERM" },
     { trigger: "SIGHUP", host: "none", expectCode: null, expectSignal: "SIGHUP" },
+    { trigger: "SIGQUIT", host: "none", expectCode: null, expectSignal: "SIGQUIT" },
     { trigger: "exit", host: "none", expectCode: 7, expectSignal: null },
     { trigger: "SIGINT", host: "once", expectCode: 3, expectSignal: null },
-    { trigger: "SIGQUIT", host: "once", expectCode: 3, expectSignal: null },
   ] as const)("parent $trigger mid-step (host handler: $host): no descendant of either side survives, parent ends as it would have", async ({ trigger, host, expectCode, expectSignal }) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "staging-invoker-parent-"));
     const pidFiles = [path.join(dir, "consumer-descendant.pid"), path.join(dir, "producer-descendant.pid")];

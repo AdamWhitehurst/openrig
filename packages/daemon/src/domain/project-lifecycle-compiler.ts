@@ -38,8 +38,8 @@ export interface LifecycleCompilation {
   compiledInputDigest: string;
   sources: LifecycleSourceDigest[];
   dependencies: Array<{ stepId: string; dependsOn: string[] }>;
-  /** Slice identity (metadata.id and directory name) -> slice directory name, for every active slice. The Queue tab keys
-   *  on the directory, which a step id (from metadata.id, or authored to name a slice) need not equal. */
+  /** Slice directory name or metadata.id -> slice directory name, for every active slice (a directory name wins over an id;
+   *  an id several slices claim is absent). The Queue tab keys on the directory, which a step id need not equal. */
   sliceDirs: Record<string, string>;
   graphSource: LifecycleGraphSource;
   workflowSpec: WorkflowSpec | null;
@@ -86,6 +86,8 @@ export function compileProjectLifecycle(input: {
   const sources: LifecycleSourceDigest[] = [digestSource("project", projectPath), digestSource("mission", missionPath)];
   const steps: WorkflowStepSpec[] = [];
   const sliceDirs: Record<string, string> = {};
+  const activeSliceDirs: string[] = [];
+  const idClaims = new Map<string, string[]>();
   const roles: WorkflowSpec["roles"] = {};
   const unknowns: string[] = [];
   const advisories: string[] = [];
@@ -174,13 +176,12 @@ export function compileProjectLifecycle(input: {
       throw manifestError("lifecycle_slice_mission_mismatch", `${slicePath}: composition.mission does not resolve to ${missionPath}`, { slicePath, missionRef, missionPath });
     }
 
-    // Every active slice maps its identity (metadata.id, and its directory name) to the directory, authored graph
-    // or not: an authored step named for either lands on this slice's Queue tab.
+    // Every active slice contributes its directory name and metadata.id, authored graph or not; resolved after the loop.
     const sliceDir = basename(dirname(slicePath));
     const sliceId = optionalString(asMapping(slice.metadata, `${slicePath}: metadata`, true)?.id, `${slicePath}: metadata.id`);
     if (member.active) {
-      if (sliceId) sliceDirs[sliceId] ??= sliceDir;
-      sliceDirs[sliceDir] ??= sliceDir;
+      activeSliceDirs.push(sliceDir);
+      if (sliceId) idClaims.set(sliceId, [...(idClaims.get(sliceId) ?? []), sliceDir]);
     }
 
     // A mission boundary is explicitly authored; slice SDLC never manufactures its steps.
@@ -209,6 +210,14 @@ export function compileProjectLifecycle(input: {
     };
     steps.push(step);
   });
+
+  // An authored step is named for a slice's directory or its metadata.id. The directory wins; an id that names a
+  // directory-less slice maps only when exactly one active slice claims it, otherwise the step gets no slice tag.
+  for (const [id, dirs] of idClaims) {
+    if (dirs.length === 1) sliceDirs[id] = dirs[0]!;
+    else advisories.push(`slice metadata.id "${id}" is claimed by ${dirs.length} active slices (${dirs.join(", ")}); a step named "${id}" is tagged with no slice`);
+  }
+  for (const dir of activeSliceDirs) sliceDirs[dir] = dir;
 
   if (!input.operationKey) unknowns.push("opaque lifecycle operation key not supplied");
   if (!lifecycleProfile) unknowns.push("project lifecycle profile missing");

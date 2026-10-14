@@ -297,44 +297,64 @@ describe("workflow scope tags", () => {
   });
 
   describe("authored lifecycle graph", () => {
-    it("tags a step named for a slice's metadata.id or directory with that slice's directory, any other step by its id", async () => {
-      const missionDir = join(tmp, "missions", "release-2.0.0");
-      mkdirSync(join(missionDir, "slices", "01-build"), { recursive: true });
-      mkdirSync(join(missionDir, "slices", "02-ship"), { recursive: true });
+    // A mission whose graph is authored (lifecycle.workflow) over slices that each have a directory and a metadata.id.
+    const authoredMission = (name: string, slices: Array<{ dir: string; id: string }>, steps: string[]) => {
+      const missionDir = join(tmp, "missions", name);
+      for (const { dir, id } of slices) {
+        mkdirSync(join(missionDir, "slices", dir), { recursive: true });
+        writeFileSync(join(missionDir, "slices", dir, "slice.yaml"), `kind: slice\nmetadata: { id: ${id} }\ncomposition: { mission: ../../mission.yaml }\n`);
+      }
       writeFileSync(join(tmp, "project.yaml"), `kind: project\nmetadata: { id: demo }\nmissions: { root: missions }\nlifecycle: { profile: authored-v0 }\n`);
-      const boundary = [
-        "lifecycle:",
-        "  profile: authored-v0",
-        "  workflow:",
-        "    entry: { role: builder }",
-        "    roles:",
-        "      builder: { preferred_targets: [builder@rig] }",
-        "    steps:",
-        "      - { id: build, actor_role: builder, allowed_exits: [handoff, done, failed] }",
-        "      - { id: 02-ship, actor_role: builder, depends_on: [build], allowed_exits: [handoff, done, failed] }",
-        "      - { id: wrap-up, actor_role: builder, depends_on: [02-ship], allowed_exits: [done, failed] }",
-      ].join("\n");
-      writeFileSync(join(missionDir, "mission.yaml"), `kind: mission\nmetadata: { name: release-2.0.0 }\ncomposition:\n  slices:\n    - { ref: slices/01-build/slice.yaml, order: 10 }\n    - { ref: slices/02-ship/slice.yaml, order: 20 }\n${boundary}\n`);
-      writeFileSync(join(missionDir, "slices", "01-build", "slice.yaml"), `kind: slice\nmetadata: { id: build }\ncomposition: { mission: ../../mission.yaml }\n`);
-      writeFileSync(join(missionDir, "slices", "02-ship", "slice.yaml"), `kind: slice\nmetadata: { id: ship }\ncomposition: { mission: ../../mission.yaml }\n`);
-      const created = await runtime.instantiateLifecycle({
-        missionPath: missionDir, operationKey: "scope-op-authored", rootObjective: "authored", createdBySession: "ops@rig",
-      });
-      // step "build" is the slice whose metadata.id is build (directory 01-build)
-      expect(tagsOf(created.entryQitemId).slice(-3)).toEqual(["project:demo", "mission:release-2.0.0", "slice:01-build"]);
-      const second = await runtime.project({
-        instanceId: created.instance.instanceId, currentPacketId: created.entryQitemId, exit: "handoff", actorSession: "builder@rig",
-      });
-      // step "02-ship" is named for a slice directory
-      expect(tagsOf(second.nextQitemId!).slice(-1)).toEqual(["slice:02-ship"]);
-      const third = await runtime.project({
-        instanceId: created.instance.instanceId, currentPacketId: second.nextQitemId!, exit: "handoff", actorSession: "builder@rig",
-      });
-      // step "wrap-up" matches no slice: its own id
-      expect(tagsOf(third.nextQitemId!).slice(-1)).toEqual(["slice:wrap-up"]);
+      const graph = steps.map((id, i) =>
+        `      - { id: ${id}, actor_role: builder${i > 0 ? `, depends_on: [${steps[i - 1]}]` : ""}, allowed_exits: [handoff, done, failed] }`);
+      writeFileSync(join(missionDir, "mission.yaml"), [
+        `kind: mission`, `metadata: { name: ${name} }`, `composition:`, `  slices:`,
+        ...slices.map(({ dir }, i) => `    - { ref: slices/${dir}/slice.yaml, order: ${(i + 1) * 10} }`),
+        `lifecycle:`, `  profile: authored-v0`, `  workflow:`, `    entry: { role: builder }`, `    roles:`,
+        `      builder: { preferred_targets: [builder@rig] }`, `    steps:`, ...graph, ``,
+      ].join("\n"));
+      return missionDir;
+    };
+    // The slice tag on the packet each step of the authored chain produces, in order.
+    const sliceTagsAlong = async (missionDir: string, key: string, length: number) => {
+      const created = await runtime.instantiateLifecycle({ missionPath: missionDir, operationKey: key, rootObjective: "authored", createdBySession: "ops@rig" });
+      const out = [tagsOf(created.entryQitemId).filter((t) => t.startsWith("slice:"))];
+      let current = created.entryQitemId;
+      for (let i = 1; i < length; i++) {
+        const next = await runtime.project({ instanceId: created.instance.instanceId, currentPacketId: current, exit: "handoff", actorSession: "builder@rig" });
+        current = next.nextQitemId!;
+        out.push(tagsOf(current).filter((t) => t.startsWith("slice:")));
+      }
+      return { created, out };
+    };
+
+    it("tags a step named for a slice's metadata.id or directory with that slice's directory, and a step matching no slice with no slice tag", async () => {
+      const missionDir = authoredMission("release-2.0.0", [{ dir: "01-build", id: "build" }, { dir: "02-ship", id: "ship" }], ["build", "02-ship", "wrap-up"]);
+      const { created, out } = await sliceTagsAlong(missionDir, "scope-op-authored", 3);
+      expect(out).toEqual([["slice:01-build"], ["slice:02-ship"], []]);
+      // project and mission still ride the unmatched step's packets
+      expect(created.instance.scope).toMatchObject({ project: "demo", mission: "release-2.0.0" });
       const indexer = new SliceIndexer({ db, slicesRoot: join(tmp, "missions"), dogfoodEvidenceRoot: null, projectId: "demo" });
       expect(indexer.get("01-build")?.qitemIds).toContain(created.entryQitemId);
-      expect(indexer.get("02-ship")?.qitemIds).toContain(second.nextQitemId);
+    });
+
+    it("an exact directory-name match wins over a metadata.id match, whatever the composition order", async () => {
+      // dir 01-alpha has id 02-beta; dir 02-beta has id beta. A step named 02-beta is the directory 02-beta.
+      const alpha = { dir: "01-alpha", id: "02-beta" };
+      const beta = { dir: "02-beta", id: "beta" };
+      const forward = await sliceTagsAlong(authoredMission("alias-forward", [alpha, beta], ["02-beta", "beta"]), "alias-forward", 2);
+      expect(forward.out).toEqual([["slice:02-beta"], ["slice:02-beta"]]);
+      const reversed = await sliceTagsAlong(authoredMission("alias-reversed", [beta, alpha], ["02-beta", "beta"]), "alias-reversed", 2);
+      expect(reversed.out).toEqual(forward.out);
+    });
+
+    it("an id claimed by more than one active slice maps to nothing, with an advisory", async () => {
+      const missionDir = authoredMission("dup-ids", [{ dir: "01-a", id: "dup" }, { dir: "02-b", id: "dup" }], ["dup", "01-a"]);
+      const compiled = runtime.compileLifecycle(missionDir, "dup-op");
+      expect(compiled.sliceDirs).toEqual({ "01-a": "01-a", "02-b": "02-b" });
+      expect(compiled.advisories.join("\n")).toMatch(/"dup" is claimed by 2 active slices/);
+      const { out } = await sliceTagsAlong(missionDir, "dup-op", 2);
+      expect(out).toEqual([[], ["slice:01-a"]]);
     });
   });
 
