@@ -249,7 +249,7 @@ export class WorkflowProjector {
         { instanceId: instance.instanceId, currentPacketId: input.currentPacketId, frontier: instance.currentFrontier },
       );
     }
-    const specRow = this.specCache.getByNameVersion(instance.workflowName, instance.workflowVersion);
+    const specRow = this.specCache.getForInstance(instance);
     if (!specRow) {
       throw new WorkflowProjectorError(
         "spec_not_cached",

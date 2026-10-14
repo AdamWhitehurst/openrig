@@ -43,7 +43,8 @@ import {
 } from "./workflow-projector.js";
 import { loadHostRegistry } from "./hosts/hosts-registry-reader.js";
 import type { HostRegistryLookupFn } from "./workflow-validator.js";
-import { WorkflowSpecCache, WorkflowSpecError } from "./workflow-spec-cache.js";
+import { WorkflowSpecCache, WorkflowSpecError, bindRowToRig } from "./workflow-spec-cache.js";
+import { RIG_PLACEHOLDER, rolesUsingRigPlaceholder } from "./workflow-rig-placeholder.js";
 import { WorkflowStepTrailLog } from "./workflow-step-trail-log.js";
 import {
   type SeatLivenessCheckFn,
@@ -209,7 +210,7 @@ export class WorkflowRuntime {
 
   guidance(instanceId: string, options: Pick<GuidanceInput, "packetId" | "component" | "full"> = {}) {
     const instance = this.instanceStore.getByIdOrThrow(instanceId);
-    const spec = this.specCache.getByNameVersion(instance.workflowName, instance.workflowVersion)?.spec;
+    const spec = this.specCache.getForInstance(instance)?.spec;
     const packetId = options.packetId ?? (instance.currentFrontier.length === 1 ? instance.currentFrontier[0] : undefined);
     if (packetId && !instance.currentFrontier.includes(packetId)) throw new WorkflowProjectorError("packet_not_on_frontier", "Guidance needs a current frontier packet; inspect workflow show first.");
     const packet = packetId ? this.queueRepo.getById(packetId) : null;
@@ -220,7 +221,7 @@ export class WorkflowRuntime {
 
   exceptionReadiness(instanceId: string): ExceptionReadiness | null {
     const instance = this.instanceStore.getByIdOrThrow(instanceId);
-    const row = this.specCache.getByNameVersion(instance.workflowName, instance.workflowVersion);
+    const row = this.specCache.getForInstance(instance);
     if (!row) return null;
     return this.readExceptionReadiness(row.spec, exceptionConfigurationSource(row.sourcePath,
       instance.lifecycleBinding?.graphSource as LifecycleCompilation["graphSource"] | undefined), instance.boundRig, instanceId);
@@ -296,8 +297,9 @@ export class WorkflowRuntime {
      *  Absent/null = the shipped fleet-blind string-pick only. */
     boundRig?: string | null,
   ): ExceptionRoute | null {
-    const specRow = this.specCache.getByNameVersion(workflowName, workflowVersion);
-    if (!specRow) return null;
+    const stored = this.specCache.getByNameVersion(workflowName, workflowVersion);
+    if (!stored) return null;
+    const specRow = bindRowToRig(stored, boundRig ?? null);
     const spec = specRow.spec;
     const roleCtx = roleResolutionContext(this.db, boundRig ?? null);
     return resolveExceptionRoute({
@@ -384,7 +386,7 @@ export class WorkflowRuntime {
             },
           );
         }
-        const spec = this.specCache.getByNameVersion(existing.workflowName, existing.workflowVersion);
+        const spec = this.specCache.getForInstance(existing);
         const entryQitemId = typeof existing.lifecycleBinding?.entryQitemId === "string"
           ? existing.lifecycleBinding.entryQitemId
           : null;
@@ -415,7 +417,7 @@ export class WorkflowRuntime {
     // the bare name straight to readThrough -> spec_file_missing.
     const resolvedSpecPath = this.specCache.resolveSourcePathByName(input.specPath) ?? input.specPath;
     const generatedSpec = input.compiledLifecycle?.workflowSpec;
-    const specRow = generatedSpec
+    let specRow = generatedSpec
       ? this.specCache.putGenerated(
           generatedSpec,
           input.compiledLifecycle!.sources.find((source) => source.kind === "mission")?.path ?? resolvedSpecPath,
@@ -521,6 +523,23 @@ export class WorkflowRuntime {
       }
     } else {
       boundRig = null;
+    }
+
+    // `member@{rig}` in preferred_targets resolves against the bound rig.
+    // The instance row stores that binding, so every later read of this
+    // instance's spec expands the same way. With no bound rig there is
+    // nothing to resolve against: refuse now rather than route to a
+    // literal "{rig}" seat.
+    const placeholderRoles = rolesUsingRigPlaceholder(specRow.spec);
+    if (placeholderRoles.length > 0) {
+      if (boundRig === null) {
+        throw new WorkflowProjectorError(
+          "rig_placeholder_unbound",
+          `cannot instantiate: role ${placeholderRoles.map((r) => `"${r}"`).join(", ")} in spec ${specRow.name}@${specRow.version} uses ${RIG_PLACEHOLDER} in preferred_targets, but this instance is not bound to a rig. Pass --rig <name> to bind it, or write the rig name into the target.`,
+          { specPath: input.specPath, roles: placeholderRoles },
+        );
+      }
+      specRow = bindRowToRig(specRow, boundRig);
     }
 
     // OPR.0.4.6.WF2 FR-2: static harness-pin reconciliation for EVERY
@@ -934,7 +953,7 @@ export class WorkflowRuntime {
   } {
     const instance = this.instanceStore.getByIdOrThrow(instanceId);
     const unknowns: string[] = [];
-    const spec = this.specCache.getByNameVersion(instance.workflowName, instance.workflowVersion)?.spec;
+    const spec = this.specCache.getForInstance(instance)?.spec;
     const frontier = instance.currentFrontier.map((packetId) => {
       const binding = this.instanceStore.getFrontierBinding(instanceId, packetId);
       const packet = this.queueRepo.getById(packetId);
@@ -985,7 +1004,7 @@ export class WorkflowRuntime {
       if (instance.status === "completed" || instance.status === "aborted") {
         throw new WorkflowProjectorError("instance_not_abortable", `instance ${instance.instanceId} is ${instance.status}`, { instanceId: instance.instanceId, status: instance.status });
       }
-      const spec = this.specCache.getByNameVersion(instance.workflowName, instance.workflowVersion)?.spec;
+      const spec = this.specCache.getForInstance(instance)?.spec;
       const bindingByPacket = new Map(this.instanceStore.listFrontierBindings(instance.instanceId).map((binding) => [binding.packetId, binding]));
       const closedAt = this.now().toISOString();
       for (const packetId of instance.currentFrontier) {
@@ -1103,7 +1122,7 @@ export class WorkflowRuntime {
           { instanceId: instance.instanceId, status: instance.status, expectedStatus: "failed" },
         );
       }
-      const specRow = this.specCache.getByNameVersion(instance.workflowName, instance.workflowVersion);
+      const specRow = this.specCache.getForInstance(instance);
       if (!specRow) {
         throw new WorkflowProjectorError(
           "spec_not_cached",
@@ -1377,7 +1396,7 @@ export class WorkflowRuntime {
       if (instance.status === "completed" || instance.status === "aborted") {
         throw new WorkflowProjectorError("instance_not_resumable", `instance ${instance.instanceId} is ${instance.status}`, { instanceId: instance.instanceId, status: instance.status });
       }
-      const specRow = this.specCache.getByNameVersion(instance.workflowName, instance.workflowVersion);
+      const specRow = this.specCache.getForInstance(instance);
       if (!specRow) throw new WorkflowProjectorError("spec_not_cached", `workflow spec ${instance.workflowName}@${instance.workflowVersion} is not cached`);
       const step = specRow.spec.steps.find((candidate) => candidate.id === occurrence.stepId);
       if (!step) throw new WorkflowProjectorError("resume_step_missing_from_spec", `failed step "${occurrence.stepId}" no longer exists`, { instanceId: instance.instanceId, stepId: occurrence.stepId });
@@ -1523,7 +1542,7 @@ export class WorkflowRuntime {
       // (7) harness pin: the SAME reconciliation the projector applies
       // to explicit --next-owner overrides — an explicit route target
       // never silently defeats a declared pin.
-      const specRow = this.specCache.getByNameVersion(instance.workflowName, instance.workflowVersion);
+      const specRow = this.specCache.getForInstance(instance);
       const oldBinding = this.instanceStore.getFrontierBinding(instance.instanceId, oldPacketId);
       const selectedStepId = oldBinding?.stepId ?? (instance.currentFrontier.length === 1 ? instance.currentStepId : null);
       const step =

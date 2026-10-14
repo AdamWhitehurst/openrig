@@ -129,6 +129,19 @@ parked `blocked_on` that human seat in the same transaction (summary and
 for a declared role, an ordinary packet goes to that handler role's seat
 (`workflow-projector.ts:1659`–`1778`).
 
+A `preferred_targets` entry may be written `member@{rig}`, for example
+`watcher@{rig}`. At instantiate, `{rig}` becomes the instance's bound rig
+(`--rig`, or the spec's `target.rig` default), so one reusable spec addresses
+that rig's member, including a `builtin:terminal` member. Literal
+`member@rig` entries are unchanged. A spec that uses `{rig}` and ends up with
+no bound rig is refused at instantiate (`rig_placeholder_unbound`). The cached
+spec keeps the literal `{rig}`; the expansion is computed from the instance's
+stored `bound_rig` each time its spec is read, so later hand-offs, resume and
+exception routing use the same target
+(`workflow-rig-placeholder.ts`, `WorkflowSpecCache.getForInstance`). A
+terminal member cannot act on a nudge, so it must poll its own queue for the
+packet.
+
 Instantiation also emits advisories for missing members in otherwise
 registered target rigs. That member check is advisory and does not imply
 all preferred targets received a live-readiness test.
