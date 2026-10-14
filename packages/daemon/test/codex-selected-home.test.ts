@@ -113,9 +113,12 @@ it("seatless startup, disable and projection preserve the other home's bytes; st
   const first = await start();
   try {
     expect(first.db.prepare('SELECT count(*) AS n FROM nodes').get()).toEqual({ n: 0 });
-    const config = path.join(f.selected, 'config.toml'); const text = fs.readFileSync(config, 'utf8');
-    expect(text).toContain('trusted_hash'); expect(text).toContain('hooks');
+    const config = path.join(f.selected, 'config.toml');
+    expect(fs.existsSync(config)).toBe(false);
     const a = first.deps.runtimeAdapters!.codex as CodexRuntimeAdapter;
+    await a.ensureManagedConfig();
+    const text = fs.readFileSync(config, 'utf8');
+    expect(text).toContain('trusted_hash'); expect(text).toContain('hooks');
     a.ensureCodexFeatureFlag(true, { codexVersion: '0.120.0' });
     expect(fs.readFileSync(config, 'utf8')).toContain('codex_hooks = true');
     a.ensureManagedBootstrap({ cwd: f.cwd });
@@ -132,7 +135,12 @@ it("seatless startup, disable and projection preserve the other home's bytes; st
   vi.stubEnv('OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED', 'false');
   const second = await start();
   try {
-    expect(fs.readFileSync(path.join(f.selected, 'config.toml'), 'utf8')).not.toContain('# BEGIN OPENRIG MANAGED ACTIVITY HOOKS');
+    const selectedConfig = path.join(f.selected, 'config.toml'), written = fs.readFileSync(selectedConfig);
+    expect(written.toString()).toContain('# BEGIN OPENRIG MANAGED ACTIVITY HOOKS');
+    // A daemon without Codex seats leaves a block it finds untouched; the next launch honours the disable.
+    expect(fs.readFileSync(selectedConfig)).toEqual(written);
+    await (second.deps.runtimeAdapters!.codex as CodexRuntimeAdapter).ensureManagedConfig();
+    expect(fs.readFileSync(selectedConfig, 'utf8')).not.toContain('# BEGIN OPENRIG MANAGED ACTIVITY HOOKS');
     expect(fs.readFileSync(f.firstConfig)).toEqual(before);
     expect(fs.readdirSync(path.join(f.home, '.codex')).sort()).toEqual(['config.toml', 'history.jsonl']);
     expect(fs.readFileSync(path.join(f.home, '.codex/history.jsonl'), 'utf8')).toBe('{"fixture":"first-home"}\n');
@@ -144,7 +152,7 @@ it("seatless startup, disable and projection preserve the other home's bytes; st
 it.each([
   { name: 'unset', selection: undefined },
   { name: 'empty', selection: '' },
-])('$name home selection keeps seatless startup writes in the default home', async ({ selection }) => {
+])('$name home selection resolves the default home and seatless startup leaves it untouched', async ({ selection }) => {
   const f = fixture(), originalCwd = process.cwd();
   vi.resetModules();
   vi.spyOn(os, 'homedir').mockReturnValue(f.home);
@@ -161,6 +169,8 @@ it.each([
     try {
       expect(daemon.db.prepare('SELECT count(*) AS n FROM nodes').get()).toEqual({ n: 0 });
       expect(fs.existsSync(path.join(f.cwd, 'config.toml'))).toBe(false);
+      expect(fs.readFileSync(f.firstConfig, 'utf8')).toBe('# first-home sentinel\nmodel = "fixture"\n');
+      await (daemon.deps.runtimeAdapters!.codex as CodexRuntimeAdapter).ensureManagedConfig();
       expect(fs.readFileSync(f.firstConfig, 'utf8')).toContain('trusted_hash');
       expect(fs.readFileSync(f.firstConfig, 'utf8')).toContain('# BEGIN OPENRIG MANAGED ACTIVITY HOOKS');
       expect(daemon.deps.sessionEnv!.CODEX_HOME).toBe(path.join(f.home, '.codex'));

@@ -114,6 +114,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   // Default = the real resolver; tests may inject a controlled one.
   private resolveGitAddDirs: CodexGitAddDirResolver;
   private prepareTeamWorkspace?: PrepareCodexTeamWorkspace;
+  private resolveManagedConfigSettings?: () => Promise<{ enabled: boolean; codexVersion?: string }>;
   // OPR.0.4.1.10 FR-B — absolute path to the daemon's own shipped activity-relay.cjs,
   // resolved by startup from import.meta.dirname. Used by ensureCodexActivityHooks
   // (FR-A) to write config-layer [hooks] command entries that are cwd-independent and
@@ -138,8 +139,11 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     readNetworkDefault?: CodexNetworkDefaultReader;
     resolveGitAddDirs?: CodexGitAddDirResolver;
     prepareTeamWorkspace?: PrepareCodexTeamWorkspace;
+    /** Resolves the hooks setting and Codex version that ensureManagedConfig applies. Absent: no managed config write. */
+    resolveManagedConfigSettings?: () => Promise<{ enabled: boolean; codexVersion?: string }>;
   }) {
     this.tmux = deps.tmux;
+    this.resolveManagedConfigSettings = deps.resolveManagedConfigSettings;
     this.prepareTeamWorkspace = deps.prepareTeamWorkspace;
     this.seatLaunchEnvironment = deps.seatLaunchEnvironment;
     this.fs = deps.fsOps;
@@ -155,6 +159,25 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.verifyProfilePreflight = deps.verifyProfilePreflight
       ?? ((profile, cwd) => defaultProfilePreflight(profile, this.codexHome ? { cwd, codexHome: this.codexHome, launchPath: this.launchPath } : undefined));
+  }
+
+  /**
+   * Bring the Codex config.toml to the state OpenRig-managed seats need: feature flag,
+   * activity hooks and their trust, or the stripped block when hooks are disabled. Runs when
+   * a daemon has Codex seats (boot) or is about to launch one, never for a daemon without
+   * them: a rig with no Codex seat leaves the user's config alone. A failure warns and does
+   * not block the launch.
+   */
+  async ensureManagedConfig(): Promise<void> {
+    if (!this.resolveManagedConfigSettings) return;
+    try {
+      const { enabled, codexVersion } = await this.resolveManagedConfigSettings();
+      this.ensureCodexFeatureFlag(enabled, { codexVersion });
+      if (enabled) this.ensureCodexActivityHooks();
+      else this.removeCodexActivityHooks();
+    } catch (err) {
+      console.error(`[openrig] runtime setup warning: ${(err as Error).message}`);
+    }
   }
 
   /**
@@ -486,6 +509,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   /** Launch flags shared by fresh, fork and resume, decided once per launch. With `running`, the probed and
    *  prepared parts come from the running Codex instead, and no Codex process is started to decide them. */
   private async prepareLaunch(binding: NodeBinding, name: string, running?: RunningCodexLaunch): Promise<PreparedCodexLaunch | { ok: false; error: string }> {
+    await this.ensureManagedConfig();
     const model = binding.model?.trim();
     const modelArg = model ? ` -m ${shellQuote(model)}` : "";
     const effort = binding.effort?.trim();
