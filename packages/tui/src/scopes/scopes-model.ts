@@ -272,6 +272,19 @@ export interface ScopeContentOpts {
   executionStrip?: ContentLine[];
 }
 
+/** The header's proof count. With a judgment policy it counts accepted items and is ok only
+ * when all are accepted; without one it counts items an artifact cites, labelled "paired",
+ * because citation is not acceptance. The colour follows the number shown. */
+function proofHeader(detail: SliceScopeSnap): { text: string; token: Token } {
+  if (detail.readiness?.configured) {
+    const total = detail.readiness.items.length;
+    const accepted = detail.readiness.items.filter(i => i.state === "accepted").length;
+    return { text: `${accepted}/${total} accepted`, token: total > 0 && accepted === total ? "ok" : "warn" };
+  }
+  const { paired, total } = detail.proof;
+  return { text: `${paired}/${total} paired`, token: total > 0 && paired === total ? "ok" : "warn" };
+}
+
 /** Compact identity/status/provenance block shared by every route into the
  * canonical slice detail. Keeping it here prevents Explorer and mission-graph
  * navigation from growing separate slice pages again. */
@@ -281,7 +294,7 @@ export function scopeIdentityLines(detail: SliceScopeSnap, mission: string | nul
   const w = Math.max(24, width);
   const stage = detail.readiness?.configured ? (detail.readiness.state === "ready" ? "outcome complete" : detail.readiness.items.some(i => i.state === "withdrawn" || i.state === "rejected") ? "reopened" : "outcomes pending") : detail.stage ?? detail.status ?? "unknown";
   const stateToken: Token = /done|established|building|active|spec/i.test(stage) ? "ok" : "dim";
-  const proofToken: Token = detail.proof.total > 0 && detail.proof.paired === detail.proof.total ? "ok" : "warn";
+  const { text: proofText, token: proofToken } = proofHeader(detail);
   const locks = `${detail.locks.spec ? "spec locked" : "spec open"} · ${detail.locks.delivery ? "delivery locked" : "delivery open"}`;
   lines.push(semantic([
     { text: `${sliceGlyph(detail)} `, token: stateToken, bold: true },
@@ -299,13 +312,13 @@ export function scopeIdentityLines(detail: SliceScopeSnap, mission: string | nul
   }
   if (w < 70) {
     lines.push(semantic([{ text: "  STATE  ", token: "dim" }, { text: stage, token: stateToken, bold: true }], w));
-    lines.push(semantic([{ text: "  PROOF  ", token: "dim" }, { text: `${detail.proof.paired}/${detail.proof.total}`, token: proofToken, bold: true }], w));
+    lines.push(semantic([{ text: "  PROOF  ", token: "dim" }, { text: proofText, token: proofToken, bold: true }], w));
     lines.push(semantic([{ text: "  LOCKS  ", token: "dim" }, { text: locks, token: detail.locks.delivery ? "ok" : "bright" }], w));
   } else {
     lines.push(semantic([
       { text: "  STATE ", token: "dim" }, { text: stage, token: stateToken, bold: true },
       { text: " · ", token: "chrome" },
-      { text: "PROOF ", token: "dim" }, { text: `${detail.proof.paired}/${detail.proof.total}`, token: proofToken, bold: true },
+      { text: "PROOF ", token: "dim" }, { text: proofText, token: proofToken, bold: true },
       { text: " · ", token: "chrome" },
       { text: "LOCKS ", token: "dim" }, { text: locks, token: detail.locks.delivery ? "ok" : "bright" },
     ], w));

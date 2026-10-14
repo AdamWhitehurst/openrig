@@ -4,7 +4,7 @@ import { createViewState, computeExplorerRows } from "../src/state.js";
 import { renderScreen } from "../src/render.js";
 import { demoSnapshot } from "../src/demo-data.js";
 import { parseCommand } from "../src/grammar.js";
-import { proofBadge, scopeContractLines } from "../src/scopes/scopes-model.js";
+import { proofBadge, scopeContractLines, scopeIdentityLines } from "../src/scopes/scopes-model.js";
 
 function openGateway() {
   const snap = demoSnapshot();
@@ -48,7 +48,7 @@ describe("scopes view (store-direct render, v4 mock contract)", () => {
     const { snap, view } = openGateway();
     const out = renderScreen(view.get(), snap, { cols: 160, rows: 220 }).lines.join("\n");
     expect(out).toContain("● gateway-m1 · OPR.0.5.2.9 · release-0.5.2");
-    expect(out).toContain("STATE building · PROOF 2/9 · LOCKS spec locked · delivery open");
+    expect(out).toContain("STATE building · PROOF 2/9 paired · LOCKS spec locked · delivery open");
     expect(out).toContain("── INTENT ");
     expect(out).toContain("Slack to the founder");
     expect(out).toContain("── REQUIREMENTS (2)");
@@ -79,7 +79,7 @@ describe("scopes view (store-direct render, v4 mock contract)", () => {
     expect(out).toContain("PROGRESS · narrative only · N closes");
     expect(out).toContain("A2 held on arch consult");
     // the data-path rule: the narrative panel does NOT change the store-derived counts
-    expect(out).toContain("PROOF 2/9");
+    expect(out).toContain("PROOF 2/9 paired");
   });
 });
 
@@ -150,4 +150,43 @@ it.each([60, 100])("does not promote retained drops when current evidence was no
   expect(current).toContain("Evidencereferencesnotserved");
   expect(current).not.toContain("proof/legacy.md");
   expect(history).toContain("proof/legacy.md");
+});
+
+describe("scopes header proof count reads as acceptance only when judges are configured", () => {
+  type Judged = "accepted" | "pending";
+  const slice = (cited: boolean, judged: Judged[] | null) => {
+    const detail = demoSnapshot().scopes![0]!.slices[0]!;
+    detail.proofContract = (judged ?? ["pending", "pending", "pending"]).map((_, i) => (
+      { id: `item-${i}`, index: i + 1, text: `Item ${i + 1}`, paired: cited, drops: [] }));
+    detail.proof = { paired: cited ? detail.proofContract.length : 0, total: detail.proofContract.length };
+    detail.readiness = judged
+      ? { configured: true, state: judged.every(s => s === "accepted") ? "ready" : "not-ready", revision: "basis",
+        items: judged.map((state, i) => ({ id: `item-${i}`, index: i + 1, text: `Item ${i + 1}`, state, reason: state, judgment: null })) }
+      : undefined;
+    return detail;
+  };
+  // The segment carrying the proof count, in the wide header line and the narrow PROOF row.
+  const proofSeg = (detail: ReturnType<typeof slice>, width: number) => {
+    const lines = scopeIdentityLines(detail, "m", width);
+    const segs = lines.flatMap(l => l.segs ?? []);
+    const at = segs.findIndex(s => s.text.trim() === "PROOF");
+    return { text: segs[at + 1]!.text, token: segs[at + 1]!.token };
+  };
+
+  it.each([60, 160])("shows 0/N accepted, not ok, when every item is cited but none is judged (width %i)", (width) => {
+    expect(proofSeg(slice(true, ["pending", "pending", "pending"]), width)).toEqual({ text: "0/3 accepted", token: "warn" });
+  });
+
+  it.each([60, 160])("shows N/N accepted in ok when every item is accepted (width %i)", (width) => {
+    expect(proofSeg(slice(true, ["accepted", "accepted", "accepted"]), width)).toEqual({ text: "3/3 accepted", token: "ok" });
+  });
+
+  it.each([60, 160])("shows partial acceptance in warn (width %i)", (width) => {
+    expect(proofSeg(slice(true, ["accepted", "pending", "pending"]), width)).toEqual({ text: "1/3 accepted", token: "warn" });
+  });
+
+  it.each([60, 160])("says n/m paired without a policy (width %i)", (width) => {
+    expect(proofSeg(slice(true, null), width)).toEqual({ text: "3/3 paired", token: "ok" });
+    expect(proofSeg(slice(false, null), width)).toEqual({ text: "0/3 paired", token: "warn" });
+  });
 });
