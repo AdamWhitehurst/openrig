@@ -157,4 +157,17 @@ describe("workflow preferred_targets: member@{rig}", () => {
     const next = (projected as { nextOwnerSession?: string | null }).nextOwnerSession;
     expect(next).toBe("finisher@rig-b");
   });
+
+  it("validate on an unbound spec says a {rig} exception target resolves at instantiate, not 'unregistered'", () => {
+    const specPath = join(tmp, "exception.yaml");
+    writeFileSync(specPath, SPEC_RIG_RELATIVE + "  exception_routing:\n    orchestrator_role: watcher\n");
+    const { exceptionReadiness } = runtime.validate(specPath);
+    expect(exceptionReadiness.routes.length).toBeGreaterThan(0);
+    for (const route of exceptionReadiness.routes) {
+      expect(route.destinationSession).toBe("watcher@{rig}");
+      expect(route.identity).not.toBe("unregistered");
+      expect(route.state).toBe("ready");
+      expect(route.message).toMatch(/resolves at instantiate against the bound rig/);
+    }
+  });
 });

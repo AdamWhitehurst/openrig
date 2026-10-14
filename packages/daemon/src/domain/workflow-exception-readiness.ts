@@ -3,6 +3,7 @@ import type { WorkflowSpec } from "./workflow-types.js";
 import type { LifecycleGraphSource } from "./project-lifecycle-compiler.js";
 import { exceptionPolicy, resolveExceptionRoute, type ExceptionRouteInput } from "./workflow-exception-router.js";
 import { WorkflowHumanDestinationError } from "./workflow-human-destination.js";
+import { RIG_PLACEHOLDER } from "./workflow-rig-placeholder.js";
 import { rigMemberExists, roleResolutionContext, tryResolveRoleByCapability } from "./workflow-role-context.js";
 
 /** The configuration owner, not a generated cached spec or every source mirror. */
@@ -63,13 +64,16 @@ export function inspectExceptionReadiness(input: {
       // Authored preferred targets are the existing route policy. Verify their
       // declared identity separately; never turn an advisory read into fallback.
       let identity = route.humanRouted ? "registered-human" : "declared-agent";
-      if (roleResolution === "preferred-target") {
+      // An unbound read still holds the literal member@{rig}; there is no rig to check it against yet.
+      const rigRelative = roleResolution === "preferred-target" && destinationSession.includes(RIG_PLACEHOLDER);
+      if (roleResolution === "preferred-target" && !rigRelative) {
         const rig = destinationSession.split("@")[1];
         identity = rig && rigMemberExists(input.db, rig, destinationSession) ? "declared-member" : "unregistered";
       }
       routes.push({ exceptionClass, state: identity === "unregistered" ? "unregistered" : "ready", roleResolution,
         destinationSession, position, resolvedVia, identity,
-        message: identity === "unregistered" ? "The authored target is not a declared rig member. Check rig ps --nodes --json and correct the selected role's preferred_targets."
+        message: rigRelative ? `The authored target ${destinationSession} resolves at instantiate against the bound rig (--rig); it is checked once an instance is bound.`
+          : identity === "unregistered" ? "The authored target is not a declared rig member. Check rig ps --nodes --json and correct the selected role's preferred_targets."
           : route.position === "fallback" ? `Registered-human fallback; agent resolution: ${roleResolution}.`
           : "Current evidence resolves this route; it is re-read when an occurrence is admitted." });
     } catch (error) {
