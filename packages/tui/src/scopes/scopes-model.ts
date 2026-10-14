@@ -12,6 +12,9 @@ export interface ScopeLocksSnap { spec: { by: string; at: string } | null; deliv
 export interface ReadinessSnap {
   configured: boolean; state: string; revision: string;
   issues?: string[];
+  /** The authored judgment policy; null when none is readable. `configured` alone also covers a leftover judgments
+   * directory or a failed policy read. Absent from an older daemon, which is read as no policy. */
+  policy?: { judges: string[] } | null;
   history?: Array<{ ref: string; id: string; verdict: string; previous: string | null }>;
   items: Array<{ id: string; index: number; text: string; state: string; reason: string; judgment: {
     id: string; actor?: string; at?: string; verdict?: string; previous?: string | null;
@@ -272,17 +275,20 @@ export interface ScopeContentOpts {
   executionStrip?: ContentLine[];
 }
 
-/** The header's proof count. With a judgment policy it counts accepted items and is ok only
- * when all are accepted; without one it counts items an artifact cites, labelled "paired",
- * because citation is not acceptance. The colour follows the number shown. */
+/** The header's proof count. With a judgment policy actually present it counts accepted items and is ok only
+ * when all are accepted. Otherwise it counts items an artifact cites, labelled "paired", because citation is
+ * not acceptance: that covers no policy, a judgments directory left behind after the policy was removed, and a
+ * failed policy read. Reported issues keep the count but never colour it ok. The colour follows the number shown. */
 function proofHeader(detail: SliceScopeSnap): { text: string; token: Token } {
-  if (detail.readiness?.configured) {
-    const total = detail.readiness.items.length;
-    const accepted = detail.readiness.items.filter(i => i.state === "accepted").length;
+  const readiness = detail.readiness;
+  const broken = (readiness?.issues?.length ?? 0) > 0;
+  if (readiness?.configured && readiness.policy && !broken) {
+    const total = readiness.items.length;
+    const accepted = readiness.items.filter(i => i.state === "accepted").length;
     return { text: `${accepted}/${total} accepted`, token: total > 0 && accepted === total ? "ok" : "warn" };
   }
   const { paired, total } = detail.proof;
-  return { text: `${paired}/${total} paired`, token: total > 0 && paired === total ? "ok" : "warn" };
+  return { text: `${paired}/${total} paired`, token: !broken && total > 0 && paired === total ? "ok" : "warn" };
 }
 
 /** Compact identity/status/provenance block shared by every route into the

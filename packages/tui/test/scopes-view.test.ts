@@ -160,7 +160,7 @@ describe("scopes header proof count reads as acceptance only when judges are con
       { id: `item-${i}`, index: i + 1, text: `Item ${i + 1}`, paired: cited, drops: [] }));
     detail.proof = { paired: cited ? detail.proofContract.length : 0, total: detail.proofContract.length };
     detail.readiness = judged
-      ? { configured: true, state: judged.every(s => s === "accepted") ? "ready" : "not-ready", revision: "basis",
+      ? { configured: true, policy: { judges: ["judge@scratch"] }, state: judged.every(s => s === "accepted") ? "ready" : "not-ready", revision: "basis",
         items: judged.map((state, i) => ({ id: `item-${i}`, index: i + 1, text: `Item ${i + 1}`, state, reason: state, judgment: null })) }
       : undefined;
     return detail;
@@ -183,6 +183,27 @@ describe("scopes header proof count reads as acceptance only when judges are con
 
   it.each([60, 160])("shows partial acceptance in warn (width %i)", (width) => {
     expect(proofSeg(slice(true, ["accepted", "pending", "pending"]), width)).toEqual({ text: "1/3 accepted", token: "warn" });
+  });
+
+  // `configured` is also true for a judgments directory left after the policy was removed, and for a failed policy read.
+  const withoutPolicy = (issues?: string[]) => {
+    const detail = slice(true, ["pending", "pending", "pending"]);
+    detail.readiness = { ...detail.readiness!, policy: null, ...(issues ? { issues, state: "unknown" } : {}) };
+    return detail;
+  };
+
+  it.each([60, 160])("says n/m paired, ok, when only a judgments directory is left after the policy was removed (width %i)", (width) => {
+    expect(proofSeg(withoutPolicy(), width)).toEqual({ text: "3/3 paired", token: "ok" });
+  });
+
+  it.each([60, 160])("keeps the paired count but never ok when the policy could not be read (width %i)", (width) => {
+    expect(proofSeg(withoutPolicy(["proofPolicy.judges must name authorized actors"]), width)).toEqual({ text: "3/3 paired", token: "warn" });
+  });
+
+  it.each([60, 160])("falls back to paired, warn, when a present policy reports issues (width %i)", (width) => {
+    const detail = slice(true, ["accepted", "accepted", "accepted"]);
+    detail.readiness = { ...detail.readiness!, issues: ["No authored proof contract"], state: "unknown" };
+    expect(proofSeg(detail, width)).toEqual({ text: "3/3 paired", token: "warn" });
   });
 
   it.each([60, 160])("says n/m paired without a policy (width %i)", (width) => {
