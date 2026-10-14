@@ -5,7 +5,7 @@ import { queueItemsRecoveryTagsSchema } from "../../src/db/migrations/099_queue_
 import { resumeRotationSchema } from "../../src/db/migrations/101_claude_resume_rotation.js";
 import { sessionStopIntentSchema } from "../../src/db/migrations/103_session_stop_intent.js";
 import { nodeEffortChoiceSchema } from "../../src/db/migrations/104_node_effort_choice.js";
-import { seatEnvSchema } from "../../src/db/migrations/110_seat_env.js";
+import { seatEnvSchema } from "../../src/db/migrations/111_seat_env.js";
 import { modePostureCoexistSchema } from "../../src/db/migrations/109_mode_posture_coexist.js";
 import { rigNonInterruptiveSchema } from "../../src/db/migrations/095_rig_non_interruptive.js";
 import { mockShellCommand } from "./shell-command-mock.js";

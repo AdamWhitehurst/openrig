@@ -4,7 +4,7 @@ import type { Migration } from "../migrate.js";
  *  member level (nodes.env_json), stored as a JSON object of NAME -> value. NULL = none declared.
  *  The two stay separate so a launch merges them (member over rig) and an export round-trips both. */
 export const seatEnvSchema: Migration = {
-  name: "110_seat_env.sql",
+  name: "111_seat_env.sql",
   sql: `
     ALTER TABLE rigs ADD COLUMN env_json TEXT;
     ALTER TABLE nodes ADD COLUMN env_json TEXT;
