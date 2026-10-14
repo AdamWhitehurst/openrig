@@ -57,6 +57,7 @@ import { workflowResumeSchema } from "./migrations/051_workflow_resume.js";
 import { workflowInstanceBoundRigSchema } from "./migrations/052_workflow_instance_bound_rig.js";
 import { sessionsNodeIdIndexSchema } from "./migrations/053_sessions_node_id_index.js";
 import { queueTransitionsArchiveSchema } from "./migrations/054_queue_transitions_archive.js";
+import { seatEnvSchema } from "./migrations/110_seat_env.js";
 import { nodePermissionPolicySchema } from "./migrations/055_node_permission_policy.js";
 import { rigPermissionPolicySchema } from "./migrations/056_rig_permission_policy.js";
 import { nodePolicyProvenanceSchema } from "./migrations/057_node_policy_provenance.js";
@@ -219,4 +220,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   piUsageEntriesSchema,
   piUsageChargesSchema,
   modePostureCoexistSchema,
+  seatEnvSchema,
 ];

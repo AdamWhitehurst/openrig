@@ -40,6 +40,8 @@ export interface Node {
   /** OPR.0.4.8.3 Seam B: attached permission_policy REF (builtin:<name> or spec-relative custom
    *  path), or null when none is attached (= the floor). */
   permissionPolicy?: string | null;
+  /** The member's own declared launch environment (not merged with the rig's), or null. */
+  env?: Record<string, string> | null;
   cwd: string | null;
   surfaceHint: string | null;
   workspace: string | null;
@@ -1111,6 +1113,8 @@ export interface RigSpecPodMember {
   /** OPR.0.4.8.3 Seam B: optional per-seat permission_policy REF (builtin:<name> or a spec-relative
    *  custom path). Absent = the floor. Overrides the rig-level ref. */
   permissionPolicy?: string;
+  /** Non-secret launch environment for this seat; overrides the rig-level `env`. */
+  env?: Record<string, string>;
   cwd: string;
   restorePolicy?: string;
   /** OPR.0.5.6.20 — per-member continuity override (most-specific-wins; canonical or
@@ -1201,6 +1205,8 @@ export interface RigSpec {
   /** OPR.0.4.8.3 Seam B: optional rig-level permission_policy REF (builtin:<name> or a
    *  spec-relative custom path). Absent = the floor. A per-member ref overrides this. */
   permissionPolicy?: string;
+  /** Non-secret launch environment for every seat in the rig; a member's `env` overrides it. */
+  env?: Record<string, string>;
   /** #25: per-runtime managed-block destination. Absent = CLAUDE.md. */
   managedBlocks?: { "claude-code"?: import("./managed-blocks.js").ClaudeManagedBlockFile };
   docs?: RigSpecDoc[];

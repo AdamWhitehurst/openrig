@@ -1,4 +1,5 @@
 import nodePath from "node:path";
+import { normalizeSeatEnv, validateSeatEnv, type SeatEnv } from "../domain/seat-env.js";
 import { Hono } from "hono";
 import { bootstrapFailureResponse } from "./bootstrap-failure-response.js";
 import type { BootstrapOrchestrator } from "../domain/bootstrap-orchestrator.js";
@@ -213,12 +214,27 @@ upRoutes.post("/", async (c) => {
     return c.json({ error: "sourceRef is required" }, 400);
   }
 
+  // `rig up --env KEY=VALUE`: environment for this launch only. It is not saved with the rig.
+  let envOverride: SeatEnv | undefined;
+  if (body["envOverride"] !== undefined) {
+    const envErrors = validateSeatEnv(body["envOverride"], "--env");
+    if (envErrors.length > 0) return c.json({ error: envErrors.join("; "), code: "invalid_env" }, 400);
+    envOverride = normalizeSeatEnv(body["envOverride"]);
+  }
+
   // Route source — classify raw sourceRef first, only resolve path for file-based kinds
   let sourceKind: string;
   let resolvedSourceRef = sourceRef;
   try {
     const route = upRouter.route(sourceRef);
     sourceKind = route.sourceKind;
+
+    if (envOverride && (sourceKind === "rig_name" || sourceKind === "topology")) {
+      return c.json({
+        error: "--env applies to a new launch from a rig spec or bundle. A restore keeps the rig's own env: block; to change it, edit env: in the spec and launch again.",
+        code: "env_not_applicable",
+      }, 400);
+    }
 
     // Rig name: restore from latest auto-pre-down snapshot
     if (sourceKind === "rig_name") {
@@ -378,6 +394,7 @@ upRoutes.post("/", async (c) => {
         autoApprove,
         nonInterruptive,
         cwdOverride,
+        envOverride,
         targetRoot,
         runId: run.id,
       });

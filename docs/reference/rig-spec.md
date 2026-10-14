@@ -179,6 +179,7 @@ edges:
 | `culture_file` | string | no | — | Relative path to a rig-wide culture/constitution file. Must be a safe relative path (no `..`, no absolute). |
 | `non_interruptive` | boolean | no | — | Pod-aware rig launch-warning default. With full-bypass Claude/Codex seats, true accepts or hides supported harness warnings using launch flags. Explicit CLI choices override this field; this field overrides the machine default. It does not grant permissions, change native settings files, or bypass login. |
 | `permission_policy` | string | no | — | Permission policy attached to the rig. Either a built-in (`builtin:locked`, `builtin:standard`, `builtin:open`, `builtin:yolo`, `builtin:auto`) or a safe relative path to a custom policy file (resolved from this spec's directory; no `..`, no absolute, no empty segments, each segment `[A-Za-z0-9][A-Za-z0-9._-]*`), or `none`, a recorded choice of the floor. Absent uses the default floor with the scoped team launch allowances described below. A bare built-in name such as `yolo` is refused ("use 'builtin:yolo'"), and so is an explicit `null`. A custom file that is missing, unreadable or invalid isn't a validation error: it resolves to the floor, and preflight warns. A member may set its own `permission_policy` (not on a terminal member), which takes precedence over the rig-level one; there is no pod level. See "Attaching a permission policy" below. |
+| `env` | map | no | — | Launch environment for every seat in the rig: `NAME: value` pairs. A member's own `env` overrides it name by name. Names match `^[A-Z_][A-Z0-9_]*$`, names starting `OPENRIG_` are reserved, and values must be non-empty strings (quote numbers and booleans). Values are not secret. See "Launch environment" below. |
 | `managed_blocks` | map | no | `CLAUDE.md` | File that receives OpenRig's managed instruction blocks for Claude Code members. Only the `claude-code` key is accepted, with `CLAUDE.md` or `CLAUDE.local.md`. Codex, Pi and OMP members use `AGENTS.md`. See "Choosing the Claude instruction file" below. |
 | `workspace` | object | no | — | The rig's workspace: `workspace_root` (required), `repos[]` of `{name, path, kind}` with `kind` one of `user`, `project`, `knowledge`, `lab` or `delivery` and unique names, an optional `default_repo` naming one of them, and an optional `knowledge_root`. Relative repo paths resolve against `workspace_root`. |
 | `docs` | Doc[] | no | — | Documentation files that should travel with the rig. Included in rig bundles. Each entry has a `path` field (safe relative path). The engine does not consume these — they are for humans and agents setting up the environment before launch. |
@@ -334,6 +335,31 @@ context for `rig seat continue`; `rig up --non-interruptive` or `rig bundle inst
 except inside a recognized sandbox. See Claude Code's
 [Choose a permission mode](https://code.claude.com/docs/en/permission-modes#skip-all-checks-with-bypasspermissions-mode).
 
+### Launch environment
+
+`env:` sets environment variables for the seats of a rig, so a team can share a setting such as a feature flag, a region or a log level without every member hand-editing a shell profile. Declare it on the rig, on a member, or both:
+
+```yaml
+env:
+  LOG_LEVEL: info
+  REGION: eu
+pods:
+  - id: dev
+    members:
+      - id: impl
+        runtime: claude-code
+        env:
+          LOG_LEVEL: debug   # overrides the rig's value for this seat only
+```
+
+- A seat gets the rig's `env` with its own `env` laid over it, name by name.
+- The same environment is applied on first launch, on `rig up <rig-name>` restore, and to the successor of a seat handover. Claude Code seats run with a cleared environment (`env -i`); the declared names are forwarded through it, except `PATH`, `HOME` and `CLAUDE_CONFIG_DIR`, which OpenRig sets for that launch itself.
+- `rig up <spec> --env KEY=VALUE` (repeatable) adds or overrides a value for that launch only. It is not saved: a later restore or handover uses the spec's `env:` again. To keep a value, put it in `env:`. `--env` does not apply to `rig up <rig-name>` (a restore).
+- Names starting `OPENRIG_` are reserved for OpenRig and refused. Empty values are refused, because the launch omits empty variables.
+- `rig export` writes the rig and member `env:` back out.
+
+**Do not put secrets in `env:` or `--env`.** The values are passed to tmux on its command line and sit in the seat's process environment, so other local processes and users on the machine can read them (see #306). Use it for settings only; credentials belong in the provider's own login or a secret store the seat reads at run time.
+
 ### Choosing the Claude instruction file
 
 OpenRig writes its instructions for Claude Code members into managed blocks in
@@ -402,6 +428,7 @@ directory's `CLAUDE.md`, including blocks written by other rigs.
 | `model` | string | no | — | Model override. Runtime-specific (e.g., `claude-opus-4-6` for Claude Code). |
 | `effort` | string | no | — | Reasoning effort override, trimmed. A non-string value is ignored with an advisory. |
 | `permission_policy` | string | no | — | Member-level permission policy; overrides the rig's. Not valid on terminal members. |
+| `env` | map | no | — | Launch environment for this seat, laid over the rig's `env`. Same rules as the rig-level field. Valid on terminal members too. See "Launch environment" below. |
 | `role` | string | no | — | The seat's role, letters, digits, `_`, `.` and `-`. Not valid on terminal members. |
 | `restore_policy` | string | no | the AgentSpec's | Restore behavior. One of: `resume_if_possible`, `relaunch_fresh`, `checkpoint_only`. The default comes from the AgentSpec's `defaults.lifecycle` (else `resume_if_possible`) as narrowed by its profile; a member value may only narrow it further, in that order. |
 | `compaction_strategy` | string | no | — | `default-compaction`, `managed-compaction`, `handover` or `apprentice-handover`; `harness_native` and `pod_continuity` are accepted as deprecated aliases, and `custom_prompt` is refused. |

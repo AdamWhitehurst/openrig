@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { ulid } from "ulid";
 import { deriveComposeProjectName } from "./compose-project-name.js";
 import type { ClaudeManagedBlockFile } from "./managed-blocks.js";
+import { mergeSeatEnv, parseStoredSeatEnv, type SeatEnv } from "./seat-env.js";
 import type {
   Rig,
   Node,
@@ -125,6 +126,8 @@ interface NodeOptions {
   codexConfigProfile?: string;
   /** OPR.0.4.8.3 Seam B: per-seat permission_policy REF (builtin:<name> or spec-relative path). */
   permissionPolicy?: string;
+  /** The member's declared launch environment (spec `env:`); not merged with the rig's. */
+  env?: SeatEnv;
   cwd?: string;
   surfaceHint?: string;
   workspace?: string;
@@ -212,6 +215,30 @@ export class RigRepository {
     const row = this.db.prepare("SELECT non_interruptive FROM rigs WHERE id = ?")
       .get(rigId) as { non_interruptive: number } | undefined;
     return row?.non_interruptive === 1;
+  }
+
+  /** Persist the rig-level `env:` block from the spec, or null to clear. */
+  setRigEnv(rigId: string, env: SeatEnv | null): void {
+    if (!this.hasRigColumn("env_json")) return;
+    this.db.prepare("UPDATE rigs SET env_json = ?, updated_at = ? WHERE id = ?")
+      .run(env ? JSON.stringify(env) : null, new Date().toISOString(), rigId);
+  }
+
+  getRigEnv(rigId: string): SeatEnv | null {
+    if (!this.hasRigColumn("env_json")) return null;
+    const row = this.db.prepare("SELECT env_json FROM rigs WHERE id = ?")
+      .get(rigId) as { env_json: string | null } | undefined;
+    return parseStoredSeatEnv(row?.env_json);
+  }
+
+  /** What a seat's process gets: its rig's `env:` with the member's own `env:` over it. A launch,
+   *  a restore and a handover successor all read this, so they cannot disagree. */
+  getEffectiveSeatEnv(nodeId: string): SeatEnv {
+    if (!this.hasNodeColumn("env_json")) return {};
+    const row = this.db.prepare("SELECT rig_id, env_json FROM nodes WHERE id = ?")
+      .get(nodeId) as { rig_id: string; env_json: string | null } | undefined;
+    if (!row) return {};
+    return mergeSeatEnv(this.getRigEnv(row.rig_id), parseStoredSeatEnv(row.env_json));
   }
 
   /** OPR.0.4.8.3 Seam B — persist a rig's attached permission_policy REF (builtin:<name> or a
@@ -458,6 +485,11 @@ export class RigRepository {
     if (opts?.effort && this.hasNodeColumn("effort")) {
       this.db.prepare("UPDATE nodes SET effort = ? WHERE id = ?")
         .run(opts.effort, id);
+    }
+
+    if (opts?.env && this.hasNodeColumn("env_json")) {
+      this.db.prepare("UPDATE nodes SET env_json = ? WHERE id = ?")
+        .run(JSON.stringify(opts.env), id);
     }
 
     return this.rowToNode(
@@ -744,6 +776,7 @@ export class RigRepository {
       effortChoice: row.effort_choice ?? null,
       codexConfigProfile: row.codex_config_profile ?? null,
       permissionPolicy: row.permission_policy ?? null,
+      env: parseStoredSeatEnv(row.env_json),
       cwd: row.cwd,
       surfaceHint: row.surface_hint ?? null,
       workspace: row.workspace ?? null,
@@ -834,6 +867,7 @@ interface NodeRow {
   effort_choice?: string | null;
   codex_config_profile?: string | null;
   permission_policy?: string | null;
+  env_json?: string | null;
   cwd: string | null;
   surface_hint: string | null;
   workspace: string | null;

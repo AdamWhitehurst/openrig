@@ -528,6 +528,72 @@ describe("Up CLI", () => {
     for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
   });
 
+  it("up --env sends each KEY=VALUE as envOverride, splitting at the first equals sign", async () => {
+    let lastBody: Record<string, unknown> = {};
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      if (req.url === "/api/up") {
+        lastBody = JSON.parse(body);
+        res.writeHead(201, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "completed", runId: "r", rigId: "g", stages: [], errors: [] }));
+      }
+    });
+
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "/tmp/rig.yaml", "--env", "DEBUG=1", "--env", "URL=http://x/?a=b"]);
+    });
+
+    expect(lastBody.envOverride).toEqual({ DEBUG: "1", URL: "http://x/?a=b" });
+
+    server.removeAllListeners("request");
+    for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+  });
+
+  it("up without --env sends no envOverride", async () => {
+    let lastBody: Record<string, unknown> = {};
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
+      let body = "";
+      for await (const chunk of req) body += chunk;
+      if (req.url === "/api/up") {
+        lastBody = JSON.parse(body);
+        res.writeHead(201, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "completed", runId: "r", rigId: "g", stages: [], errors: [] }));
+      }
+    });
+
+    await captureLogs(async () => {
+      await makeCmd().parseAsync(["node", "rig", "up", "/tmp/rig.yaml"]);
+    });
+
+    expect(lastBody).not.toHaveProperty("envOverride");
+
+    server.removeAllListeners("request");
+    for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+  });
+
+  it("up --env without an equals sign stops before contacting the daemon", async () => {
+    let called = false;
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", (_req: http.IncomingMessage, res: http.ServerResponse) => { called = true; res.writeHead(500); res.end(); });
+    try {
+      const { logs, exitCode } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "up", "/tmp/rig.yaml", "--env", "NOEQUALS"]);
+      });
+      expect(called).toBe(false);
+      expect(exitCode).toBe(1);
+      expect(logs.join("\n")).toContain("--env expects KEY=VALUE");
+    } finally {
+      server.removeAllListeners("request");
+      for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+    }
+  });
+
   // OPR.0.3.2.22 Bug 3 — path-form `rig up <spec-inside-install>` without
   // --cwd should default cwdOverride to process.cwd() so the spec's
   // member-level cwd: "." does not resolve into the OpenRig install root

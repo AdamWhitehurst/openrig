@@ -14,6 +14,7 @@ import type { TmuxOptionDefaultsApplier } from "./tmux-option-defaults.js";
 import { observeSolePane, paneObservationVerdict } from "./pane-binding-observation.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import type { OccupantKind } from "./session-registry.js";
+import { mergeSeatEnv, seatEnvLaunchVars, type SeatEnv } from "./seat-env.js";
 
 import type { Session, Binding } from "./types.js";
 
@@ -33,6 +34,8 @@ interface LaunchOpts {
   silenceWindowSeconds?: number;
   /** A deliberate fresh occupant is distinct from initial rig boot in the tenure ledger. */
   occupantKind?: OccupantKind;
+  /** One-off env for this launch only (`rig up --env`); wins over the spec's env and is not saved. */
+  env?: SeatEnv;
 }
 
 interface NodeLauncherDeps {
@@ -145,6 +148,7 @@ export class NodeLauncher {
       OPENRIG_RUNTIME: node.runtime ?? undefined,
       ...this.sessionEnv,
       ...(node.runtime ? this.runtimeSessionEnv[node.runtime] : undefined),
+      ...seatEnvLaunchVars(mergeSeatEnv(this.rigRepo.getEffectiveSeatEnv(node.id), opts?.env)),
       OPENRIG_OCCUPANT_GENERATION: occupantGeneration ?? undefined,
     });
     const sessionCwd = opts?.cwd ?? node.cwd ?? undefined;
