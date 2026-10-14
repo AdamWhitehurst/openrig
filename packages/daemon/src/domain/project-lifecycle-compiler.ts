@@ -38,7 +38,8 @@ export interface LifecycleCompilation {
   compiledInputDigest: string;
   sources: LifecycleSourceDigest[];
   dependencies: Array<{ stepId: string; dependsOn: string[] }>;
-  /** Step id -> its slice directory name, for steps compiled from a slice. The Queue tab keys on the directory, not the step id. */
+  /** Slice identity (metadata.id and directory name) -> slice directory name, for every active slice. The Queue tab keys
+   *  on the directory, which a step id (from metadata.id, or authored to name a slice) need not equal. */
   sliceDirs: Record<string, string>;
   graphSource: LifecycleGraphSource;
   workflowSpec: WorkflowSpec | null;
@@ -173,6 +174,15 @@ export function compileProjectLifecycle(input: {
       throw manifestError("lifecycle_slice_mission_mismatch", `${slicePath}: composition.mission does not resolve to ${missionPath}`, { slicePath, missionRef, missionPath });
     }
 
+    // Every active slice maps its identity (metadata.id, and its directory name) to the directory, authored graph
+    // or not: an authored step named for either lands on this slice's Queue tab.
+    const sliceDir = basename(dirname(slicePath));
+    const sliceId = optionalString(asMapping(slice.metadata, `${slicePath}: metadata`, true)?.id, `${slicePath}: metadata.id`);
+    if (member.active) {
+      if (sliceId) sliceDirs[sliceId] ??= sliceDir;
+      sliceDirs[sliceDir] ??= sliceDir;
+    }
+
     // A mission boundary is explicitly authored; slice SDLC never manufactures its steps.
     if (authoredBoundary || !member.active) return;
     const execution = asMapping(slice.execution, `${slicePath}: execution`, true);
@@ -180,8 +190,7 @@ export function compileProjectLifecycle(input: {
       unknowns.push(`${normalizedRef}: execution contract missing`);
       return;
     }
-    const stepId = optionalString(asMapping(slice.metadata, `${slicePath}: metadata`, true)?.id, `${slicePath}: metadata.id`) ?? basename(dirname(slicePath));
-    sliceDirs[stepId] = basename(dirname(slicePath));
+    const stepId = sliceId ?? sliceDir;
     const actorRole = requiredString(execution.actor_role, `${slicePath}: execution.actor_role`);
     const preferredTargets = stringList(execution.preferred_targets, `${slicePath}: execution.preferred_targets`, true);
     roles[actorRole] ??= preferredTargets.length > 0 ? { preferred_targets: preferredTargets } : {};

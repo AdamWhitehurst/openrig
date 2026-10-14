@@ -268,7 +268,7 @@ describe("workflow scope tags", () => {
   });
 
   describe("lifecycle", () => {
-    it("defaults project and mission from the recorded identity and tags each step's packets slice:<stepId>", async () => {
+    it("defaults project and mission from the recorded identity and tags each step's packets slice:<directory>", async () => {
       const missionDir = join(tmp, "missions", "release-1.0.0");
       mkdirSync(join(missionDir, "slices", "01-build"), { recursive: true });
       mkdirSync(join(missionDir, "slices", "02-ship"), { recursive: true });
@@ -280,7 +280,8 @@ describe("workflow scope tags", () => {
         missionPath: missionDir, operationKey: "scope-op-1", rootObjective: "lifecycle", createdBySession: "ops@rig",
       });
       expect(created.instance.scope).toEqual({
-        project: "demo", mission: "release-1.0.0", stepSlices: { build: "01-build", ship: "02-ship" },
+        project: "demo", mission: "release-1.0.0",
+        stepSlices: { build: "01-build", "01-build": "01-build", ship: "02-ship", "02-ship": "02-ship" },
       });
       // Step ids are build / ship (metadata.id); the slices' DIRECTORIES are 01-build / 02-ship,
       // and the Queue tab keys on the directory.
@@ -292,6 +293,48 @@ describe("workflow scope tags", () => {
       const indexer = new SliceIndexer({ db, slicesRoot: join(tmp, "missions"), dogfoodEvidenceRoot: null, projectId: "demo" });
       expect(indexer.get("01-build")?.qitemIds).toContain(created.entryQitemId);
       expect(indexer.get("02-ship")?.qitemIds).toContain(next.nextQitemId);
+    });
+  });
+
+  describe("authored lifecycle graph", () => {
+    it("tags a step named for a slice's metadata.id or directory with that slice's directory, any other step by its id", async () => {
+      const missionDir = join(tmp, "missions", "release-2.0.0");
+      mkdirSync(join(missionDir, "slices", "01-build"), { recursive: true });
+      mkdirSync(join(missionDir, "slices", "02-ship"), { recursive: true });
+      writeFileSync(join(tmp, "project.yaml"), `kind: project\nmetadata: { id: demo }\nmissions: { root: missions }\nlifecycle: { profile: authored-v0 }\n`);
+      const boundary = [
+        "lifecycle:",
+        "  profile: authored-v0",
+        "  workflow:",
+        "    entry: { role: builder }",
+        "    roles:",
+        "      builder: { preferred_targets: [builder@rig] }",
+        "    steps:",
+        "      - { id: build, actor_role: builder, allowed_exits: [handoff, done, failed] }",
+        "      - { id: 02-ship, actor_role: builder, depends_on: [build], allowed_exits: [handoff, done, failed] }",
+        "      - { id: wrap-up, actor_role: builder, depends_on: [02-ship], allowed_exits: [done, failed] }",
+      ].join("\n");
+      writeFileSync(join(missionDir, "mission.yaml"), `kind: mission\nmetadata: { name: release-2.0.0 }\ncomposition:\n  slices:\n    - { ref: slices/01-build/slice.yaml, order: 10 }\n    - { ref: slices/02-ship/slice.yaml, order: 20 }\n${boundary}\n`);
+      writeFileSync(join(missionDir, "slices", "01-build", "slice.yaml"), `kind: slice\nmetadata: { id: build }\ncomposition: { mission: ../../mission.yaml }\n`);
+      writeFileSync(join(missionDir, "slices", "02-ship", "slice.yaml"), `kind: slice\nmetadata: { id: ship }\ncomposition: { mission: ../../mission.yaml }\n`);
+      const created = await runtime.instantiateLifecycle({
+        missionPath: missionDir, operationKey: "scope-op-authored", rootObjective: "authored", createdBySession: "ops@rig",
+      });
+      // step "build" is the slice whose metadata.id is build (directory 01-build)
+      expect(tagsOf(created.entryQitemId).slice(-3)).toEqual(["project:demo", "mission:release-2.0.0", "slice:01-build"]);
+      const second = await runtime.project({
+        instanceId: created.instance.instanceId, currentPacketId: created.entryQitemId, exit: "handoff", actorSession: "builder@rig",
+      });
+      // step "02-ship" is named for a slice directory
+      expect(tagsOf(second.nextQitemId!).slice(-1)).toEqual(["slice:02-ship"]);
+      const third = await runtime.project({
+        instanceId: created.instance.instanceId, currentPacketId: second.nextQitemId!, exit: "handoff", actorSession: "builder@rig",
+      });
+      // step "wrap-up" matches no slice: its own id
+      expect(tagsOf(third.nextQitemId!).slice(-1)).toEqual(["slice:wrap-up"]);
+      const indexer = new SliceIndexer({ db, slicesRoot: join(tmp, "missions"), dogfoodEvidenceRoot: null, projectId: "demo" });
+      expect(indexer.get("01-build")?.qitemIds).toContain(created.entryQitemId);
+      expect(indexer.get("02-ship")?.qitemIds).toContain(second.nextQitemId);
     });
   });
 
