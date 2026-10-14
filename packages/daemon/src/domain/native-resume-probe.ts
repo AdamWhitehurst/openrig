@@ -152,8 +152,7 @@ export function assessNativeResumeProbe(
         detail: "Claude is the active foreground process in the probe pane.",
       };
     }
-    if (/(^|\n)\s*❯/.test(paneContent)
-      && /^[ \t]*⏵⏵ auto mode on \(shift\+tab to cycle\)(?:[ \t]+·[^\r\n]*)?[ \t]*$/m.test(paneContent)) {
+    if (/(^|\n)\s*❯/.test(paneContent) && paneContent.split(/\r?\n/).some(isClaudeAutoModeFooter)) {
       return input.claudeAutoIdentityVerified
         ? { status: "resumed", code: "active_runtime", detail: "Claude auto-mode TUI and the exact managed native identity were verified." }
         : { status: "inconclusive", code: "claude_auto_identity_required", detail: "Auto-mode screen text requires proof of the launched Claude identity." };
@@ -257,6 +256,22 @@ export function isProbeShellReady(input: ProbeShellReadyInput): boolean {
   return SHELL_COMMANDS.has(paneCommand) && paneContent.length > 0;
 }
 
+const AUTO_MODE_HINT = "(shift+tab to cycle)";
+
+/** Claude's auto-mode footer line. A narrow pane cuts it short (`…(shift+tab to cy`), and vim mode puts
+ * `-- INSERT --` ahead of it. Only that mode bar is accepted: this is screen text, never identity proof. */
+function isClaudeAutoModeFooter(line: string): boolean {
+  const bar = line.trim().replace(/^-- INSERT --\s+/, "");
+  const head = "⏵⏵ auto mode on";
+  if (!bar.startsWith(head)) return false;
+  const rest = bar.slice(head.length);
+  // The hint's opening parenthesis must be there: the bare mode name is not enough to call the bar a footer.
+  if (!rest.startsWith(" (")) return false;
+  const tail = rest.slice(1).replace(/…$/, "");
+  return AUTO_MODE_HINT.startsWith(tail)
+    || (tail.startsWith(AUTO_MODE_HINT) && /^(?:\s+·.*)?$/.test(tail.slice(AUTO_MODE_HINT.length)));
+}
+
 function looksLikeClaudeTui(paneContent: string): boolean {
   const hasPrompt = hasClaudeComposerPrompt(paneContent);
   if (!hasPrompt) return false;
@@ -264,6 +279,8 @@ function looksLikeClaudeTui(paneContent: string): boolean {
   return (
     paneContent.includes("Claude Code v")
     || paneContent.includes("accept edits on")
+    // A narrow pane cuts the footer short; vim mode puts `-- INSERT --` ahead of it.
+    || /^[ \t]*(?:-- INSERT --[ \t]+)?⏵⏵ accept\b/m.test(paneContent)
   );
 }
 

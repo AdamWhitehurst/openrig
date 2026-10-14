@@ -900,3 +900,52 @@ describe("native resume probe", () => {
     });
   });
 });
+
+// A narrow pane cuts Claude's footer short, and vim mode puts `-- INSERT --` ahead of it. Screen text alone
+// still never proves the launched identity for an auto-mode seat, so those screens stay "inconclusive" without it.
+describe("Claude footers in a narrow or vim-mode pane", () => {
+  const screen = (footer: string) => `Conversation\n──────────\n❯ \n──────────\n  ${footer}\n`;
+  const probe = (footer: string, verified = false) => assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "2.1.296",
+    paneContent: screen(footer), ...(verified ? { claudeAutoIdentityVerified: true } : {}) });
+
+  it.each([
+    "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+    "-- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)",
+    "⏵⏵ auto mode on (shift+tab to cy",
+    "⏵⏵ auto mode on (shift+tab to cycle…",
+    "⏵⏵ auto mode on (",
+  ])("an auto-mode footer reads as awaiting identity proof: %s", footer => {
+    expect(probe(footer)).toMatchObject({ status: "inconclusive", code: "claude_auto_identity_required" });
+    expect(probe(footer, true)).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  it.each([
+    "⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
+    "-- INSERT -- ⏵⏵ accept edits on (shift+tab to cycle)",
+    "⏵⏵ accept edits on (shift+t",
+    "⏵⏵ accept edi",
+    "-- INSERT -- ⏵⏵ accept",
+  ])("an accept-edits footer reads as a running TUI: %s", footer => {
+    expect(probe(footer)).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  it.each([
+    "⏵⏵ auto mode on (shift+tab to cycle) extra words",
+    "⏵⏵ auto mode off",
+    "-- INSERT -- ⏵⏵ auto mode on",
+    "⏵⏵ auto mode only (shift+tab to cycle)",
+    "auto mode on (shift+tab to cycle)",
+    "I think ⏵⏵ auto mode on (shift+tab to cycle)",
+    "-- NORMAL -- ⏵⏵ auto mode on (shift+tab to cycle)",
+    "⏵⏵ bypass permissions on (shift+tab to cycle)",
+    "? for shortcuts",
+  ])("a non-ready or unrelated line is still not a ready footer: %s", footer => {
+    expect(probe(footer, true).code === "claude_auto_identity_required").toBe(false);
+    expect(probe(footer).status).not.toBe("resumed");
+  });
+
+  it("needs the composer prompt as well", () => {
+    expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "2.1.296",
+      paneContent: "Conversation\n  ⏵⏵ auto mode on (shift+tab to cy\n" })).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+  });
+});

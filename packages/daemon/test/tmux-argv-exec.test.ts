@@ -31,12 +31,12 @@ describe("tmux argv exec path", () => {
     await adapter.createSession("r01-dev1-impl", "/home/user/my project/code", { PATH: "/a b:/c", EMPTY: "" });
     expect(exec).not.toHaveBeenCalled();
     expect(seen).toEqual([[
-      "tmux", "new-session", "-d", "-s", "r01-dev1-impl",
+      "tmux", "new-session", "-d", "-s", "r01-dev1-impl", "-x", "200", "-y", "50",
       "-c", "/home/user/my project/code",
       "-e", "OPENRIG_TRANSCRIPTS_LINES=", "-e", "OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=",
       "-e", "PATH=/a b:/c", "-e", "EMPTY=",
       "-P", "-F", "#{pane_id}",
-    ], ["tmux", "show-environment", "-g"]]);
+    ], ["tmux", "show-environment", "-g"], ["tmux", "set-option", "-t", "=r01-dev1-impl:", "window-size", "manual"]]);
   });
 
   it("sendKeys passes key names as separate verbatim units", async () => {
