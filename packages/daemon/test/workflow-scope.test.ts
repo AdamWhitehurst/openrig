@@ -101,6 +101,19 @@ describe("workflow scope tags", () => {
   const instantiate = (path: string, scope?: Parameters<typeof normalizeWorkflowScope>[0]) =>
     runtime.instantiate({ specPath: path, rootObjective: "scope", createdBySession: "ops@rig", ...(scope ? { scope } : {}) });
 
+  // The slice tag on the packet each step of a lifecycle chain produces, in order.
+  const sliceTagsAlong = async (missionDir: string, key: string, length: number) => {
+    const created = await runtime.instantiateLifecycle({ missionPath: missionDir, operationKey: key, rootObjective: "lifecycle", createdBySession: "ops@rig" });
+    const out = [tagsOf(created.entryQitemId).filter((t) => t.startsWith("slice:"))];
+    let current = created.entryQitemId;
+    for (let i = 1; i < length; i++) {
+      const next = await runtime.project({ instanceId: created.instance.instanceId, currentPacketId: current, exit: "handoff", actorSession: "builder@rig" });
+      current = next.nextQitemId!;
+      out.push(tagsOf(current).filter((t) => t.startsWith("slice:")));
+    }
+    return { created, out };
+  };
+
   describe("normalizeWorkflowScope", () => {
     it("is null when nothing is set", () => {
       expect(normalizeWorkflowScope({})).toBeNull();
@@ -372,19 +385,6 @@ describe("workflow scope tags", () => {
       ].join("\n"));
       return missionDir;
     };
-    // The slice tag on the packet each step of the authored chain produces, in order.
-    const sliceTagsAlong = async (missionDir: string, key: string, length: number) => {
-      const created = await runtime.instantiateLifecycle({ missionPath: missionDir, operationKey: key, rootObjective: "authored", createdBySession: "ops@rig" });
-      const out = [tagsOf(created.entryQitemId).filter((t) => t.startsWith("slice:"))];
-      let current = created.entryQitemId;
-      for (let i = 1; i < length; i++) {
-        const next = await runtime.project({ instanceId: created.instance.instanceId, currentPacketId: current, exit: "handoff", actorSession: "builder@rig" });
-        current = next.nextQitemId!;
-        out.push(tagsOf(current).filter((t) => t.startsWith("slice:")));
-      }
-      return { created, out };
-    };
-
     it("tags a step named for a slice's metadata.id or directory with that slice's directory, and a step matching no slice with no slice tag", async () => {
       const missionDir = authoredMission("release-2.0.0", [{ dir: "01-build", id: "build" }, { dir: "02-ship", id: "ship" }], ["build", "02-ship", "wrap-up"]);
       const { created, out } = await sliceTagsAlong(missionDir, "scope-op-authored", 3);
@@ -437,17 +437,6 @@ describe("workflow scope tags", () => {
         ...lifecycle, ``,
       ].join("\n"));
       return missionDir;
-    };
-    const sliceTagsAlong = async (missionDir: string, key: string, length: number) => {
-      const created = await runtime.instantiateLifecycle({ missionPath: missionDir, operationKey: key, rootObjective: "x", createdBySession: "ops@rig" });
-      const out = [tagsOf(created.entryQitemId).filter((t) => t.startsWith("slice:"))];
-      let current = created.entryQitemId;
-      for (let i = 1; i < length; i++) {
-        const next = await runtime.project({ instanceId: created.instance.instanceId, currentPacketId: current, exit: "handoff", actorSession: "builder@rig" });
-        current = next.nextQitemId!;
-        out.push(tagsOf(current).filter((t) => t.startsWith("slice:")));
-      }
-      return { created, out };
     };
     const BAD_METADATA = [["a list", "[oops]"], ["a non-string id", "{ id: 7 }"], ["a blank id", '{ id: "" }']] as const;
 
