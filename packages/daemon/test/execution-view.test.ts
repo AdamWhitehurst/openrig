@@ -783,6 +783,34 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
       await expectAncestryAnswer();
     });
 
+    it("never lets a late merge report that names an older candidate re-point built", async () => {
+      const first = squashedCandidate();
+      const next = commitOnLane("candidate B");
+      db.prepare(
+        `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, body)
+         VALUES ('qitem-build-b-31', '2026-08-30T12:00:00.000Z', '2026-08-30T12:00:00.000Z', 'lead@exec-fixture', 'lead@exec-fixture', 'done', 'normal', 'light', ?, 'Build B.')`,
+      ).run(JSON.stringify([`mission:${MISSION}`, "slice:OPR.9.9.31", `candidate:${next}`]));
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1291", `candidate:${first}`], "2026-08-30T13:00:00.000Z");
+      const ladder = await ladder31();
+      expect((ladder.built as Record<string, unknown>).resolved_commit).toBe(next);
+      expect(String((ladder.built as Record<string, unknown>).basis)).toContain("qitem-build-b-31");
+      expect(ladder.folded).toMatchObject({ value: false, merge_report: { pr: "1291", linked: false } });
+      await expectAncestryAnswer();
+    });
+
+    it("turns only a false from ancestry into merged, never an answer ancestry could not give", async () => {
+      const sha = squashedCandidate();
+      const missionYamlPath = path.join(missionsRoot, MISSION, "mission.yaml");
+      // A valid-shaped ref that does not exist: ancestry cannot answer.
+      fs.writeFileSync(missionYamlPath, fs.readFileSync(missionYamlPath, "utf8") + "\n  source:\n    integration_ref: no-such-branch\n");
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1291", `candidate:${sha}`]);
+      const folded = (await ladder31()).folded as Record<string, unknown>;
+      expect(folded).toMatchObject({ value: "INDETERMINATE", merge_report: { pr: "1291", linked: true } });
+      expect(String(folded.basis)).toContain("only a false from ancestry is turned true");
+      expect(await nextUp("OPR.9.9.31")).toBe("INDETERMINATE");
+      expect(await nextUp("OPR.9.9.32")).toBe("INDETERMINATE");
+    });
+
     it("keeps a row linked to a different commit as a report only", async () => {
       squashedCandidate();
       const other = commitOnLane("other work");
@@ -815,14 +843,14 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
       expect(await nextUp("OPR.9.9.33")).toBe(nextBefore);
     });
 
-    it("leaves a declared integration ref that is unusable indeterminate, even for a linked row", async () => {
+    it("leaves a malformed declared integration ref indeterminate, and still reports a row linked by commit", async () => {
       const sha = squashedCandidate();
       const missionYamlPath = path.join(missionsRoot, MISSION, "mission.yaml");
       fs.writeFileSync(missionYamlPath, fs.readFileSync(missionYamlPath, "utf8") + '\n  source:\n    integration_ref: "-invalid-branch"\n');
       insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1291"]);
       insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1292", `candidate:${sha}`], "2026-08-30T11:00:00.000Z");
       const folded = (await ladder31()).folded as Record<string, unknown>;
-      expect(folded).toMatchObject({ value: "INDETERMINATE", merge_report: { pr: "1292", linked: false } });
+      expect(folded).toMatchObject({ value: "INDETERMINATE", merge_report: { pr: "1292", linked: true } });
       expect(String(folded.basis)).toContain("-invalid-branch");
       expect(String(folded.basis)).toContain("merged:1292 recorded on row");
       expect(await nextUp("OPR.9.9.31")).toBe("INDETERMINATE");

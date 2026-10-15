@@ -92,12 +92,15 @@ text, and `recorded_at` is when the row recorded the merge, not when it happened
 A report never changes the merged answer by itself: without a candidate, with an
 unresolvable candidate, with an unusable declared integration ref or with no
 repository context, the answer, next-up and dependent slices stay as ancestry gives
-them. The answer changes only when the same row also carries a `candidate:<sha>`
-that resolves, through the repository context, to the slice's built commit. Then
-the rung reads merged and the basis says so (`linked: true`); a row with no
-candidate or a different commit reports `linked: false`. The report never changes
-which commit counts as built or reviewed: the newest `candidate:<sha>` tag stays
-their identity.
+them. A row that carries a `merged:` tag is a report, not a build, so it never picks
+which commit counts as built: that stays the newest `candidate:<sha>` tag on a row
+without a `merged:` tag. A report is `linked: true` when its own row's `candidate:<sha>`
+resolves, through the repository context, to that built commit, and `linked: false`
+otherwise (no candidate on the row, or a different commit). The answer changes only
+for a linked report when ancestry answered false (not an ancestor): then the rung
+reads merged and the basis says so. A linked report never turns an answer ancestry
+could not give into merged. The report never changes which commit counts as built
+or reviewed.
 
 **The heavier flow — proof contracts, plan-lock, C1 drops, proof-lock — is PART B and is not in
 force unless assigned.**

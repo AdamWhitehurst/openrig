@@ -925,6 +925,8 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     let candidateSha: string | null = null;
     let candidateRow: string | null = null;
     for (const r of candRows) {
+      // A row carrying a merged: tag reports a merge; it is not a build, so it never picks the built candidate.
+      if (parseTags(r.tags).some((t) => MERGED_TAG.test(t))) continue;
       for (const t of parseTags(r.tags)) {
         const m = t.match(CANDIDATE_TAG);
         if (m?.[1]) {
@@ -1007,28 +1009,27 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     // changes the answer only when the SAME row also carries a `candidate:<sha>`
     // that resolves, through the repo context and a usable integration ref, to the
     // slice's built commit. Squash and rebase merges leave the candidate off the
-    // integration ref, so only that link reads such a merge as merged.
+    // integration ref, so only that link reads such a merge as merged, and only
+    // from ancestry's false: an answer ancestry could not give is never turned true.
     const reports: MergeReport[] = [];
     for (const r of candRows) { // newest first
       const tags = parseTags(r.tags);
       const pr = tags.map((t) => t.match(MERGED_TAG)?.[1]).find((n): n is string => !!n);
       if (!pr) continue;
       const token = extractShaToken(tags.map((t) => t.match(CANDIDATE_TAG)?.[1]).find((n): n is string => !!n) ?? null);
-      const resolved = token && repoCtx && !isUnusableDeclaration ? await resolveCommit(exec, repoCtx, token, commitCache) : null;
+      const resolved = token && repoCtx ? await resolveCommit(exec, repoCtx, token, commitCache) : null;
       reports.push({ pr, row: r.qitem_id, recorded_at: r.ts_created, linked: !!builtResolved && resolved === builtResolved });
     }
     const report = reports.find((r) => r.linked) ?? reports[0] ?? null;
     const reportNote = report
-      ? `merged:${report.pr} recorded on row ${report.row} at ${report.recorded_at}${report.linked ? "" : "; that row is not linked to the built candidate, so it does not change this answer"}`
+      ? `merged:${report.pr} recorded on row ${report.row} at ${report.recorded_at}${report.linked ? "; that row is linked to the built candidate, but only a false from ancestry is turned true, so the answer stays as ancestry gives it" : "; that row is not linked to the built candidate, so it does not change this answer"}`
       : null;
     const folded: Rung & { merge_report?: MergeReport } = !report
       ? ancestry
-      : report.linked && ancestry.value !== true
+      : report.linked && ancestry.value === false
         ? {
             value: true,
-            basis: `reported merged in #${report.pr} for candidate ${(builtResolved ?? "").slice(0, 9)}, recorded on row ${report.row} at ${report.recorded_at}; ${
-              ancestry.value === false ? `candidate is not an ancestor of ${targetRef}` : "ancestry underivable"
-            } (${ancestry.basis})`,
+            basis: `reported merged in #${report.pr} for candidate ${(builtResolved ?? "").slice(0, 9)}, recorded on row ${report.row} at ${report.recorded_at}; candidate is not an ancestor of ${targetRef} (${ancestry.basis})`,
             merge_report: report,
           }
         : { ...ancestry, basis: `${ancestry.basis}; ${reportNote}`, merge_report: report };
