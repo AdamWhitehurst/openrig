@@ -946,6 +946,24 @@ describe("Claude footers in a narrow or vim-mode pane", () => {
     expect(probe(footer).status).not.toBe("resumed");
   });
 
+  // Real panes of a healthy Claude 2.1.296 seat, captured with `tmux capture-pane -p` while a 30-column client
+  // was attached (the window was 30x10). At that width Claude cuts the auto-mode footer to `⏵⏵ auto mode on (shift+tab`.
+  const realFrame = (name: string) => fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8");
+
+  it("reads the footer of a real auto-mode seat in a 30-column pane", () => {
+    const paneContent = realFrame("claude-2.1.296-30col-auto-mode.txt");
+    expect(paneContent).toContain("⏵⏵ auto mode on (shift+tab\n");
+    const probe = (verified: boolean) => assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "2.1.296", paneContent,
+      ...(verified ? { claudeAutoIdentityVerified: true } : {}) });
+    expect(probe(false)).toMatchObject({ status: "inconclusive", code: "claude_auto_identity_required" });
+    expect(probe(true)).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  it("still reads the footer of a real accept-edits seat in a 30-column pane (it read fine before)", () => {
+    expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "2.1.296",
+      paneContent: realFrame("claude-2.1.296-30col-accept-edits.txt") })).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
   it("needs the composer prompt as well", () => {
     expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "2.1.296",
       paneContent: "Conversation\n  ⏵⏵ auto mode on (shift+tab to cy\n" })).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
