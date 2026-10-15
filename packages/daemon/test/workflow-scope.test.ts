@@ -570,63 +570,86 @@ describe("workflow scope tags", () => {
     const post = (app: Hono, body: Record<string, unknown>) =>
       app.request("/api/workflow/instantiate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
-    it("refuses a scope project the workspace catalog does not declare, and creates nothing", async () => {
+    const runtimeScope = (id: string) => runtime.instanceStore.getByIdOrThrow(id).scope ?? null;
+    const instanceCount = () => (db.prepare(`SELECT count(*) AS n FROM workflow_instances`).get() as { n: number }).n;
+    const catalog = () => {
       writeFileSync(join(tmp, "workspace.yaml"), "projects:\n  - id: p1\n    root: p1\n");
       mkdirSync(join(tmp, "p1", "missions"), { recursive: true });
-      const response = await post(appFor(tmp), {
-        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope: { project: "nope" },
-      });
-      expect(response.status).toBe(409);
-      expect((await response.json() as { error: string }).error).toBe("project_not_found");
-      expect((db.prepare(`SELECT count(*) AS n FROM workflow_instances`).get() as { n: number }).n).toBe(0);
-    });
+    };
+    // The fixture spec's own advisories (unregistered seats) are not the scope's; pick out the scope notes.
+    const scopeNotes = (body: { advisories: string[] }) => body.advisories.filter((a) => /^(Scope not applied|Ignored request body fields)/.test(a));
+    type Created = {
+      entryQitemId: string;
+      instance: { instanceId: string };
+      advisories: string[];
+      scopeIgnored?: { fields: string[]; message: string };
+    };
 
     it("accepts a scope with a catalogued project and stamps it, with tags", async () => {
-      writeFileSync(join(tmp, "workspace.yaml"), "projects:\n  - id: p1\n    root: p1\n");
-      mkdirSync(join(tmp, "p1", "missions"), { recursive: true });
+      catalog();
       const response = await post(appFor(tmp), {
         specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope: { project: "p1", slice: "01-s1", tags: ["ticket-7"] },
       });
       expect(response.status).toBe(201);
-      const body = await response.json() as { entryQitemId: string };
+      const body = await response.json() as Created;
       expect(body).not.toHaveProperty("scopeIgnored");
-      expect(tagsOf(body.entryQitemId).slice(-3)).toEqual(["project:p1", "slice:01-s1", "ticket-7"]);
+      expect(scopeNotes(body)).toEqual([]);
+      expect(tagsOf(body.entryQitemId)).toEqual(["workflow", "entry", "workflow:scope-pipeline", `instance:${body.instance.instanceId}`, "project:p1", "slice:01-s1", "ticket-7"]);
+      expect(runtimeScope(body.instance.instanceId)).toEqual({ project: "p1", slice: "01-s1", tags: ["ticket-7"] });
     });
 
+    it("an instantiate with no scope fields has no note and no advisory", async () => {
+      const response = await post(appFor(tmp), { specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig" });
+      expect(response.status).toBe(201);
+      const body = await response.json() as Created;
+      expect(body).not.toHaveProperty("scopeIgnored");
+      expect(scopeNotes(body)).toEqual([]);
+      expect(tagsOf(body.entryQitemId)).toEqual(["workflow", "entry", "workflow:scope-pipeline", `instance:${body.instance.instanceId}`]);
+      expect(runtimeScope(body.instance.instanceId)).toBeNull();
+    });
+
+    // A nested scope the route cannot apply: main accepted these requests, ignoring the key and creating one unscoped
+    // instance and packet, so the route does too, and says in the advisories (the output `rig workflow run` prints) that
+    // the scope was not applied. Nothing the scope named is recorded, and no routing tag reaches the packet.
     it.each([
-      ["a string", "instance:evil"],
-      ["an object", {}],
-    ])("refuses scope tags sent as %s with a 400, creating nothing", async (_label, tags) => {
-      const response = await post(appFor(tmp), {
-        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope: { tags },
-      });
-      expect(response.status).toBe(400);
-      expect((await response.json() as { error: string }).error).toBe("scope_tag_invalid");
-      expect((db.prepare(`SELECT count(*) AS n FROM workflow_instances`).get() as { n: number }).n).toBe(0);
+      ["a project the catalog does not declare", { project: "nope" }, /project_not_found/],
+      ["a conflicting project tag", { project: "p1", tags: ["project:other"] }, /scope_tag_contradiction/],
+      ["a reserved tag", { project: "p1", tags: ["gate"] }, /scope_tag_reserved/],
+      ["a reserved-prefix tag", { project: "p1", tags: ["instance:evil"] }, /scope_tag_reserved/],
+      ["a workflow: tag", { tags: ["workflow:other"] }, /scope_tag_reserved/],
+      ["tags that are an object", { project: "p1", tags: {} }, /scope_tag_invalid/],
+      ["tags that are a string", { tags: "instance:evil" }, /scope_tag_invalid/],
+      ["a malformed project id", { project: "has space" }, /scope_id_invalid/],
+      ["a non-string project", { project: { id: "p1" } }, /scope_id_invalid/],
+      ["a null scope", null, /scope_invalid/],
+      ["an array scope", ["p1"], /scope_invalid/],
+      ["a string scope", "p1", /scope_invalid/],
+    ])("creates one unscoped instance, and says the scope was not applied, for a scope with %s", async (_label, scope, reason) => {
+      catalog();
+      const response = await post(appFor(tmp), { specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope });
+      expect(response.status).toBe(201);
+      const body = await response.json() as Created;
+      expect(instanceCount()).toBe(1);
+      expect(db.prepare(`SELECT count(*) AS n FROM queue_items`).get()).toEqual({ n: 1 });
+      // main's tags exactly: no scope tag, and no tag from the rejected scope
+      expect(tagsOf(body.entryQitemId)).toEqual(["workflow", "entry", "workflow:scope-pipeline", `instance:${body.instance.instanceId}`]);
+      expect(runtimeScope(body.instance.instanceId)).toBeNull();
+      // the advisory (what `rig workflow run` prints) names the instance and the reason, and does not read as a scoped success
+      const [note, ...rest] = scopeNotes(body);
+      expect(rest).toEqual([]);
+      expect(note).toMatch(/^Scope not applied \(/);
+      expect(note).toMatch(reason);
+      expect(note).toContain(`Instance ${body.instance.instanceId} was created unscoped`);
+      expect(note).toMatch(/second instance/);
+      expect(body.scopeIgnored?.fields).toEqual(["scope"]);
     });
 
-    it("refuses a non-string scope project with a 400", async () => {
+    it("does not turn an unrelated instantiate failure into a success when the scope also cannot be applied", async () => {
       const response = await post(appFor(tmp), {
-        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope: { project: { id: "p1" } },
+        specPath: join(tmp, "no-such-spec.yaml"), rootObjective: "x", createdBySession: "ops@rig", scope: { project: "nope" },
       });
-      expect(response.status).toBe(400);
-      expect((await response.json() as { error: string }).error).toBe("scope_id_invalid");
-    });
-
-    it("refuses a reserved scope tag with a 400", async () => {
-      const response = await post(appFor(tmp), {
-        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope: { tags: ["gate"] },
-      });
-      expect(response.status).toBe(400);
-      expect((await response.json() as { error: string }).error).toBe("scope_tag_reserved");
-    });
-
-    it.each([null, "p1", ["p1"]])("refuses a scope that is not an object (%j) with a 400", async (scope) => {
-      const response = await post(appFor(tmp), {
-        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", scope,
-      });
-      expect(response.status).toBe(400);
-      expect((await response.json() as { error: string }).error).toBe("scope_invalid");
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(instanceCount()).toBe(0);
     });
 
     // What main accepted and ignored: the bare fields. They still instantiate, unscoped, and the response says so.
@@ -647,11 +670,28 @@ describe("workflow scope tags", () => {
         specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", ...fields,
       });
       expect(response.status).toBe(201);
-      const body = await response.json() as { entryQitemId: string; instance: { instanceId: string; scope?: unknown }; scopeIgnored: { fields: string[]; message: string } };
+      const body = await response.json() as { entryQitemId: string; instance: { instanceId: string; scope?: unknown }; advisories: string[]; scopeIgnored: { fields: string[]; message: string } };
       expect(tagsOf(body.entryQitemId)).toEqual(["workflow", "entry", "workflow:scope-pipeline", `instance:${body.instance.instanceId}`]);
       expect(runtime.instanceStore.getByIdOrThrow(body.instance.instanceId).scope ?? null).toBeNull();
       expect(body.scopeIgnored.fields).toEqual(Object.keys(fields));
       expect(body.scopeIgnored.message).toBe(`Ignored request body fields: ${Object.keys(fields).join(", ")}. Send scope as an object ({ project, mission, slice, tags }) to apply it. The instance was created unscoped.`);
+      // `rig workflow run` prints advisories, not the response body, so the note rides there too
+      expect(scopeNotes(body)).toEqual([body.scopeIgnored.message]);
+    });
+
+    it("when the body carries bare fields and a scope that cannot be applied, both are said once", async () => {
+      catalog();
+      const response = await post(appFor(tmp), {
+        specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig", tags: ["x"], scope: { project: "nope" },
+      });
+      expect(response.status).toBe(201);
+      const body = await response.json() as Created;
+      const notes = scopeNotes(body);
+      expect(notes).toHaveLength(2);
+      expect(notes[0]).toMatch(/^Ignored request body fields: tags\./);
+      expect(notes[1]).toMatch(/^Scope not applied \(project_not_found/);
+      expect(body.scopeIgnored?.fields).toEqual(["tags", "scope"]);
+      expect(runtimeScope(body.instance.instanceId)).toBeNull();
     });
 
     it("when the body carries both, the scope object applies and the note says the bare fields were ignored", async () => {
@@ -665,12 +705,6 @@ describe("workflow scope tags", () => {
       expect(tagsOf(body.entryQitemId).slice(-1)).toEqual(["project:p1"]);
       expect(body.scopeIgnored.fields).toEqual(["slice"]);
       expect(body.scopeIgnored.message).toBe("Ignored request body fields: slice. Send scope as an object ({ project, mission, slice, tags }) to apply it. The instance carries the scope object's scope.");
-    });
-
-    it("an instantiate with no scope fields has no scopeIgnored note", async () => {
-      const response = await post(appFor(tmp), { specPath: spec(PIPELINE), rootObjective: "x", createdBySession: "ops@rig" });
-      expect(response.status).toBe(201);
-      expect(await response.json()).not.toHaveProperty("scopeIgnored");
     });
   });
 });

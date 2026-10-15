@@ -224,19 +224,25 @@ rig workflow instantiate ./spec.workflow.md \
   --tags ticket-7
 ```
 
-- `--project` must name a project in the workspace catalog; an unknown project
-  is refused. `--mission` and `--slice` take the same ids as the slice routes.
-  `rig workflow run` takes the same flags.
+- `--project` should name a project in the workspace catalog. `--mission` and
+  `--slice` take the same ids as the slice routes. `rig workflow run` takes the
+  same flags. The CLI refuses what it can check itself (an id of the wrong shape,
+  a reserved tag, a tag that contradicts a flag) as a usage error, before
+  anything is sent. Only the daemon knows the catalog, so a mistyped `--project`
+  is **not refused**: the daemon creates the instance unscoped, its packets carry
+  no scope tags, and the CLI prints a warning on stderr (also with `--json`)
+  that names the instance and says the scope was not applied. The CLI does not
+  retry; instantiating again creates a second instance.
 - Packets carry `project:<id>`, `mission:<id>` and `slice:<id>` for the parts
   you set, then your `--tags`, after the tags the workflow system writes. Tags
   compose as in `rig queue create`: duplicates collapse, so `--slice S --tags
   slice:S` is one tag.
-- `--tags` refuses what the workflow runtime reads back to route packets:
+- `--tags` is refused locally when it carries what the workflow runtime reads back to route packets:
   `workflow`, `handoff`, `gate`, `entry`, `resume`, `re-route`,
   `workflow-exception`, and the `workflow:`, `instance:`, `step:`,
-  `exception:`, `occurrence:` and `recovery-for:` prefixes. It also refuses a
-  `project:`, `mission:` or `slice:` tag that contradicts its flag, or a second
-  value of the same key.
+  `exception:`, `occurrence:` and `recovery-for:` prefixes, a `project:`,
+  `mission:` or `slice:` tag that contradicts its flag, or a second value of the
+  same key.
 - `rig workflow instantiate-lifecycle` needs no flags: it takes the project and
   mission from the lifecycle identity it compiles. A compiled step's packets
   carry the `slice:<directory>` of the slice that step was compiled from, even
@@ -249,12 +255,20 @@ rig workflow instantiate ./spec.workflow.md \
   A project id or mission name the compiler reads from the manifests that cannot
   be a tag (a space, a `:`, a leading `.`, `_` or `-`, or too long) is left off
   the packets with a compile advisory; the lifecycle still instantiates. Slice
-  metadata the lifecycle does not run is not read.
+  metadata the lifecycle does not run is read only leniently, for step names, and
+  never fails compile or instantiate.
 - Over HTTP, `POST /api/workflow/instantiate` reads the scope from a `scope`
-  object (`{ project, mission, slice, tags }`) and validates it as above. Bare
-  `project`, `mission`, `slice` or `tags` fields in the body are ignored, as
-  before: the instance is created unscoped and the response carries a
-  `scopeIgnored` note saying so.
+  object (`{ project, mission, slice, tags }`). A scope that is valid and names
+  a catalogued project is applied as above. A scope the route cannot apply (a
+  project the catalog does not declare, a conflicting, reserved or malformed tag
+  or id, or a `scope` that is not an object) is ignored: the route does what it
+  did before the field existed and creates one unscoped instance, records
+  nothing the scope named, and never lets a rejected tag reach a packet. The
+  response `advisories` then carry a `Scope not applied (...)` note that names
+  the instance (`scopeIgnored` repeats it); `rig workflow run` prints
+  `advisories`. Bare `project`, `mission`, `slice` or `tags` fields in the body
+  are ignored the same way, with a note. A failure unrelated to the scope still
+  fails the request.
 - A Projects view scoped to a project lists a slice's packets only when they
   carry `project:<id>` as well as `slice:<id>`, so pass `--project` with
   `--slice`.
