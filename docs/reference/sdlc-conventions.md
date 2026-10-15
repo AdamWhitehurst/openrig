@@ -84,14 +84,20 @@ release-line fold followed by one explicit merge are both valid; leaving the
 choice implicit is not.
 
 A candidate that merges by squash or rebase is never an ancestor of that ref, so
-ancestry alone cannot read it as merged. `rig view show execution` also reads the
-"merged" rung (`folded`) true from a recorded merge fact: a `merged:<pr-number>`
-tag on any queue row bound to the slice (the `slice:` tag, like `candidate:`),
-with the row's creation time as the merged-at time. Ancestry that holds keeps its
-own basis; the fact decides when it does not, including for a slice with no
-candidate. A fact recorded before the newest candidate's row belongs to an earlier
-build and does not merge the newer candidate. The fact never changes which commit counts as built or reviewed: the
-newest `candidate:<sha>` tag stays their identity.
+ancestry alone cannot read it as merged. A `merged:<pr-number>` tag on a queue row
+bound to the slice (the `slice:` tag, like `candidate:`) is a recorded report of a
+merge, not a verified one: `rig view show execution` shows it on the "merged" rung
+(`folded`) as `merge_report` (`pr`, `row`, `recorded_at`, `linked`) and in the basis
+text, and `recorded_at` is when the row recorded the merge, not when it happened.
+A report never changes the merged answer by itself: without a candidate, with an
+unresolvable candidate, with an unusable declared integration ref or with no
+repository context, the answer, next-up and dependent slices stay as ancestry gives
+them. The answer changes only when the same row also carries a `candidate:<sha>`
+that resolves, through the repository context, to the slice's built commit. Then
+the rung reads merged and the basis says so (`linked: true`); a row with no
+candidate or a different commit reports `linked: false`. The report never changes
+which commit counts as built or reviewed: the newest `candidate:<sha>` tag stays
+their identity.
 
 **The heavier flow — proof contracts, plan-lock, C1 drops, proof-lock — is PART B and is not in
 force unless assigned.**

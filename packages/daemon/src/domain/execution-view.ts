@@ -132,10 +132,11 @@ function parseArrayField(v: unknown): string[] | Indeterminate {
 
 const SLICE_TAG = /^slice:(.+)$/;
 const CANDIDATE_TAG = /^candidate:(.+)$/;
-/** A recorded merge fact: `merged:<pr-number>` on a row bound to the slice. Squash
- *  and rebase merges leave the candidate commit off the integration ref, so
- *  ancestry alone never reads a merged PR as merged. */
+/** A recorded merge report: `merged:<pr-number>` on a row bound to the slice. */
 const MERGED_TAG = /^merged:(\d+)$/;
+/** `recorded_at` is when the row recorded the merge, not when it happened. `linked`
+ *  is true when the same row's `candidate:<sha>` resolves to the slice's built commit. */
+interface MergeReport { pr: string; row: string; recorded_at: string; linked: boolean }
 
 /** Candidate identity is a COMMIT, not a string. Production carries mixed forms —
  *  abbreviated tags (`dced9edb0`), full 40-hex artifact fields, and annotated
@@ -1000,34 +1001,37 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
         : !repoCtx
           ? { value: INDETERMINATE, basis: "no reachable repo context (no EC-3 worktree on the board)" }
           : await gitAncestor(exec, repoCtx, builtResolved ?? candidateSha, targetRef, declaredRef);
-    // A recorded merge fact is a second way to read folded. It never touches
-    // built or reviewed: the candidate sha stays their identity. Ancestry that
-    // holds keeps its own basis; the fact decides when ancestry does not hold.
-    // A fact recorded before the selected candidate's row belongs to an earlier
-    // build, so it does not merge a newer candidate. With no candidate, any fact counts.
-    const candidateAt = candRows.find((r) => r.qitem_id === candidateRow)?.ts_created;
-    let mergeFact: { pr: string; row: string; at: string } | null = null;
-    for (const r of candRows) {
-      if (candidateAt && r.ts_created < candidateAt) break; // candRows is newest first
-      const pr = parseTags(r.tags).map((t) => t.match(MERGED_TAG)?.[1]).find((n): n is string => !!n);
-      if (pr) {
-        mergeFact = { pr, row: r.qitem_id, at: r.ts_created };
-        break;
-      }
+    // A merge report (`merged:<pr-number>` on a row bound to the slice) is recorded,
+    // not verified: it carries no repository, commit or landed commit. So it is
+    // always shown as its own signal and never turns the answer ancestry gave. It
+    // changes the answer only when the SAME row also carries a `candidate:<sha>`
+    // that resolves, through the repo context and a usable integration ref, to the
+    // slice's built commit. Squash and rebase merges leave the candidate off the
+    // integration ref, so only that link reads such a merge as merged.
+    const reports: MergeReport[] = [];
+    for (const r of candRows) { // newest first
+      const tags = parseTags(r.tags);
+      const pr = tags.map((t) => t.match(MERGED_TAG)?.[1]).find((n): n is string => !!n);
+      if (!pr) continue;
+      const token = extractShaToken(tags.map((t) => t.match(CANDIDATE_TAG)?.[1]).find((n): n is string => !!n) ?? null);
+      const resolved = token && repoCtx && !isUnusableDeclaration ? await resolveCommit(exec, repoCtx, token, commitCache) : null;
+      reports.push({ pr, row: r.qitem_id, recorded_at: r.ts_created, linked: !!builtResolved && resolved === builtResolved });
     }
-    const folded: Rung & { merge_fact?: { pr: string; row: string; at: string } } = mergeFact && ancestry.value !== true
-      ? {
-          value: true,
-          basis: `merged:${mergeFact.pr} recorded on row ${mergeFact.row} at ${mergeFact.at}; ${
-            !candidateSha
-              ? "no candidate was recorded to test ancestry"
-              : ancestry.value === false
-                ? `candidate is not an ancestor of ${targetRef} (${ancestry.basis})`
-                : `ancestry underivable (${ancestry.basis})`
-          }`,
-          merge_fact: mergeFact,
-        }
-      : ancestry;
+    const report = reports.find((r) => r.linked) ?? reports[0] ?? null;
+    const reportNote = report
+      ? `merged:${report.pr} recorded on row ${report.row} at ${report.recorded_at}${report.linked ? "" : "; that row is not linked to the built candidate, so it does not change this answer"}`
+      : null;
+    const folded: Rung & { merge_report?: MergeReport } = !report
+      ? ancestry
+      : report.linked && ancestry.value !== true
+        ? {
+            value: true,
+            basis: `reported merged in #${report.pr} for candidate ${(builtResolved ?? "").slice(0, 9)}, recorded on row ${report.row} at ${report.recorded_at}; ${
+              ancestry.value === false ? `candidate is not an ancestor of ${targetRef}` : "ancestry underivable"
+            } (${ancestry.basis})`,
+            merge_report: report,
+          }
+        : { ...ancestry, basis: `${ancestry.basis}; ${reportNote}`, merge_report: report };
     const adopted: Rung = opts?.project
       ? { value: "NOT_APPLICABLE", basis: "selected project has no binding to the OpenRig daemon source; daemon adoption is not project progress" }
       : !candidateSha || !repoCtx
