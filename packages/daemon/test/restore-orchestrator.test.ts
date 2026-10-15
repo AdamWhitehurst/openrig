@@ -2823,10 +2823,7 @@ describe("RestoreOrchestrator", () => {
 
     async function restoreSeat(runtime: string, policy: string) {
       const { snap, node } = seatSnapshot(runtime, policy);
-      const tmux = mockTmux({
-        sendText: vi.fn(async () => ({ ok: true as const })),
-        sendKeys: vi.fn(async () => ({ ok: true as const })),
-      });
+      const tmux = mockTmux();
       const adapter = {
         runtime,
         listInstalled: vi.fn(async () => []),
