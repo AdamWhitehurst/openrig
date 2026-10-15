@@ -982,8 +982,12 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     // A recorded merge fact is a second way to read folded. It never touches
     // built or reviewed: the candidate sha stays their identity. Ancestry that
     // holds keeps its own basis; the fact decides when ancestry does not hold.
+    // A fact recorded before the selected candidate's row belongs to an earlier
+    // build, so it does not merge a newer candidate. With no candidate, any fact counts.
+    const candidateAt = candRows.find((r) => r.qitem_id === candidateRow)?.ts_created;
     let mergeFact: { pr: string; row: string; at: string } | null = null;
     for (const r of candRows) {
+      if (candidateAt && r.ts_created < candidateAt) break; // candRows is newest first
       const pr = parseTags(r.tags).map((t) => t.match(MERGED_TAG)?.[1]).find((n): n is string => !!n);
       if (pr) {
         mergeFact = { pr, row: r.qitem_id, at: r.ts_created };

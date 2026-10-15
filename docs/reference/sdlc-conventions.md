@@ -89,7 +89,8 @@ ancestry alone cannot read it as merged. `rig view show execution` also reads th
 tag on any queue row bound to the slice (the `slice:` tag, like `candidate:`),
 with the row's creation time as the merged-at time. Ancestry that holds keeps its
 own basis; the fact decides when it does not, including for a slice with no
-candidate. The fact never changes which commit counts as built or reviewed: the
+candidate. A fact recorded before the newest candidate's row belongs to an earlier
+build and does not merge the newer candidate. The fact never changes which commit counts as built or reviewed: the
 newest `candidate:<sha>` tag stays their identity.
 
 **The heavier flow — proof contracts, plan-lock, C1 drops, proof-lock — is PART B and is not in

@@ -682,6 +682,25 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
       expect((after.reviewed as Record<string, unknown>).value).toBe(true);
     });
 
+    it("does not let a merge fact recorded before a newer candidate merge that candidate", async () => {
+      squashedCandidate();
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1291"], "2026-08-30T10:00:00.000Z");
+      expect((await ladder31()).folded).toMatchObject({ value: true });
+      // A follow-up build lands after the merge was recorded.
+      git(laneWorktree, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "follow-up build");
+      const next = git(laneWorktree, "rev-parse", "HEAD");
+      db.prepare(
+        `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, body)
+         VALUES ('qitem-followup-31', '2026-08-30T12:00:00.000Z', '2026-08-30T12:00:00.000Z', 'lead@exec-fixture', 'lead@exec-fixture', 'done', 'normal', 'light', ?, 'Follow-up build.')`,
+      ).run(JSON.stringify([`mission:${MISSION}`, "slice:OPR.9.9.31", `candidate:${next}`]));
+      const stale = await ladder31();
+      expect((stale.built as Record<string, unknown>).resolved_commit).toBe(next);
+      expect(stale.folded).toMatchObject({ value: false });
+      // A merge fact recorded after that candidate does merge it.
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1300"], "2026-08-30T13:00:00.000Z");
+      expect((await ladder31()).folded).toMatchObject({ value: true, merge_fact: { pr: "1300" } });
+    });
+
     it("keeps ancestry as the basis when the candidate is an ancestor, even with a merge fact", async () => {
       insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:7"]);
       const folded = (await ladder31()).folded as Record<string, unknown>;
