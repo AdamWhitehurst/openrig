@@ -28,6 +28,10 @@ describe("homeIsolationAdvisory", () => {
     expect(homeIsolationAdvisory({ accountHome: d.real, openrigHome: path.join(d.scratch, ".openrig"), home: d.scratch, codexHome: path.join(d.scratch, ".codex") })).toBeUndefined();
     expect(homeIsolationAdvisory({ accountHome: d.real, openrigHome: path.join(d.scratch, ".openrig"), home: d.scratch })).toBeUndefined();
     expect(homeIsolationAdvisory({ accountHome: d.real, openrigHome: path.join(d.scratch, "custom"), home: d.scratch })).toBeUndefined();
+    // HOME nested inside OPENRIG_HOME is consistent too.
+    const nested = path.join(d.scratch, "home");
+    expect(homeIsolationAdvisory({ accountHome: d.real, openrigHome: d.scratch, home: nested, codexHome: path.join(nested, ".codex") })).toBeUndefined();
+    expect(homeIsolationAdvisory({ accountHome: d.real, openrigHome: d.scratch, home: nested })).toBeUndefined();
   });
 
   it("warns when the isolated OPENRIG_HOME still has the real HOME", () => {
@@ -52,6 +56,13 @@ describe("homeIsolationAdvisory", () => {
     const msg = homeIsolationAdvisory({ accountHome: d.real, openrigHome: path.join(d.scratch, ".openrig"), home: d.real })!;
     expect(msg).toContain(`HOME=${d.real}`);
     expect(msg).toContain(`CODEX_HOME=${path.join(d.real, ".codex")} (derived from HOME)`);
+  });
+
+  it("warns when HOME is nested in OPENRIG_HOME but CODEX_HOME is outside both", () => {
+    const d = dirs(); const nested = path.join(d.scratch, "home"); const real = path.join(d.real, ".codex");
+    const msg = homeIsolationAdvisory({ accountHome: d.real, openrigHome: d.scratch, home: nested, codexHome: real })!;
+    expect(msg).toContain(`CODEX_HOME=${real}`);
+    expect(msg).not.toMatch(/(?<![A-Z_])HOME=/);
   });
 
   it("warns for a scratch CODEX_HOME that sits outside the isolation root", () => {
