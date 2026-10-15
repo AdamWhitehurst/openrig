@@ -189,7 +189,11 @@ ambiguity.
 ## Queue Mapping
 
 A `slice:<id>` tag is the authoritative way to attach a queue item to a slice;
-with a project selected, typed rows also need the `project:<id>` tag. As a
+with a project selected, typed rows also need the `project:<id>` tag. The tag
+value is either the slice's frontmatter `id` (a dot-ID such as `CUS.9775.1.1`)
+or its directory name (`01-custody-funds`); both resolve to the same slice on
+the Queue tab, the ownership lanes and the agents band. A row that carries both
+forms counts once. As a
 fallback, for slices with no typed rows, items attach when their body or tags
 mention one of:
 
