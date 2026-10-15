@@ -140,6 +140,11 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
         envOverride[assignment.slice(0, eq)] = assignment.slice(eq + 1);
       }
       const envOverrideBody = Object.keys(envOverride).length > 0 ? envOverride : undefined;
+      if (envOverrideBody && sourceLooksLikeTopology(source)) {
+        console.error("--env applies to a new launch from one rig spec or bundle. A topology launches several rigs from their own specs; put env: in each rig's spec instead.");
+        process.exitCode = 1;
+        return;
+      }
 
       // Link preparation verifies the effective endpoint before fetch or local auto-start.
       // Existing path/name dispatch below is unchanged.

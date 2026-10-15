@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import nodePath from "node:path";
 import { EventEmitter } from "node:events";
 import { Command } from "commander";
 import { formatRemoteUpFailure, upCommand } from "../src/commands/up.js";
@@ -640,6 +643,24 @@ describe("Up CLI", () => {
       expect(exitCode).toBe(1);
       expect(logs.join("\n")).toContain("A restore keeps the rig's own env: block");
     });
+  });
+
+  it("up --env with a topology source says a topology takes no --env and does not call /api/up", async () => {
+    const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), "up-topology-env-"));
+    try {
+      const manifest = nodePath.join(dir, "factory.rigtopology");
+      fs.writeFileSync(manifest, "rigs:\n  - source: ./a.yaml\n");
+      await withListener(() => ({ status: 200, body: {} }), async (upCalls) => {
+        const { logs, exitCode } = await captureLogs(async () => {
+          await makeCmd().parseAsync(["node", "rig", "up", manifest, "--env", "DEBUG=1"]);
+        });
+        expect(upCalls()).toBe(0);
+        expect(exitCode).toBe(1);
+        expect(logs.join("\n")).toContain("A topology launches several rigs");
+      });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // OPR.0.3.2.22 Bug 3 — path-form `rig up <spec-inside-install>` without
