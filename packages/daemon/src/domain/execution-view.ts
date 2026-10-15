@@ -133,6 +133,11 @@ function parseArrayField(v: unknown): string[] | Indeterminate {
 
 const SLICE_TAG = /^slice:(.+)$/;
 const CANDIDATE_TAG = /^candidate:(.+)$/;
+/** A recorded merge report: `merged:<pr-number>` on a row bound to the slice. */
+const MERGED_TAG = /^merged:(\d+)$/;
+/** `recorded_at` is when the row recorded the merge, not when it happened. `linked`
+ *  is true when the same row's `candidate:<sha>` resolves to the slice's built commit. */
+interface MergeReport { pr: string; row: string; recorded_at: string; linked: boolean }
 
 /** Candidate identity is a COMMIT, not a string. Production carries mixed forms —
  *  abbreviated tags (`dced9edb0`), full 40-hex artifact fields, and annotated
@@ -935,6 +940,8 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     let candidateSha: string | null = null;
     let candidateRow: string | null = null;
     for (const r of candRows) {
+      // A row carrying a merged: tag reports a merge; it is not a build, so it never picks the built candidate.
+      if (parseTags(r.tags).some((t) => MERGED_TAG.test(t))) continue;
       for (const t of parseTags(r.tags)) {
         const m = t.match(CANDIDATE_TAG);
         if (m?.[1]) {
@@ -1004,17 +1011,47 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     // The selected project has no binding to the OpenRig daemon's source.
     // Missing Git objects cannot establish applicability. Keep daemon ancestry
     // only on the legacy unscoped view, with its existing unknown/false rules.
-    const folded: Rung = isUnusableDeclaration
+    const ancestry: Rung = isUnusableDeclaration
       ? { value: INDETERMINATE, basis: `declared integration_ref unusable (${declaredRef})` }
       : !candidateSha
         ? { value: INDETERMINATE, basis: "no candidate sha to test" }
         : !repoCtx
           ? { value: INDETERMINATE, basis: "no reachable repo context (no EC-3 worktree on the board)" }
           : await gitAncestor(exec, repoCtx, builtResolved ?? candidateSha, targetRef, declaredRef);
+    // A merge report (`merged:<pr-number>` on a row bound to the slice) is recorded,
+    // not verified: it carries no repository, commit or landed commit. So it is
+    // always shown as its own signal and never turns the answer ancestry gave. It
+    // changes the answer only when the SAME row also carries a `candidate:<sha>`
+    // that resolves, through the repo context and a usable integration ref, to the
+    // slice's built commit. Squash and rebase merges leave the candidate off the
+    // integration ref, so only that link reads such a merge as merged, and only
+    // from ancestry's false: an answer ancestry could not give is never turned true.
+    const reports: MergeReport[] = [];
+    for (const r of candRows) { // newest first
+      const tags = parseTags(r.tags);
+      const pr = tags.map((t) => t.match(MERGED_TAG)?.[1]).find((n): n is string => !!n);
+      if (!pr) continue;
+      const token = extractShaToken(tags.map((t) => t.match(CANDIDATE_TAG)?.[1]).find((n): n is string => !!n) ?? null);
+      const resolved = token && repoCtx ? await resolveCommit(exec, repoCtx, token, commitCache) : null;
+      reports.push({ pr, row: r.qitem_id, recorded_at: r.ts_created, linked: !!builtResolved && resolved === builtResolved });
+    }
+    const report = reports.find((r) => r.linked) ?? reports[0] ?? null;
+    const reportNote = report
+      ? `merged:${report.pr} recorded on row ${report.row} at ${report.recorded_at}${report.linked ? "; that row is linked to the built candidate, but only a false from ancestry is turned true, so the answer stays as ancestry gives it" : "; that row is not linked to the built candidate, so it does not change this answer"}`
+      : null;
+    const folded: Rung & { merge_report?: MergeReport } = !report
+      ? ancestry
+      : report.linked && ancestry.value === false
+        ? {
+            value: true,
+            basis: `reported merged in #${report.pr} for candidate ${(builtResolved ?? "").slice(0, 9)}, recorded on row ${report.row} at ${report.recorded_at}; candidate is not an ancestor of ${targetRef} (${ancestry.basis})`,
+            merge_report: report,
+          }
+        : { ...ancestry, basis: `${ancestry.basis}; ${reportNote}`, merge_report: report };
     const adopted: Rung = opts?.project
       ? { value: "NOT_APPLICABLE", basis: "selected project has no binding to the OpenRig daemon source; daemon adoption is not project progress" }
       : !candidateSha || !repoCtx
-        ? { value: INDETERMINATE, basis: folded.basis }
+        ? { value: INDETERMINATE, basis: ancestry.basis }
         : buildInfo.commit
           ? await gitAncestor(exec, repoCtx, builtResolved ?? candidateSha, buildInfo.commit)
           : { value: INDETERMINATE, basis: "daemon build stamp absent (dev run) — adopted rung underivable" };

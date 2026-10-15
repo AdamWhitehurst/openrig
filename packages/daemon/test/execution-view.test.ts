@@ -791,6 +791,171 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
     });
   });
 
+  describe("reported merge (squash merges leave the candidate off the integration ref)", () => {
+    const sliceOf = (list: unknown, id: string) => (list as Record<string, unknown>[]).find(s => s.slice_id === id)!;
+    const ladder31 = async () => sliceOf((await show()).q4_ladder, "OPR.9.9.31");
+    // 31 is next-up when unmerged; 32 depends on 31, so it is ready only once 31 reads merged.
+    const nextUp = async (id: string) => sliceOf((await show()).q2_sequencing, id).next_up;
+    let mergeRows = 0;
+    const insertMergeRow = (tags: string[], ts = "2026-08-30T10:00:00.000Z") =>
+      db.prepare(
+        `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, body)
+         VALUES (?, ?, ?, 'lead@exec-fixture', 'lead@exec-fixture', 'done', 'normal', 'light', ?, 'Merged upstream.')`,
+      ).run(mergeRows++ === 0 ? "qitem-merged-31" : `qitem-merged-31-${mergeRows}`, ts, ts, JSON.stringify(tags));
+    const commitOnLane = (message: string) => {
+      git(laneWorktree, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", message);
+      return git(laneWorktree, "rev-parse", "HEAD");
+    };
+
+    // The candidate is a commit main does not contain, as after a squash merge.
+    // The build rows are finished, so next-up reads the merged answer, not a claim.
+    const squashedCandidate = () => {
+      const sha = commitOnLane("squashed away");
+      db.prepare("UPDATE queue_items SET tags = ?, state = 'done' WHERE qitem_id = 'qitem-lane-31'")
+        .run(JSON.stringify([`mission:${MISSION}`, "slice:OPR.9.9.31", `candidate:${sha}`]));
+      // Slice 32 depends on 31 and has its own unmerged build, so its next-up follows 31's merged answer.
+      db.prepare("UPDATE queue_items SET tags = ?, state = 'done' WHERE qitem_id = 'qitem-lane-32'")
+        .run(JSON.stringify([`mission:${MISSION}`, "slice:OPR.9.9.32", `candidate:${commitOnLane("slice 32 build")}`]));
+      const reviewDir = path.join(rigsRoot, "exec-fixture", "state", "review-fixture");
+      fs.writeFileSync(path.join(reviewDir, "S31-squashed.md"), `---\nslice: 31-alpha\nartifact_type: rev1-r2\nverdict: CLEAR\ncandidate_sha: ${sha}\n---\nCLEAR.\n`);
+      return sha;
+    };
+    const expectAncestryAnswer = async () => {
+      expect(await ladder31()).toMatchObject({ folded: { value: false } });
+      expect(await nextUp("OPR.9.9.31")).toBe(true);
+      expect(await nextUp("OPR.9.9.32")).toBe(false);
+    };
+
+    it("with no merged: tag the merged rung is exactly what ancestry gives, with no report", async () => {
+      squashedCandidate();
+      await expectAncestryAnswer();
+      expect((await ladder31()).folded).not.toHaveProperty("merge_report");
+    });
+
+    it("reads a squash merge as merged when the same row carries merged:<pr> and the built candidate", async () => {
+      const sha = squashedCandidate();
+      const before = await ladder31();
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1291", `candidate:${sha.slice(0, 9)}`]);
+      const after = await ladder31();
+      expect(after.folded).toMatchObject({
+        value: true,
+        basis: expect.stringContaining(`reported merged in #1291 for candidate ${sha.slice(0, 9)}`),
+        merge_report: { pr: "1291", row: "qitem-merged-31", recorded_at: "2026-08-30T10:00:00.000Z", linked: true },
+      });
+      expect(String((after.folded as Record<string, unknown>).basis)).toContain("recorded");
+      expect(String((after.folded as Record<string, unknown>).basis)).toContain("not an ancestor");
+      expect(after.reviewed).toEqual(before.reviewed);
+      expect((after.built as Record<string, unknown>).resolved_commit).toBe(sha);
+      expect(await nextUp("OPR.9.9.31")).toBe(false);
+      expect(await nextUp("OPR.9.9.32")).toBe(true);
+    });
+
+    it("does not let a late tag for an earlier PR merge a newer candidate", async () => {
+      const first = squashedCandidate();
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1291", `candidate:${first}`], "2026-08-29T22:00:00.000Z");
+      expect((await ladder31()).folded).toMatchObject({ value: true });
+      // A follow-up build, then a late record of the earlier PR with no candidate.
+      const next = commitOnLane("follow-up build");
+      db.prepare(
+        `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, body)
+         VALUES ('qitem-followup-31', '2026-08-30T12:00:00.000Z', '2026-08-30T12:00:00.000Z', 'lead@exec-fixture', 'lead@exec-fixture', 'done', 'normal', 'light', ?, 'Follow-up build.')`,
+      ).run(JSON.stringify([`mission:${MISSION}`, "slice:OPR.9.9.31", `candidate:${next}`]));
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1291"], "2026-08-30T13:00:00.000Z");
+      const ladder = await ladder31();
+      expect((ladder.built as Record<string, unknown>).resolved_commit).toBe(next);
+      expect(ladder.folded).toMatchObject({
+        value: false,
+        basis: expect.stringContaining("merged:1291 recorded on row"),
+        // The earlier PR's linked row is for the older commit, so the report is the newest row, unlinked.
+        merge_report: { pr: "1291", recorded_at: "2026-08-30T13:00:00.000Z", linked: false },
+      });
+      expect(String((ladder.folded as Record<string, unknown>).basis)).toContain("does not change this answer");
+      await expectAncestryAnswer();
+    });
+
+    it("never lets a late merge report that names an older candidate re-point built", async () => {
+      const first = squashedCandidate();
+      const next = commitOnLane("candidate B");
+      db.prepare(
+        `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, body)
+         VALUES ('qitem-build-b-31', '2026-08-30T12:00:00.000Z', '2026-08-30T12:00:00.000Z', 'lead@exec-fixture', 'lead@exec-fixture', 'done', 'normal', 'light', ?, 'Build B.')`,
+      ).run(JSON.stringify([`mission:${MISSION}`, "slice:OPR.9.9.31", `candidate:${next}`]));
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1291", `candidate:${first}`], "2026-08-30T13:00:00.000Z");
+      const ladder = await ladder31();
+      expect((ladder.built as Record<string, unknown>).resolved_commit).toBe(next);
+      expect(String((ladder.built as Record<string, unknown>).basis)).toContain("qitem-build-b-31");
+      expect(ladder.folded).toMatchObject({ value: false, merge_report: { pr: "1291", linked: false } });
+      await expectAncestryAnswer();
+    });
+
+    it("turns only a false from ancestry into merged, never an answer ancestry could not give", async () => {
+      const sha = squashedCandidate();
+      const missionYamlPath = path.join(missionsRoot, MISSION, "mission.yaml");
+      // A valid-shaped ref that does not exist: ancestry cannot answer.
+      fs.writeFileSync(missionYamlPath, fs.readFileSync(missionYamlPath, "utf8") + "\n  source:\n    integration_ref: no-such-branch\n");
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1291", `candidate:${sha}`]);
+      const folded = (await ladder31()).folded as Record<string, unknown>;
+      expect(folded).toMatchObject({ value: "INDETERMINATE", merge_report: { pr: "1291", linked: true } });
+      expect(String(folded.basis)).toContain("only a false from ancestry is turned true");
+      expect(await nextUp("OPR.9.9.31")).toBe("INDETERMINATE");
+      expect(await nextUp("OPR.9.9.32")).toBe("INDETERMINATE");
+    });
+
+    it("keeps a row linked to a different commit as a report only", async () => {
+      squashedCandidate();
+      const other = commitOnLane("other work");
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1100", `candidate:${other}`], "2026-08-29T20:00:00.000Z");
+      expect((await ladder31()).folded).toMatchObject({ value: false, merge_report: { pr: "1100", linked: false } });
+      await expectAncestryAnswer();
+    });
+
+    it("keeps ancestry as the basis when the candidate is an ancestor, and still shows the report", async () => {
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:7"]);
+      const folded = (await ladder31()).folded as Record<string, unknown>;
+      expect(folded).toMatchObject({ value: true, merge_report: { pr: "7", linked: false } });
+      expect(String(folded.basis)).toMatch(/^.*merge-base --is-ancestor/);
+    });
+
+    it("leaves a slice with no candidate as ancestry gives it and shows the report", async () => {
+      const q4 = async () => sliceOf((await show()).q4_ladder, "OPR.9.9.33");
+      const before = await q4();
+      const nextBefore = await nextUp("OPR.9.9.33");
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.33", "merged:55"]);
+      const after = await q4();
+      expect(after.folded).toMatchObject({
+        value: "INDETERMINATE",
+        basis: expect.stringContaining("no candidate sha to test"),
+        merge_report: { pr: "55", linked: false },
+      });
+      expect(String((after.folded as Record<string, unknown>).basis)).toContain("merged:55 recorded on row");
+      expect(after.built).toEqual(before.built);
+      expect(after.reviewed).toEqual(before.reviewed);
+      expect(await nextUp("OPR.9.9.33")).toBe(nextBefore);
+    });
+
+    it("leaves a malformed declared integration ref indeterminate, and still reports a row linked by commit", async () => {
+      const sha = squashedCandidate();
+      const missionYamlPath = path.join(missionsRoot, MISSION, "mission.yaml");
+      fs.writeFileSync(missionYamlPath, fs.readFileSync(missionYamlPath, "utf8") + '\n  source:\n    integration_ref: "-invalid-branch"\n');
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1291"]);
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1292", `candidate:${sha}`], "2026-08-30T11:00:00.000Z");
+      const folded = (await ladder31()).folded as Record<string, unknown>;
+      expect(folded).toMatchObject({ value: "INDETERMINATE", merge_report: { pr: "1292", linked: true } });
+      expect(String(folded.basis)).toContain("-invalid-branch");
+      expect(String(folded.basis)).toContain("merged:1292 recorded on row");
+      expect(await nextUp("OPR.9.9.31")).toBe("INDETERMINATE");
+      expect(await nextUp("OPR.9.9.32")).toBe("INDETERMINATE");
+    });
+
+    it("ignores a merge report on another slice and a merged: tag with no PR number", async () => {
+      squashedCandidate();
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.32", "merged:9"]);
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:", "merged:soon"], "2026-08-30T11:00:00.000Z");
+      expect((await ladder31()).folded).not.toHaveProperty("merge_report");
+      await expectAncestryAnswer();
+    });
+  });
+
   it.each([
     [{ code: 1 }, false],
     [{ status: 1 }, false],
