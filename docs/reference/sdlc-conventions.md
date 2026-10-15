@@ -83,6 +83,15 @@ truth is reconciled to main. Continuous integration to main and a
 release-line fold followed by one explicit merge are both valid; leaving the
 choice implicit is not.
 
+A candidate that merges by squash or rebase is never an ancestor of that ref, so
+ancestry alone cannot read it as merged. `rig view show execution` also reads the
+"merged" rung (`folded`) true from a recorded merge fact: a `merged:<pr-number>`
+tag on any queue row bound to the slice (the `slice:` tag, like `candidate:`),
+with the row's creation time as the merged-at time. Ancestry that holds keeps its
+own basis; the fact decides when it does not, including for a slice with no
+candidate. The fact never changes which commit counts as built or reviewed: the
+newest `candidate:<sha>` tag stays their identity.
+
 **The heavier flow — proof contracts, plan-lock, C1 drops, proof-lock — is PART B and is not in
 force unless assigned.**
 

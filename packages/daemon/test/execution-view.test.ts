@@ -644,6 +644,68 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
     expect(after).toMatchObject({ folded: { value: true }, adopted: { value: false } });
   });
 
+  describe("recorded merge fact (squash merges leave the candidate off the integration ref)", () => {
+    const ladder31 = async () => ((await show()).q4_ladder as Record<string, unknown>[]).find(s => s.slice_id === "OPR.9.9.31")!;
+    let mergeRows = 0;
+    const insertMergeRow = (tags: string[], ts = "2026-08-30T10:00:00.000Z") =>
+      db.prepare(
+        `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, body)
+         VALUES (?, ?, ?, 'lead@exec-fixture', 'lead@exec-fixture', 'done', 'normal', 'light', ?, 'Merged upstream.')`,
+      ).run(mergeRows++ === 0 ? "qitem-merged-31" : `qitem-merged-31-${mergeRows}`, ts, ts, JSON.stringify(tags));
+
+    // The candidate is a commit main does not contain, as after a squash merge.
+    const squashedCandidate = () => {
+      git(laneWorktree, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-qm", "squashed away");
+      const sha = git(laneWorktree, "rev-parse", "HEAD");
+      db.prepare("UPDATE queue_items SET tags = ? WHERE qitem_id = 'qitem-lane-31'")
+        .run(JSON.stringify([`mission:${MISSION}`, "slice:OPR.9.9.31", `candidate:${sha}`]));
+      const reviewDir = path.join(rigsRoot, "exec-fixture", "state", "review-fixture");
+      fs.writeFileSync(path.join(reviewDir, "S31-squashed.md"), `---\nslice: 31-alpha\nartifact_type: rev1-r2\nverdict: CLEAR\ncandidate_sha: ${sha}\n---\nCLEAR.\n`);
+      return sha;
+    };
+
+    it("reads merged from a merged:<pr> row when the candidate is not an ancestor, leaving built and reviewed alone", async () => {
+      const sha = squashedCandidate();
+      const before = await ladder31();
+      expect(before.folded).toMatchObject({ value: false });
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:1291"]);
+      const after = await ladder31();
+      expect(after.folded).toMatchObject({
+        value: true,
+        basis: expect.stringContaining("merged:1291"),
+        merge_fact: { pr: "1291", row: "qitem-merged-31", at: "2026-08-30T10:00:00.000Z" },
+      });
+      expect(String((after.folded as Record<string, unknown>).basis)).toContain("not an ancestor");
+      expect(after.built).toEqual(before.built);
+      expect(after.reviewed).toEqual(before.reviewed);
+      expect((after.built as Record<string, unknown>).resolved_commit).toBe(sha);
+      expect((after.reviewed as Record<string, unknown>).value).toBe(true);
+    });
+
+    it("keeps ancestry as the basis when the candidate is an ancestor, even with a merge fact", async () => {
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:7"]);
+      const folded = (await ladder31()).folded as Record<string, unknown>;
+      expect(folded.value).toBe(true);
+      expect(String(folded.basis)).toContain("merge-base --is-ancestor");
+    });
+
+    it("ignores a merge fact on another slice and a merged: tag with no PR number", async () => {
+      squashedCandidate();
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.32", "merged:9"]);
+      expect((await ladder31()).folded).toMatchObject({ value: false });
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.31", "merged:", "merged:soon"], "2026-08-30T11:00:00.000Z");
+      expect((await ladder31()).folded).toMatchObject({ value: false });
+    });
+
+    it("reads merged for a slice with no candidate, and says no candidate was recorded", async () => {
+      insertMergeRow([`mission:${MISSION}`, "slice:OPR.9.9.33", "merged:55"]);
+      const s33 = ((await show()).q4_ladder as Record<string, unknown>[]).find(s => s.slice_id === "OPR.9.9.33")!;
+      expect(s33.folded).toMatchObject({ value: true, basis: expect.stringContaining("no candidate") });
+      expect((s33.built as Record<string, unknown>).candidate_sha).toBe("INDETERMINATE");
+      expect((s33.reviewed as Record<string, unknown>).value).toBe("INDETERMINATE");
+    });
+  });
+
   it.each([
     [{ code: 1 }, false],
     [{ status: 1 }, false],
