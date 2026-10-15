@@ -111,6 +111,7 @@ import { usageSamplesClientCostSchema } from "./migrations/105_usage_samples_cli
 import { piUsageEntriesSchema } from "./migrations/107_pi_usage_entries.js";
 import { piUsageChargesSchema } from "./migrations/108_pi_usage_charges.js";
 import { modePostureCoexistSchema } from "./migrations/109_mode_posture_coexist.js";
+import { queueTransitionsTsQitemSchema } from "./migrations/112_queue_transitions_ts_qitem.js";
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
 
@@ -221,4 +222,5 @@ export const ALL_MIGRATIONS: Migration[] = [
   piUsageChargesSchema,
   modePostureCoexistSchema,
   seatEnvSchema,
+  queueTransitionsTsQitemSchema,
 ];
