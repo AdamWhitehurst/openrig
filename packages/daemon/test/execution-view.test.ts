@@ -344,6 +344,28 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
     expect((doc.q1_lanes as Record<string, unknown>[]).map((lane) => lane.qitem_id)).toContain("qitem-lane-31");
   });
 
+  describe("a slice: tag names the slice by its frontmatter id or its directory name", () => {
+    const working = { activity: "working" as const, needsInput: { count: 0, reason: null }, decidedBy: "window-sampling", changedAt: "2026-08-29T21:59:30.000Z" };
+    const retag = (qitemId: string, tags: string[]) =>
+      db.prepare(`UPDATE queue_items SET tags = ? WHERE qitem_id = ?`).run(JSON.stringify(tags), qitemId);
+    const lane32 = async () => ((await show()).q1_lanes as Record<string, unknown>[]).find((l) => l.qitem_id === "qitem-lane-32")!;
+    const seq32 = async () => ((await show()).q2_sequencing as Record<string, unknown>[]).find((s) => s.slice_id === "OPR.9.9.32")!;
+
+    for (const [form, tag] of [["frontmatter id", "OPR.9.9.32"], ["directory name", "32-beta"], ["both forms", "OPR.9.9.32"]] as const) {
+      it(`gives a row tagged by ${form} an owner lane with working activity and a claimed slice`, async () => {
+        retag("qitem-lane-32", form === "both forms" ? [`mission:${MISSION}`, `slice:${tag}`, "slice:32-beta"] : [`mission:${MISSION}`, `slice:${tag}`]);
+        arbitratedBySession.set(SEAT_B, working);
+        const lane = await lane32();
+        expect(lane.seat).toBe(SEAT_B);
+        expect((lane.activity as Record<string, unknown>).activity).toBe("working");
+        const seq = await seq32();
+        expect((seq.work_rows as Record<string, unknown>[]).map((w) => w.qitem_id)).toEqual(["qitem-lane-32"]);
+        expect(seq.next_up).toBe(false);
+        expect(seq.next_up_basis).toBe("already claimed in-progress");
+      });
+    }
+  });
+
   describe("a row binds to a mission by its mission: tag first and by a body mention only when it has none", () => {
     const later = "2026-08-29T21:30:00.000Z";
     const addRow = (id: string, tags: string[], body: string, state = "in-progress", seat = SEAT_B) =>

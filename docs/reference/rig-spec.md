@@ -480,6 +480,8 @@ profile: none
 
 All three must be present together. Any partial combination is a validation error.
 
+A terminal seat no longer waits for a `--fresh` decision just because it has no resume token: on restore it relaunches fresh and re-runs its startup actions. The runtime, identity and replay prerequisites still apply. A runtime mismatch still waits for a decision, an ambiguous occupant still fails, and a missing required replay file still blocks.
+
 ### agent_ref Rules
 
 - Must start with `local:` or `path:`

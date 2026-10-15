@@ -1421,6 +1421,27 @@ export class TmuxAdapter {
    *   - `null` when the target is missing OR the value is unparseable
    *     (consumers treat null as "no signal", distinct from "idle").
    */
+  /** readAllSessionWindowActivity with a key of each current window's active pane from the same call. tmux changes
+   *  what a capture returns without counting activity on a resize, a reset, a respawn, a pane switch or a
+   *  clear-history; each moves the pane's id, pid, size, history size or bytes, or its cursor. The session name stays last. */
+  async readAllSessionWindows(): Promise<Map<string, { activity: number; size: string }> | null> {
+    try {
+      const format = ["#{window_active}", "#{window_activity}", "#{window_width}x#{window_height}:#{pane_id}:#{pane_pid}:#{pane_width}x#{pane_height}:#{history_size}:#{history_bytes}:#{cursor_x},#{cursor_y}", "#{session_name}"].join(TMUX_FIELD_SEPARATOR);
+      const output = await this.run(["tmux", "list-windows", "-a", "-F", format], `tmux list-windows -a -F '${format}'`);
+      const out = new Map<string, { activity: number; size: string }>();
+      for (const line of output.split("\n")) {
+        const f1 = line.indexOf(TMUX_FIELD_SEPARATOR), f2 = line.indexOf(TMUX_FIELD_SEPARATOR, f1 + 1), f3 = line.indexOf(TMUX_FIELD_SEPARATOR, f2 + 1);
+        if (f1 < 0 || f2 < 0 || f3 < 0) continue;
+        const activity = line.slice(f1 + 1, f2).trim(), session = line.slice(f3 + 1);
+        if (!session || line.slice(0, f1) !== "1" || !/^\d+$/.test(activity) || Number(activity) <= 0) continue;
+        out.set(session, { activity: Number(activity), size: line.slice(f2 + 1, f3) });
+      }
+      return out;
+    } catch {
+      return null;
+    }
+  }
+
   /** Every session's current-window `#{window_activity}` in ONE tmux call, keyed by session name: the same value
    *  `readPaneLastActivity(<session name>)` reads (display-message -t <session> resolves to the session's current
    *  window). Only well-formed timestamps are included, so a missing key means "read it the per-target way". Null when

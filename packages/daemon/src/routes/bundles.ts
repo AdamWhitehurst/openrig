@@ -26,6 +26,7 @@ import { detectBundleConflicts, type BundleConflict } from "../domain/bundle-con
 import { bundleInstallContext, bundleInstallContextLines } from "../domain/bundle-install-context.js";
 import type { RigRepository } from "../domain/rig-repository.js";
 import { BundleAuditReader, BundleAuditWriter, type BundleAuditFsOps, type BundleAuditRecord } from "../domain/bundle-audit.js";
+import { timeBoundAdvisory } from "../domain/time-bound-advisory.js";
 import { getDefaultOpenRigPath } from "../openrig-compat.js";
 import { routingFailureWarnings, type BundleContentRouting } from "../domain/bundle-content-routing.js";
 import { configurationId, packageDigest } from "../domain/bundle-identity.js";
@@ -1109,7 +1110,9 @@ bundleRoutes.get("/history", async (c) => {
     rig: typeof rig === "string" && rig.length > 0 ? rig : undefined,
     since: typeof since === "string" && since.length > 0 ? since : undefined,
   });
-  return c.json({ records, total: records.length }, 200);
+  // since is compared as text against installedAt; say so when it doesn't read as a date or time.
+  const advisory = timeBoundAdvisory("since", since, "installedAt");
+  return c.json({ records, total: records.length, ...(advisory ? { advisories: [advisory] } : {}) }, 200);
 });
 
 // POST /api/bundles/install — reuses full bootstrap lifecycle
