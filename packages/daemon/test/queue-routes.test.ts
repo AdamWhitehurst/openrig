@@ -334,6 +334,7 @@ describe("queue routes", () => {
       return withField;
     }
 
+    // Every row here is a request main answers 200, writing one transition and one event.
     it.each([
       ["in-progress", { state: "pending" }],
       ["in-progress", { state: "in-progress", transitionNote: "still going" }],
@@ -343,14 +344,28 @@ describe("queue routes", () => {
       ["handed-off", { state: "in-progress", reopen: true, transitionNote: "more to do" }],
       ["in-progress", { transitionNote: "just a note" }],
       ["done", { transitionNote: "just a note" }],
-      ["done", { state: "done", closureReason: "no-follow-on", transitionNote: "again" }],
+      ["canceled", { transitionNote: "just a note" }],
+      ["handed-off", { transitionNote: "just a note" }],
+      ["done", { state: "done", transitionNote: "again" }],
       ["canceled", { state: "canceled", transitionNote: "again" }],
-      ["handed-off", { state: "handed-off", closureReason: "handed_off_to", closureTarget: "next@r", transitionNote: "again" }],
+      ["handed-off", { state: "handed-off", transitionNote: "again" }],
       ["failed", { state: "failed" }],
       ["denied", { state: "denied" }],
       ["failed", { state: "done", closureReason: "no-follow-on" }],
     ] as Array<[Start, Record<string, unknown>]>)("%s row, %j: text in resolution changes nothing about the answer or the writes", async (start, body) => {
       const result = await expectSameAsWithoutResolution(start, body, "an outcome");
+      expect(result).toMatchObject({ status: 200, error: null, transitionsWritten: 1, eventsWritten: 1 });
+      expect(result.resolution).toBeNull();
+    });
+
+    // Main refuses these too (a repeat close that carries closure fields is not a note append), so the
+    // field makes no difference to the refusal; they are not part of the 200 table above.
+    it.each([
+      ["done", { state: "done", closureReason: "no-follow-on", transitionNote: "again" }],
+      ["handed-off", { state: "handed-off", closureReason: "handed_off_to", closureTarget: "next@r", transitionNote: "again" }],
+    ] as Array<[Start, Record<string, unknown>]>)("%s row repeat close with closure fields is refused as on main, with or without resolution", async (start, body) => {
+      const result = await expectSameAsWithoutResolution(start, body, "an outcome");
+      expect(result).toMatchObject({ status: 400, error: "note_append_fields_not_admitted", transitionsWritten: 0, eventsWritten: 0 });
       expect(result.resolution).toBeNull();
     });
 
