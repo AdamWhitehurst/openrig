@@ -932,11 +932,19 @@ describe("Claude footers in a narrow or vim-mode pane", () => {
     "⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
     "-- INSERT -- ⏵⏵ accept edits on (shift+tab to cycle)",
     "⏵⏵ accept edits on (shift+t",
-    "⏵⏵ accept edi",
-    "-- INSERT -- ⏵⏵ accept",
     "-- NORMAL -- ⏵⏵ accept edits on (shift+tab to cycle)",
   ])("an accept-edits footer reads as a running TUI: %s", footer => {
     expect(probe(footer)).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  // Known limitation, the same as on upstream main: an accept-edits bar cut before `accept edits on` is not
+  // recognized. Screen text cannot tell a current cut-short accept bar from a stale one, and an accept bar
+  // that read as ready would skip the identity proof an auto-mode bar needs.
+  it.each([
+    "⏵⏵ accept edi",
+    "-- INSERT -- ⏵⏵ accept",
+  ])("an accept-edits bar cut before `accept edits on` is not recognized: %s", footer => {
+    expect(probe(footer)).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
   });
 
   it.each([
@@ -974,34 +982,32 @@ describe("Claude footers in a narrow or vim-mode pane", () => {
     expect(probeFrame(paneContent, true)).toMatchObject({ status: "resumed", code: "active_runtime" });
   });
 
-  it.each([
-    ["claude-2.1.296-30col-accept-edits.txt", "  ⏵⏵ accept edits on   · ← …"],
-    ["claude-2.1.296-30col-vim-accept-edits.txt", "  -- INSERT -- ⏵⏵ accept"],
-  ])("reads the footer of a real accept-edits seat in a narrow pane: %s", (name, footer) => {
-    const paneContent = realFrame(name);
-    expect(footerOf(paneContent)).toBe(footer);
+  it("reads the footer of a real accept-edits seat in a 30-column pane, as before", () => {
+    const paneContent = realFrame("claude-2.1.296-30col-accept-edits.txt");
+    expect(footerOf(paneContent)).toBe("  ⏵⏵ accept edits on   · ← …");
     expect(probeFrame(paneContent, false)).toMatchObject({ status: "resumed", code: "active_runtime" });
   });
 
-  // Only the current mode bar (the last one under the composer prompt) decides: a stale or copied line elsewhere
-  // in the pane must neither stand in for the identity proof an auto-mode bar needs nor hide a current accept bar.
+  // Known limitation (as on upstream main): vim mode at 30 columns cuts the accept-edits bar before `accept edits on`.
+  it("does not recognize a real vim-mode accept-edits seat in a 30-column pane", () => {
+    const paneContent = realFrame("claude-2.1.296-30col-vim-accept-edits.txt");
+    expect(footerOf(paneContent)).toBe("  -- INSERT -- ⏵⏵ accept");
+    expect(probeFrame(paneContent, false)).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+  });
+
+  // A truncated auto-mode bar is always identity-gated, wherever it sits, so a stale or copied accept or auto line
+  // in the pane can at worst make an auto-mode seat need its identity proof; no pane here reads resumed without it.
   const withBars = (...bars: string[]) => `Conversation\n❯\n${bars.map((bar) => `  ${bar}`).join("\n")}\n`;
 
-  it("a stale truncated accept line does not skip the identity gate of the current auto-mode bar", () => {
-    const pane = withBars("-- INSERT -- ⏵⏵ accept", "-- INSERT -- ⏵⏵ auto mode");
+  it.each([
+    ["accept line above the current auto bar", ["-- INSERT -- ⏵⏵ accept", "-- INSERT -- ⏵⏵ auto mode"]],
+    ["accept line below the current auto bar", ["-- INSERT -- ⏵⏵ auto mode", "-- INSERT -- ⏵⏵ accept"]],
+    ["auto line above a cut-short accept bar", ["-- INSERT -- ⏵⏵ auto mode", "-- INSERT -- ⏵⏵ accept"]],
+    ["full auto line above a cut-short accept bar", ["⏵⏵ auto mode on (shift+tab to cycle)", "-- INSERT -- ⏵⏵ accept"]],
+  ])("a pane with a stale or ambiguous bar still needs the identity proof: %s", (_name, bars) => {
+    const pane = withBars(...bars);
     expect(probeFrame(pane, false)).toMatchObject({ status: "inconclusive", code: "claude_auto_identity_required" });
     expect(probeFrame(pane, true)).toMatchObject({ status: "resumed", code: "active_runtime" });
-  });
-
-  it("a stale auto-mode line above the current truncated accept bar reads as accept-edits", () => {
-    for (const stale of ["-- INSERT -- ⏵⏵ auto mode", "⏵⏵ auto mode on (shift+tab to cycle)"]) {
-      expect(probeFrame(withBars(stale, "-- INSERT -- ⏵⏵ accept"), false)).toMatchObject({ status: "resumed", code: "active_runtime" });
-    }
-  });
-
-  it("a truncated accept line above the prompt, or alone with no prompt, is not a mode bar", () => {
-    expect(probeFrame("-- INSERT -- ⏵⏵ accept\nConversation\n❯\n", false)).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
-    expect(probeFrame("Conversation\n  -- INSERT -- ⏵⏵ accept\n", false)).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
   });
 
   it.each(["⏵⏵ a", "-- INSERT -- ⏵⏵ a", "⏵⏵", "⏵⏵ ac"])("%s is too short to say which mode it is", (bar) => {

@@ -152,8 +152,7 @@ export function assessNativeResumeProbe(
         detail: "Claude is the active foreground process in the probe pane.",
       };
     }
-    if (/(^|\n)\s*❯/.test(paneContent)
-      && (FULL_AUTO_MODE_FOOTER.test(paneContent) || isClaudeAutoModeFooter(operativeModeBar(paneContent) ?? ""))) {
+    if (/(^|\n)\s*❯/.test(paneContent) && paneContent.split(/\r?\n/).some(isClaudeAutoModeFooter)) {
       return input.claudeAutoIdentityVerified
         ? { status: "resumed", code: "active_runtime", detail: "Claude auto-mode TUI and the exact managed native identity were verified." }
         : { status: "inconclusive", code: "claude_auto_identity_required", detail: "Auto-mode screen text requires proof of the launched Claude identity." };
@@ -279,20 +278,7 @@ function isClaudeAutoModeFooter(line: string): boolean {
     || (tail.startsWith(AUTO_MODE_HINT) && /^(?:\s+·.*)?$/.test(tail.slice(AUTO_MODE_HINT.length)));
 }
 
-// The full auto-mode footer wherever it sits in the pane: what the identity gate has always keyed on.
-const FULL_AUTO_MODE_FOOTER = /^[ \t]*⏵⏵ auto mode on \(shift\+tab to cycle\)(?:[ \t]+·[^\r\n]*)?[ \t]*$/m;
 const VIM_MARKER = /^-- [A-Z]+ --\s+/;
-
-/** The mode bar that is current: the last line under the last composer prompt that starts with a mode glyph
- * (after an optional vim marker). Earlier bar-looking lines are scrollback, copied text or a stale render. */
-function operativeModeBar(paneContent: string): string | null {
-  const lines = paneContent.split(/\r?\n/);
-  let prompt = -1;
-  lines.forEach((line, i) => { if (/^\s*❯/.test(line)) prompt = i; });
-  if (prompt < 0) return null;
-  const bars = lines.slice(prompt + 1).map((line) => line.trim()).filter((line) => /^(?:-- [A-Z]+ -- +)?(?:⏵⏵|⏸)/.test(line));
-  return bars.at(-1) ?? null;
-}
 
 function looksLikeClaudeTui(paneContent: string): boolean {
   const hasPrompt = hasClaudeComposerPrompt(paneContent);
@@ -301,9 +287,6 @@ function looksLikeClaudeTui(paneContent: string): boolean {
   return (
     paneContent.includes("Claude Code v")
     || paneContent.includes("accept edits on")
-    // A narrow pane cuts the accept-edits bar short and vim mode puts a marker ahead of it. Only the current bar
-    // counts: a stale `⏵⏵ accept` line must not stand in for the identity proof a current auto-mode bar needs.
-    || /^⏵⏵ accept\b/.test((operativeModeBar(paneContent) ?? "").replace(VIM_MARKER, ""))
   );
 }
 
