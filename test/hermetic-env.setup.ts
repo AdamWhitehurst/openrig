@@ -61,14 +61,37 @@ for (const key of [
 // fixture home already established in this worker. Named as a realistic `.openrig`-style
 // home (still fixture-scoped via the marker) so path-shape assertions hold against it.
 const existingHome = process.env["OPENRIG_HOME"];
+let createdHome: string | undefined;
 const fixtureHome =
   existingHome && fs.existsSync(path.join(existingHome, ".openrig-fixture"))
     ? existingHome
     : (() => {
         const h = fs.mkdtempSync(path.join(os.tmpdir(), ".openrig-test-fixture-home-"));
         fs.writeFileSync(path.join(h, ".openrig-fixture"), "");
+        createdHome = h;
         return h;
       })();
+// Remove the homes this process created when it ends: nothing else ever does, and a full run leaves two per
+// worker (a run on 2026-10-14 left ~65,000, 6.2 GB, in the RAM-backed /tmp). A hook here, not a globalSetup
+// teardown: the homes are made inside the workers, which a teardown in the runner cannot name. Vitest ends a
+// finished worker with SIGTERM, which skips "exit" hooks, so the signals clean up too and then take their
+// default effect again. Only the creating file registers (later files in the worker reuse the home), and only
+// a home this process made, still carrying the marker: a reused home from the environment, say a parent
+// run's, is never ours to remove.
+if (createdHome) {
+  const home = createdHome;
+  const remove = () => {
+    if (!fs.existsSync(path.join(home, ".openrig-fixture"))) return;
+    // A failed removal (busy, permissions) must not turn a signal or a clean exit into a crash.
+    for (const dir of [home, `${home}-user-home`]) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* leave it: the worker is ending */ }
+    }
+  };
+  process.once("exit", remove);
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+    process.once(signal, () => { remove(); process.kill(process.pid, signal); });
+  }
+}
 process.env["OPENRIG_HOME"] = fixtureHome;
 delete process.env["RIGGED_HOME"];
 // Legacy ~/.rigged discovery and ordinary home-based config must also stay local
