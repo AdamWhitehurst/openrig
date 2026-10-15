@@ -745,6 +745,29 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
       });
     });
 
+    it("picks the default mission from a row parked on an external gate when nothing is in progress", async () => {
+      fs.mkdirSync(path.join(missionsRoot, "release-10.0", "slices"), { recursive: true });
+      db.prepare("UPDATE queue_items SET state = 'done' WHERE state = 'in-progress'").run();
+      // Only a park on a qitem is left: it does not pick the mission, so the newest directory wins as before.
+      expect(((await projector.show("execution")).rows[0] as Record<string, unknown>).mission).toBe("release-10.0");
+      park("qitem-pr-31", "OPR.9.9.31", SEAT_B, "external:pr-1293");
+      const doc = (await projector.show("execution")).rows[0] as Record<string, unknown>;
+      expect(doc.mission).toBe(MISSION);
+      expect((doc.q1_lanes as Record<string, unknown>[]).map((l) => [l.qitem_id, (l.waiting as Record<string, unknown>).on])).toEqual([["qitem-pr-31", "external:pr-1293"]]);
+    });
+
+    it("lets in-progress work in another mission pick the default mission over an external park", async () => {
+      fs.mkdirSync(path.join(missionsRoot, "release-10.0", "slices"), { recursive: true });
+      db.prepare("UPDATE queue_items SET state = 'done' WHERE state = 'in-progress'").run();
+      park("qitem-pr-31", "OPR.9.9.31", SEAT_B, "external:pr-1293");
+      const t = "2026-08-29T22:00:00.000Z";
+      db.prepare(
+        `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, body, claimed_at)
+         VALUES ('qitem-live-10', ?, ?, 'lead@exec-fixture', ?, 'in-progress', 'normal', 'light', ?, 'Building 10.', ?)`,
+      ).run(t, t, SEAT_A, JSON.stringify(["mission:release-10.0", "slice:OPR.10.0.1"]), t);
+      expect(((await projector.show("execution")).rows[0] as Record<string, unknown>).mission).toBe("release-10.0");
+    });
+
     it("leaves active lanes unmarked and shows only the in-progress lane when the slice also has a parked external row", async () => {
       park("qitem-pr-31", "OPR.9.9.31", SEAT_B, "external:pr-7");
       const lanes = await lanesOf("OPR.9.9.31");
