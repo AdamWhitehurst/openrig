@@ -101,7 +101,47 @@ describe("NodeLauncher: a one-off --env stays with the first pane", () => {
     expect(result.message).toContain("SHARED");
     for (const value of ["one-off-secret", "debug-secret", "from-spec"]) expect(result.message).not.toContain(value);
     expect(killSession).toHaveBeenCalledTimes(1);
+    expect(result.message).toContain("was removed");
+    expect(result.message).not.toMatch(/nothing ran|rolled back/i);
     expect(new SessionRegistry(db).getSessionsForRig(rig.id)).toHaveLength(0);
     expect(rigRepo.getRig(rig.id)!.nodes[0]!.binding).toBeNull();
+  });
+
+  const bothFail = async (removal: () => Promise<unknown>) => {
+    const { rig } = seed();
+    failOn = (call) => call.startsWith("set SHARED=");
+    killSession.mockImplementation(removal);
+    const result = await launcher().launchNode(rig.id, "dev1-impl", { env: { SHARED: "one-off-secret", ONLY_THIS_LAUNCH: "debug-secret" } });
+    expect(result).toMatchObject({ ok: false, code: "seat_env_cleanup_failed" });
+    if (result.ok) throw new Error("expected failure");
+    expect(killSession).toHaveBeenCalledTimes(1);
+    expect(killSession).toHaveBeenCalledWith(result.message.match(/"([^"]+)"/)![1]);
+    expect(result.message).toContain("SHARED");
+    expect(result.message).toMatch(/could not be confirmed removed/);
+    expect(result.message).toMatch(/check|remove/i);
+    expect(result.message).not.toMatch(/was removed|run it again|nothing ran|rolled back/i);
+    for (const value of ["one-off-secret", "debug-secret", "from-spec", "tmux said", "kill failed"]) expect(result.message).not.toContain(value);
+    // Nothing was bound to the session either way.
+    expect(new SessionRegistry(db).getSessionsForRig(rig.id)).toHaveLength(0);
+    expect(rigRepo.getRig(rig.id)!.nodes[0]!.binding).toBeNull();
+    return result.message;
+  };
+
+  it("when the cleanup fails and the removal reports failure, the message says the session was not confirmed removed and names it", async () => {
+    const message = await bothFail(async () => ({ ok: false as const, code: "tmux_error", message: "tmux said kill failed with one-off-secret" }));
+    expect(message).toContain("dev1-impl");
+  });
+
+  it("when the cleanup fails and the removal throws, the message says the same", async () => {
+    await bothFail(async () => { throw new Error("kill failed one-off-secret"); });
+  });
+
+  it("a launch whose session could not be created removes nothing", async () => {
+    const { rig } = seed();
+    const tmux = { createSession: async () => ({ ok: false as const, code: "duplicate_session", message: "exists" }), killSession } as unknown as TmuxAdapter;
+    const result = await new NodeLauncher({ db, rigRepo, sessionRegistry: new SessionRegistry(db), eventBus: new EventBus(db), tmuxAdapter: tmux, sessionEnv: { OPENRIG_HOME: "/home" } })
+      .launchNode(rig.id, "dev1-impl", { env: { ONLY_THIS_LAUNCH: "x" } });
+    expect(result).toMatchObject({ ok: false, code: "duplicate_session" });
+    expect(killSession).not.toHaveBeenCalled();
   });
 });

@@ -166,11 +166,17 @@ export class NodeLauncher {
     if (opts?.env && Object.keys(opts.env).length > 0) {
       const failed = await this.dropOneOffFromSession(sessionName, Object.keys(opts.env), launchEnv());
       if (failed) {
-        await this.tmuxAdapter.killSession(sessionName);
+        // The first pane has already started with the one-off, so this is a stopped launch, not an
+        // undone one. Say whether the new session (the one this launch just created) is gone, and
+        // never include tmux's text or a value.
+        let removed = false;
+        try { removed = (await this.tmuxAdapter.killSession(sessionName)).ok; } catch { /* not confirmed */ }
         return {
           ok: false,
           code: "seat_env_cleanup_failed",
-          message: `Could not take the --env setting ${failed} out of the new session "${sessionName}" environment, so the launch was stopped and the session removed. Run it again.`,
+          message: removed
+            ? `Could not take the --env setting ${failed} out of the new session "${sessionName}" environment, so the launch was stopped and the session was removed. Run it again.`
+            : `Could not take the --env setting ${failed} out of the new session "${sessionName}" environment, so the launch was stopped, and the session could not be confirmed removed. It may still hold the --env values in its terminal and environment and nothing is bound to it: check it and remove it before running this again.`,
         };
       }
     }
