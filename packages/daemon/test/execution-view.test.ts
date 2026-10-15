@@ -686,12 +686,35 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
       expect(await lanesOf("OPR.9.9.33")).toEqual([]);
     });
 
-    it("keeps the park honest: the parked lane is in Q5 with its armed wake, and is not a stall", async () => {
+    it("keeps the park honest: the parked lane is in Q5 with its wake still armed, and is not a stall", async () => {
       park("qitem-pr-32", "OPR.9.9.32", SEAT_B, "external:pr-1293");
       db.prepare("UPDATE queue_items SET state = 'done' WHERE qitem_id = 'qitem-lane-32'").run();
+      db.prepare(
+        `INSERT INTO queue_transitions (transition_id, qitem_id, ts, state, transition_note, actor_session)
+         VALUES (32001, 'qitem-pr-32', '2026-08-29T21:30:00.000Z', 'blocked', 'parked', ?)`,
+      ).run(SEAT_B);
+      db.prepare(
+        `INSERT INTO queue_transition_wakes (transition_id, qitem_id, phase, wake_kind, wake_ref)
+         VALUES (32001, 'qitem-pr-32', 'armed', 'timer', 'wake-timer-pr-32')`,
+      ).run();
       const doc = await show();
       const q5 = (doc.q5_park as Record<string, unknown>[]).find((p) => p.qitem_id === "qitem-pr-32")!;
       expect(q5.pickup_state).toBe("parked");
+      expect(q5.park_kind).toBe("deliberate-with-wake");
+      expect(String(q5.park_kind_basis)).toContain("wake-timer-pr-32");
+    });
+
+    it("lets an in-progress lane win whichever of the slice's id or dir each row names", async () => {
+      // Both forms name slice 31: lane-31 is tagged by id, the parked row by dir, and the reverse.
+      park("qitem-pr-31-dir", "31-alpha", SEAT_B, "external:pr-7");
+      expect((await lanesOf("OPR.9.9.31")).map((l) => l.qitem_id)).toEqual(["qitem-lane-31"]);
+      expect((await lanesOf("31-alpha"))).toEqual([]);
+      db.prepare("UPDATE queue_items SET tags = ? WHERE qitem_id = 'qitem-lane-31'")
+        .run(JSON.stringify([`mission:${MISSION}`, "slice:31-alpha", `candidate:${candidateSha.slice(0, 9)}`]));
+      db.prepare("DELETE FROM queue_items WHERE qitem_id = 'qitem-pr-31-dir'").run();
+      park("qitem-pr-31-id", "OPR.9.9.31", SEAT_B, "external:pr-7");
+      expect((await lanesOf("31-alpha")).map((l) => l.qitem_id)).toEqual(["qitem-lane-31"]);
+      expect(await lanesOf("OPR.9.9.31")).toEqual([]);
     });
   });
 
