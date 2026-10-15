@@ -14,6 +14,7 @@
 // map is never collapsed by truthiness into the legacy ladder.
 
 import type { SnapshotData, Session, SnapshotOccupantState } from "./types.js";
+import { effectiveRestorePolicy } from "./restore-policy.js";
 
 /** The minimal row shape the ladder needs — satisfied by Session and by the
  *  preview's narrower session rows alike, so ONE ladder serves every consumer
@@ -96,14 +97,15 @@ export function resolveActiveSnapshotSession(data: SnapshotData, nodeId: string)
  *  plan preview both stop such a seat for a decision rather than fresh-priming it: it HAD a session,
  *  and which earlier conversation to resume is not theirs to guess. Shared so the two cannot drift.
  *  The seat's newest row (ids are ULIDs) carries its current restore policy: under anything but
- *  resume_if_possible it starts fresh as before. Otherwise returns a row with a recorded token, or null. */
+ *  resume_if_possible (a terminal never stops here: see effectiveRestorePolicy) it starts fresh as before. Otherwise returns a row with a recorded token, or null. */
 export function absentSeatResumeHistory<T extends { id: string; nodeId: string; resumeType: string | null; resumeToken: string | null; restorePolicy?: string | null }>(
   sessions: T[],
   nodeId: string,
+  runtime: string | null | undefined,
 ): T | null {
   const rows = sessions.filter((session) => session.nodeId === nodeId);
   const newest = rows.reduce<T | null>((latest, row) => (!latest || row.id > latest.id ? row : latest), null);
-  if (!newest || (newest.restorePolicy ?? "resume_if_possible") !== "resume_if_possible") return null;
+  if (!newest || effectiveRestorePolicy(runtime, newest.restorePolicy) !== "resume_if_possible") return null;
   return rows.find((session) => !!session.resumeToken?.trim() && !!session.resumeType && session.resumeType !== "none") ?? null;
 }
 

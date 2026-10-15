@@ -125,7 +125,7 @@ function snapshotLaunchOutcome(data: SnapshotData, nodeId: string, runtime: stri
   if (runtimeError) return { kind: "decision", why: runtimeError };
   if (!session) {
     // The restore's own rule for a seat stopped at capture whose earlier occupant left a token.
-    const prior = occupant.kind === "none" ? absentSeatResumeHistory(data.sessions, nodeId) : null;
+    const prior = occupant.kind === "none" ? absentSeatResumeHistory(data.sessions, nodeId, runtime) : null;
     return prior
       ? { kind: "decision", why: `had no running occupant for this seat when it was taken, but an earlier occupant left a '${prior.resumeType}' resume token` }
       : { kind: "fresh", why: "saves no session for this seat" };
@@ -869,7 +869,7 @@ export class RestoreOrchestrator {
     // Classify absent-seat history before the continuity short-circuit: a
     // restoring seat must not report fresh while its forecast awaits a decision.
     const priorWithToken = occupantResolution.kind === "none" && !freshRequested
-      ? absentSeatResumeHistory(data.sessions, nodeId)
+      ? absentSeatResumeHistory(data.sessions, nodeId, liveNode ? liveNode.runtime : node.runtime)
       : null;
     if (priorWithToken) {
       return { nodeId, logicalId: node.logicalId, status: "awaiting-decision", error: absentSeatResumeHistoryError(node.logicalId, priorWithToken.resumeType, this.rigRepo.getRig(rigId)?.rig.name ?? data.rig.name) };

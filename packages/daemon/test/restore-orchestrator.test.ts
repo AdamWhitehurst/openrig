@@ -277,9 +277,9 @@ describe("RestoreOrchestrator", () => {
   // whose earlier occupant left a resume token is not silently fresh-primed.
   describe("a seat with no occupant at capture", () => {
     /** Capture an absent seat while retaining configurable resume-token history and policy. */
-    function absentSeat(opts: { resumeToken?: string | null; restorePolicy?: string } = {}) {
+    function absentSeat(opts: { resumeToken?: string | null; restorePolicy?: string; runtime?: string } = {}) {
       const snap = seedRigAndSnapshot({
-        nodes: [{ logicalId: "worker", role: "worker", runtime: "claude-code" }],
+        nodes: [{ logicalId: "worker", role: "worker", runtime: opts.runtime ?? "claude-code" }],
         edges: [],
         resumeType: opts.resumeToken === null ? undefined : "claude_id",
         resumeToken: opts.resumeToken === null ? undefined : (opts.resumeToken ?? "earlier-thread"),
@@ -334,6 +334,22 @@ describe("RestoreOrchestrator", () => {
       expect(tmux.sendText).not.toHaveBeenCalled();
       expect(db.prepare("SELECT * FROM sessions ORDER BY id").all()).toEqual(sessionsBefore);
       expect(db.prepare("SELECT * FROM continuity_state").all()).toEqual(continuityBefore);
+    });
+
+    it("the preview forecasts a terminal seat fresh-primed despite an earlier resume token", () => {
+      const snap = absentSeat({ runtime: "terminal" });
+      const forecast = buildRestorePlanPreview(rigRepo.getRig(snap.rigId)!, snap, snap.data.sessions);
+      expect(forecast.nodes[0]!.intendedAction).toBe("fresh-primed");
+      expect(forecast.nodes[0]!.freshRequired).toBe(false);
+    });
+
+    it("apply relaunches a terminal seat despite an earlier resume token", async () => {
+      const tmux = mockTmux();
+      const result = await createOrchestrator({ tmux }).restore(absentSeat({ runtime: "terminal" }).id);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.result.nodes[0]!.status).not.toBe("awaiting-decision");
+      expect(tmux.createSession).toHaveBeenCalled();
     });
 
     it("--fresh still starts it fresh", async () => {
