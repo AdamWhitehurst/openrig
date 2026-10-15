@@ -423,6 +423,26 @@ describe("slice: tag by frontmatter id or directory name (every membership consu
     expect(indexer.get("01-a")!.qitemIds).not.toContain("q-dir");
   });
 
+  it("an id shared by same-named slices in two missions is no alias, though directory dedupe shows only one of them", () => {
+    writeIdSlice("m1", "01-a", "X.1.1");
+    writeIdSlice("m2", "01-a", "X.1.1");
+    insertQitem(db, { id: "q-m2", dest: "alice@rig", tags: ["mission:m2", "slice:X.1.1"] });
+    insertQitem(db, { id: "q-m1", dest: "bob@rig", tags: ["mission:m1"] });
+    const { indexer } = harness();
+    expect(indexer.sliceTagKeys("01-a")).toEqual(["01-a"]);
+    expect(indexer.get("01-a")!.qitemIds).not.toContain("q-m2");
+  });
+
+  it("one slice found under two slice roots still answers to its id", () => {
+    const second = path.join(cleanup, "second");
+    fs.mkdirSync(path.join(second, "cus", "slices", "01-custody"), { recursive: true });
+    fs.writeFileSync(path.join(second, "cus", "slices", "01-custody", "SPEC.md"), "---\nid: CUS.1.1\nstatus: active\n---\n# dup\n");
+    insertQitem(db, { id: "q-id", dest: "alice@rig", tags: ["mission:cus", "slice:CUS.1.1"] });
+    const indexer = new SliceIndexer({ slicesRoot: missionsRoot, additionalSliceRoots: [second], dogfoodEvidenceRoot: null, db });
+    expect(indexer.sliceTagKeys("01-custody")).toEqual(["01-custody", "CUS.1.1"]);
+    expect(indexer.get("01-custody")!.qitemIds).toEqual(["q-id"]);
+  });
+
   it("the agents band holds a seat for an id-tagged row, a dir-tagged row and a both-tagged row", () => {
     seed();
     const sessions = new Set((harness().gatherer.composeAgents("slice:01-custody")?.rows ?? []).map((r) => r.sessionName));

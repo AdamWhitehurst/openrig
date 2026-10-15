@@ -496,13 +496,16 @@ export class SliceIndexer {
     return this.walkSliceLocations().filter((location) => !this.missionId || location.missionId === this.missionId);
   }
 
-  /** Every slice location under the roots, whatever mission this indexer is scoped to. */
-  private walkSliceLocations(): SliceLocation[] {
+  /** Every slice location under the roots, whatever mission this indexer is scoped to.
+   *  Directory names are deduplicated (first wins) unless `physical` asks for every folder. */
+  private walkSliceLocations(physical = false): SliceLocation[] {
     const locations: SliceLocation[] = [];
     const seen = new Set<string>();
     const addLocation = (location: SliceLocation) => {
-      if (seen.has(location.name)) return;
-      seen.add(location.name);
+      if (!physical) {
+        if (seen.has(location.name)) return;
+        seen.add(location.name);
+      }
       locations.push(location);
     };
 
@@ -547,24 +550,29 @@ export class SliceIndexer {
   private sliceIdAliases(): SliceIdAliases {
     const now = Date.now();
     if (this.idAliases && this.idAliases.expiresAt > now) return this.idAliases;
-    // Claims are counted over every mission, not just this indexer's: a mission-scoped
-    // indexer must still see that another mission's slice shares the id.
-    const locations = this.walkSliceLocations();
-    const names = new Set(locations.map((location) => location.name));
-    const claims = new Map<string, string[]>();
-    for (const location of locations) {
+    // Claims are counted over every physical slice folder in every mission, not just the
+    // ones this indexer shows: a mission-scoped indexer must still see that another
+    // mission's slice shares the id, and so must one that hides a same-named folder.
+    // One slice found under two roots (same mission, same name) is still one claim.
+    const physical = this.walkSliceLocations(true);
+    const names = new Set(physical.map((location) => location.name));
+    const idOfPath = new Map<string, string | null>();
+    const claims = new Map<string, Set<string>>();
+    for (const location of physical) {
       const id = this.readSliceId(location.slicePath);
+      idOfPath.set(location.slicePath, id);
       if (!id || names.has(id)) continue;
-      const claimants = claims.get(id);
-      if (claimants) claimants.push(location.name);
-      else claims.set(id, [location.name]);
+      const claimants = claims.get(id) ?? new Set<string>();
+      claimants.add(`${location.missionId ?? ""}/${location.name}`);
+      claims.set(id, claimants);
     }
     const nameById = new Map<string, string>();
     const idByName = new Map<string, string>();
-    for (const [id, claimants] of claims) {
-      if (claimants.length !== 1) continue;
-      nameById.set(id, claimants[0]!);
-      idByName.set(claimants[0]!, id);
+    for (const location of this.readSliceLocations()) {
+      const id = idOfPath.get(location.slicePath);
+      if (!id || claims.get(id)?.size !== 1) continue;
+      nameById.set(id, location.name);
+      idByName.set(location.name, id);
     }
     this.idAliases = { nameById, idByName, expiresAt: now + this.cacheTtlMs };
     return this.idAliases;
