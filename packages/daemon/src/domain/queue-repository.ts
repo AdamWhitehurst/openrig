@@ -3113,6 +3113,17 @@ export class QueueRepository {
     });
   }
 
+  /** The transition that closed a row: the first of the trailing run in its current closed state.
+   *  Later notes and delivery receipts on a closed row repeat that state, so the latest transition
+   *  is not the close. Null while the row is still active (pending, in-progress, blocked). */
+  closingTransition(qitemId: string, currentState: string): ReturnType<QueueTransitionLog["listForQitem"]>[number] | null {
+    if (isBlockerLive(currentState)) return null;
+    const transitions = this.transitionLog.listForQitem(qitemId);
+    let closing = null;
+    for (let i = transitions.length - 1; i >= 0 && transitions[i]!.state === currentState; i--) closing = transitions[i]!;
+    return closing;
+  }
+
   /** Read-only scope-aware RECENT projection. Normalization and its hard cap
    * live with the append-only transition log; the repository owns the public
    * queue-domain door. */

@@ -520,7 +520,7 @@ rig queue list --mine                # just the caller's items
 rig queue list --destination <s>     # destined to <s>
 rig queue list --source <s>          # sourced by <s>
 rig queue show <qitemId>             # bounded single-item body preview
-rig queue show <qitemId> --full      # complete body and chain fields
+rig queue show <qitemId> --full      # complete body and chain fields; a closed row adds closingTransition (the close's state, reason, target, actor, time and note)
 ```
 
 Four orthogonal axes (scope × history × field-breadth × encoding), all composable. **STOP using bare `rig queue list` as the cross-rig firehose.** Default is now active + compact + current-rig. Cross-rig history with full bodies is opt-in via `-A -a --full`; request only the breadth and fields needed for the question.
