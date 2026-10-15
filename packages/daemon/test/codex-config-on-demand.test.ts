@@ -65,6 +65,29 @@ it("a daemon that boots with a Codex seat still writes the hooks block and trust
   } finally { second.db.close(); }
 }, 60000);
 
+it("a legacy Codex restore on a daemon with no Codex seat ensures the hooks block and trust before it resumes", async () => {
+  const f = fixture(); fs.writeFileSync(f.config, USER_CONFIG);
+  const daemon = await startDaemon(f);
+  try {
+    expect(fs.readFileSync(f.config, "utf8")).toBe(USER_CONFIG);
+    const resume = (daemon.deps.restoreOrchestrator as any).codexResume;
+    await resume.resume("seat@rig", "codex_id", "thread-1", f.cwd);
+    const text = fs.readFileSync(f.config, "utf8");
+    expect(text).toContain(USER_CONFIG);
+    expect(text).toContain(HOOKS_BLOCK);
+    expect(text).toContain("trusted_hash");
+  } finally { daemon.db.close(); }
+}, 60000);
+
+it("a legacy Codex resume that cannot resume does not touch the config", async () => {
+  const f = fixture(); fs.writeFileSync(f.config, USER_CONFIG);
+  const daemon = await startDaemon(f);
+  try {
+    expect((await (daemon.deps.restoreOrchestrator as any).codexResume.resume("seat@rig", "codex_id", null, f.cwd)).code).toBe("no_resume");
+    expect(fs.readFileSync(f.config, "utf8")).toBe(USER_CONFIG);
+  } finally { daemon.db.close(); }
+}, 60000);
+
 function launchableAdapter(f: ReturnType<typeof fixture>, hooksEnabled: boolean) {
   const tmux = { getPaneCommand: vi.fn(async () => "bash"), getSessionEnv: vi.fn(async () => undefined), sendShellCommand: vi.fn(async () => ({ ok: true })) };
   const fsOps = { homedir: f.home, readFile: (p: string) => fs.readFileSync(p, "utf8"), writeFile: (p: string, c: string) => fs.writeFileSync(p, c), exists: fs.existsSync, mkdirp: (p: string) => { fs.mkdirSync(p, { recursive: true }); } };
