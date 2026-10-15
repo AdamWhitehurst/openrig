@@ -231,6 +231,12 @@ function waitingOn(lane: Record<string, unknown> | null | undefined): string | n
   return typeof on === "string" && on ? on : null;
 }
 
+/** A waiting row in words: the seat, the actual blocker and the row. Never a builder assignment. */
+function waitingRowText(lane: Record<string, unknown>): string | null {
+  const on = waitingOn(lane);
+  return on ? `waiting row · ${str(lane["seat"])} · ${on} · ${str(lane["qitem_id"])}` : null;
+}
+
 /** A live problem on the slice, in words, or null. Elapsed time alone is never a verdict. */
 function problemText(slice: SliceFacts): string | null {
   const activity = record(slice.lane?.["activity"]);
@@ -410,6 +416,7 @@ function collectIndeterminate(execution: ExecutionViewSnap, slices: SliceFacts[]
     if (first) add(RUNG_WORD[first], slice.id, slice.cells[first].basis);
   }
   for (const lane of execution.q1_lanes ?? []) {
+    if (waitingOn(lane)) continue; // a wait does not depend on the seat's activity
     const activity = record(lane["activity"]);
     if (activity["activity"] === INDETERMINATE) add("activity", str(lane["slice"] ?? lane["qitem_id"], "lane"), activity["basis"]);
   }
@@ -637,11 +644,12 @@ function sliceDetail(
     const candidateDeps = candidate.sequencing?.["depends_on"];
     return Array.isArray(candidateDeps) && candidateDeps.map(String).includes(slice.id);
   }).map((candidate) => candidate.id);
+  const waitingRow = slice.lane ? waitingRowText(slice.lane) : null;
   const ownership: ContentLine[] = [
-    cardField("seat", slice.lane ? str(slice.lane["seat"]) : "none — no claimed lane", slice.lane ? open(laneKey(slice.lane)) : undefined),
-    cardField("activity", slice.lane ? (waitingOn(slice.lane) ? `waiting on ${waitingOn(slice.lane)}` : str(activity["activity"], INDETERMINATE)) : "not assigned"),
-    cardField("decided by", slice.lane ? str(activity["decided_by"] ?? activity["basis"], "basis unavailable") : "—"),
-    cardField("changed", slice.lane ? str(activity["changed_at"], "—") : "—"),
+    cardField("seat", slice.lane && !waitingRow ? str(slice.lane["seat"]) : "none — no in-progress lane", slice.lane && !waitingRow ? open(laneKey(slice.lane)) : undefined),
+    cardField("activity", slice.lane ? (waitingRow ?? str(activity["activity"], INDETERMINATE)) : "not assigned", waitingRow ? open(laneKey(slice.lane!)) : undefined),
+    cardField("decided by", slice.lane && !waitingRow ? str(activity["decided_by"] ?? activity["basis"], "basis unavailable") : "—"),
+    cardField("changed", slice.lane && !waitingRow ? str(activity["changed_at"], "—") : "—"),
   ];
   const evidence: ContentLine[] = [];
   for (const rung of RUNGS) {
@@ -719,17 +727,21 @@ function laneDetail(execution: ExecutionViewSnap, key: string): ContentLine[] | 
   const sections: Section[] = [];
   if (lane) {
     sections.push({
-      title: "lane",
+      title: waitingOn(lane) ? "waiting row" : "lane",
       fields: [
         { label: "qitem", value: str(lane["qitem_id"]) },
         { label: "slice", value: str(lane["slice"]), link: open(`slice:${str(lane["slice"])}`) },
         { label: "seat", value: str(lane["seat"]) },
-        { label: "activity", value: waitingOn(lane) ? `waiting on ${waitingOn(lane)}` : str(activity["activity"], INDETERMINATE) },
-        { label: "decided by", value: str(activity["decided_by"] ?? activity["basis"], "basis unavailable") },
-        { label: "changed", value: str(activity["changed_at"], "—") },
+        ...(waitingOn(lane)
+          ? [{ label: "waiting on", value: waitingOn(lane)! }]
+          : [
+              { label: "activity", value: str(activity["activity"], INDETERMINATE) },
+              { label: "decided by", value: str(activity["decided_by"] ?? activity["basis"], "basis unavailable") },
+              { label: "changed", value: str(activity["changed_at"], "—") },
+            ]),
         { label: "needs input", value: Number(needs["count"] ?? 0) > 0 ? `${str(needs["count"])} · ${str(needs["reason"], "input")}` : "none" },
         { label: "pickup", value: str(record(lane["pickup"])["state"], INDETERMINATE) },
-        { label: "oracle", value: str(activity["source"], "(not named)") },
+        ...(waitingOn(lane) ? [] : [{ label: "oracle", value: str(activity["source"], "(not named)") }]),
       ],
     });
     sections.push({
@@ -834,14 +846,16 @@ export function executionSliceStripLines(
   const declaredWord = declared?.trim().toLowerCase() || "no declared status";
   const next = (declaredWord === "done" || declaredWord === "retired" || declaredWord === "deferred" || declaredWord === "closed-deferred") && !slice.lane
     ? `none — declared ${declaredWord}`
-    : nextText(slice) ?? (slice.lane ? "in progress on the lane above" : "nothing the projection can sequence");
+    : nextText(slice) ?? (slice.lane ? (waitingOn(slice.lane) ? `waiting on ${waitingOn(slice.lane)}, see the waiting row above` : "in progress on the lane above") : "nothing the projection can sequence");
   return [
     { text: "" },
     sectionRule(`EXECUTION · ${problem ? stateWord(slice) : liveWord} · wave ${waveOf(slice)}`, width),
     ...workflowOverview(execution, width),
     { text: `  declared    ${declaredWord} (slice file)` },
     actionRow(slice.readiness?.configured ? `proof ${slice.readiness.state} · inspect judgments and evidence` : `evidence    ${evidence}`, open("evidence"), width),
-    { text: `  assignment  ${slice.lane ? `${str(slice.lane["seat"])} · ${waitingOn(slice.lane) ? `waiting on ${waitingOn(slice.lane)}` : `${str(activity["activity"], INDETERMINATE)} (${str(activity["decided_by"], "?")})`}` : "none — no claimed lane"}`, ...(slice.lane ? { action: open(laneKey(slice.lane)) } : {}) },
+    { text: slice.lane && waitingOn(slice.lane)
+      ? `  waiting     ${waitingRowText(slice.lane)!.replace(/^waiting row · /, "")}`
+      : `  assignment  ${slice.lane ? `${str(slice.lane["seat"])} · ${str(activity["activity"], INDETERMINATE)} (${str(activity["decided_by"], "?")})` : "none — no claimed lane"}`, ...(slice.lane ? { action: open(laneKey(slice.lane)) } : {}) },
     { text: `  next        ${next}` },
     { text: `  problem     ${problem ?? "none on the projection's current surfaces"}` },
     ...planningLines(execution, width), ...planningLines(execution, width, waveOf(slice), true),

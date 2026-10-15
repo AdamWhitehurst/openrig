@@ -801,10 +801,12 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     }
   }
   // A lane is a row doing the slice's work. A row parked on `external:<what>`
-  // also counts: an outside party holds the ball, but the seat still owns the
-  // slice. It stays marked `waiting` so it is never mistaken for active work,
-  // and it yields to an in-progress lane on the same slice. Rows parked on a
-  // qitem, a human seat, or a fold:/auth: gate are not lanes.
+  // is also listed, as a waiting lane: `external:` records an outside dependency
+  // (a review, a decision, a capacity limit, a lifecycle step). It does not mean an
+  // outside party owns the work, or that the parked seat is the slice's builder.
+  // It stays marked `waiting` so it is never mistaken for active work, and it
+  // yields to an in-progress lane on the same slice. Rows parked on a qitem, a
+  // human seat, or a fold:/auth: gate are not lanes.
   const sliceKey = (slice: string): string => slices.find((s) => s.id === slice || s.dir === slice)?.dir ?? slice;
   const activeSlices = new Set(
     rows.filter((r) => r.state === "in-progress").flatMap((r) => sliceOfRow(r) ?? []).map(sliceKey),

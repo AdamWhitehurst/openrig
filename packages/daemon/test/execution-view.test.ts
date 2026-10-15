@@ -724,9 +724,25 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
         waiting: { on: "external:pr-1293" },
         pickup: { state: "parked" },
       });
-      // A waiting lane is an owner, not live work: parallelism health ignores it.
+      // A waiting lane is not live work: parallelism health ignores it, so q1_lanes is longer than lanes_live.
       const q6 = (await show()).q6_parallelism as Record<string, unknown>;
       expect(q6.lanes_live).toBe(1);
+      expect(((await show()).q1_lanes as unknown[]).length).toBe(2);
+    });
+
+    it("shows a coordination wait with no worktree_path= line as a waiting row, not a builder", async () => {
+      park("qitem-decision-33", "OPR.9.9.33", SEAT_B, "external:capacity-decision");
+      db.prepare("UPDATE queue_items SET state = 'done' WHERE qitem_id = 'qitem-parked-33'").run();
+      expect((db.prepare("SELECT body FROM queue_items WHERE qitem_id = 'qitem-decision-33'").get() as { body: string }).body).not.toContain("worktree_path=");
+      const lanes = await lanesOf("OPR.9.9.33");
+      expect(lanes).toHaveLength(1);
+      expect(lanes[0]).toMatchObject({
+        qitem_id: "qitem-decision-33",
+        seat: SEAT_B,
+        waiting: { on: "external:capacity-decision" },
+        worktree_path: "INDETERMINATE",
+        fragile_join: true,
+      });
     });
 
     it("leaves active lanes unmarked and shows only the in-progress lane when the slice also has a parked external row", async () => {
