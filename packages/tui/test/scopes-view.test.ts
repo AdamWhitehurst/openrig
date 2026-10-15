@@ -206,6 +206,37 @@ describe("scopes header proof count reads as acceptance only when judges are con
     expect(proofSeg(detail, width)).toEqual({ text: "3/3 paired", token: "warn" });
   });
 
+  // The header must never cut the lock state with an ellipsis: above the narrow layout it is one line only while it fits.
+  const lockLines = (detail: ReturnType<typeof slice>, width: number) =>
+    scopeIdentityLines(detail, "m", width).map(l => l.text).filter(t => /LOCKS/.test(t));
+
+  it.each([73, 80])("keeps the whole lock state visible with judges configured at detail width %i", (width) => {
+    const detail = slice(true, ["pending", "pending", "pending"]);
+    detail.locks = { spec: { by: "orch-lead@x", at: "2026-10-14T00:00:00Z" }, delivery: null };
+    const text = lockLines(detail, width);
+    expect(text).toHaveLength(1);
+    expect(text[0]).toContain("spec locked · delivery open");
+    expect(text[0]).not.toContain("…");
+  });
+
+  it("uses one line as soon as the whole header fits and a stacked layout below that", () => {
+    const detail = slice(true, ["pending", "pending", "pending"]);
+    detail.locks = { spec: { by: "orch-lead@x", at: "2026-10-14T00:00:00Z" }, delivery: null };
+    expect(lockLines(detail, 81)[0]).toBe("  STATE outcomes pending · PROOF 0/3 accepted · LOCKS spec locked · delivery open");
+    expect(lockLines(detail, 80)[0]).toBe("  LOCKS  spec locked · delivery open");
+  });
+
+  it("never cuts the lock state at any detail width from 70, for the longest header", () => {
+    const detail = slice(true, Array.from({ length: 10 }, () => "accepted" as Judged));
+    detail.locks = { spec: { by: "orch-lead@x", at: "2026-10-14T00:00:00Z" }, delivery: { by: "orch-lead@x", at: "2026-10-14T00:00:00Z" } };
+    for (let width = 70; width <= 140; width += 1) {
+      const text = lockLines(detail, width);
+      expect(text, `width ${width}`).toHaveLength(1);
+      expect(text[0], `width ${width}`).toContain("spec locked · delivery locked");
+      expect(text[0], `width ${width}`).not.toContain("…");
+    }
+  });
+
   it.each([60, 160])("says n/m paired without a policy (width %i)", (width) => {
     expect(proofSeg(slice(true, null), width)).toEqual({ text: "3/3 paired", token: "ok" });
     expect(proofSeg(slice(false, null), width)).toEqual({ text: "0/3 paired", token: "warn" });

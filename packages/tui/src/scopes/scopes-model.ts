@@ -316,18 +316,21 @@ export function scopeIdentityLines(detail: SliceScopeSnap, mission: string | nul
       { text: `${detail.id ?? "unregistered"} · ${detail.displayName}`, token: "bright" },
     ], w));
   }
-  if (w < 70) {
+  const wide = [
+    { text: "  STATE ", token: "dim" as Token }, { text: stage, token: stateToken, bold: true },
+    { text: " · ", token: "chrome" as Token },
+    { text: "PROOF ", token: "dim" as Token }, { text: proofText, token: proofToken, bold: true },
+    { text: " · ", token: "chrome" as Token },
+    { text: "LOCKS ", token: "dim" as Token }, { text: locks, token: detail.locks.delivery ? "ok" as Token : "bright" as Token },
+  ];
+  // One line while it fits. A longer proof label (or stage) must not cut the lock state with an ellipsis, so
+  // a line wider than the detail stacks exactly as the narrow layout does.
+  if (w < 70 || wide.reduce((n, part) => n + part.text.length, 0) > w) {
     lines.push(semantic([{ text: "  STATE  ", token: "dim" }, { text: stage, token: stateToken, bold: true }], w));
     lines.push(semantic([{ text: "  PROOF  ", token: "dim" }, { text: proofText, token: proofToken, bold: true }], w));
     lines.push(semantic([{ text: "  LOCKS  ", token: "dim" }, { text: locks, token: detail.locks.delivery ? "ok" : "bright" }], w));
   } else {
-    lines.push(semantic([
-      { text: "  STATE ", token: "dim" }, { text: stage, token: stateToken, bold: true },
-      { text: " · ", token: "chrome" },
-      { text: "PROOF ", token: "dim" }, { text: proofText, token: proofToken, bold: true },
-      { text: " · ", token: "chrome" },
-      { text: "LOCKS ", token: "dim" }, { text: locks, token: detail.locks.delivery ? "ok" : "bright" },
-    ], w));
+    lines.push(semantic(wide, w));
   }
   if (detail.readiness?.configured) lines.push({ text: `  judgment basis ${detail.readiness.revision.slice(0, 12)} · publication is separate` });
   const provenance = [
