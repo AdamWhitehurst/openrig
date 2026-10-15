@@ -43,6 +43,16 @@ describe("homeIsolationAdvisory", () => {
     expect(msg).toContain("Starting anyway");
   });
 
+  it("warns when OPENRIG_HOME sits inside the real HOME, naming HOME and the derived CODEX_HOME", () => {
+    const d = dirs();
+    const msg = homeIsolationAdvisory({ accountHome: d.real, openrigHome: path.join(d.real, ".openrig-dev"), home: d.real })!;
+    expect(msg).toContain(`HOME=${d.real}`);
+    expect(msg).toContain(`CODEX_HOME=${path.join(d.real, ".codex")} (derived from HOME)`);
+    const explicit = homeIsolationAdvisory({ accountHome: d.real, openrigHome: path.join(d.real, ".openrig-dev"), home: d.real, codexHome: path.join(d.real, ".codex") })!;
+    expect(explicit).toContain(`CODEX_HOME=${path.join(d.real, ".codex")}`);
+    expect(explicit).toMatch(/(?<![A-Z_])HOME=/);
+  });
+
   it("warns when the isolated OPENRIG_HOME and HOME carry the real CODEX_HOME", () => {
     const d = dirs();
     const real = path.join(d.real, ".codex");
