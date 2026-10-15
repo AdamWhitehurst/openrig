@@ -473,6 +473,96 @@ describe("queue routes", () => {
         expect((await show(qitemId)).resolution).toBe("Fixed in #42\nfallback: second");
       });
 
+      it("keeps an outcome whose last line matches an earlier fallback line", async () => {
+        const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+        queueRepo.routeToFallback(row.qitemId, "c@r", "first reason");
+        queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
+        await post(row.qitemId, { ...closeWith("done"), resolution: "kept prefix\nfallback: first reason" }, "c@r");
+        await post(row.qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" }, "c@r");
+        queueRepo.routeToFallback(row.qitemId, "d@r", "second reason");
+        expect((await show(row.qitemId)).resolution).toBe(
+          "fallback: first reason\nkept prefix\nfallback: first reason\nfallback: second reason");
+      });
+
+      it("keeps an outcome that is exactly an earlier fallback line", async () => {
+        const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+        queueRepo.routeToFallback(row.qitemId, "c@r", "first reason");
+        queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
+        await post(row.qitemId, { ...closeWith("done"), resolution: "fallback: first reason" }, "c@r");
+        await post(row.qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" }, "c@r");
+        queueRepo.routeToFallback(row.qitemId, "d@r", "second reason");
+        expect((await show(row.qitemId)).resolution).toBe(
+          "fallback: first reason\nfallback: first reason\nfallback: second reason");
+      });
+
+      it("replaces a fallback line that a close without an outcome came after, as main does", async () => {
+        const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+        queueRepo.routeToFallback(row.qitemId, "c@r", "first reason");
+        queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
+        await post(row.qitemId, closeWith("done"), "c@r");
+        await post(row.qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" }, "c@r");
+        queueRepo.routeToFallback(row.qitemId, "d@r", "second reason");
+        expect((await show(row.qitemId)).resolution).toBe("fallback: second reason");
+      });
+
+      // The fallback route takes any JSON value as the reason; main writes it into the line as JavaScript prints it.
+      it.each([
+        ["true", true], ["false", false], ["an object", { text: "reason" }], ["an array", ["reason"]],
+        ["a number", 7], ["a plain string", "plain"], ["a string with a newline", "line one\nline two"],
+      ])("a later fallback replaces a fallback line written for %s, as main does", async (_label, firstReason) => {
+        const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+        const fallback = (to: string, reason: unknown) => app.request(`/api/queue/${row.qitemId}/fallback`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fallbackDestination: to, reason }),
+        });
+        expect((await fallback("c@r", firstReason)).status).toBe(200);
+        expect((await fallback("d@r", "next")).status).toBe(200);
+        expect((await show(row.qitemId)).resolution).toBe("fallback: next");
+      });
+
+      describe("on a database with a long history", () => {
+        /** The SQL the repository prepares while `run` executes. */
+        function preparedDuring(run: () => void): string[] {
+          const seen: string[] = [];
+          const prepare = db.prepare.bind(db);
+          db.prepare = ((sql: string) => { seen.push(sql); return prepare(sql); }) as typeof db.prepare;
+          try { run(); } finally { db.prepare = prepare as typeof db.prepare; }
+          return seen;
+        }
+
+        it("still replaces the row's own earlier fallback line among many unrelated events and rows", async () => {
+          const insertEvent = db.prepare("INSERT INTO events (type, payload) VALUES (?, ?)");
+          db.transaction(() => {
+            for (let i = 0; i < 3000; i++) insertEvent.run("qitem.fallback_routed", JSON.stringify({ qitemId: `qitem-other-${i}`, reason: "first reason" }));
+          })();
+          for (let i = 0; i < 20; i++) {
+            const other = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+            queueRepo.routeToFallback(other.qitemId, "c@r", "first reason");
+          }
+          const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+          queueRepo.routeToFallback(row.qitemId, "c@r", "first reason");
+          queueRepo.routeToFallback(row.qitemId, "d@r", "second reason");
+          expect((await show(row.qitemId)).resolution).toBe("fallback: second reason");
+        });
+
+        it("finds the row's earlier fallback line without scanning a table", async () => {
+          const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+          queueRepo.routeToFallback(row.qitemId, "c@r", "first reason");
+          const lookup = queueRepo as unknown as { lastFallbackLine(qitemId: string): { line: string } | null };
+          let found: { line: string } | null = null;
+          const sql = preparedDuring(() => { found = lookup.lastFallbackLine(row.qitemId); });
+          expect(found).toEqual({ line: "fallback: first reason", outcomeMayFollow: false });
+          expect(sql.length).toBeGreaterThan(0);
+          const scans: string[] = [];
+          for (const read of sql) {
+            expect(read).not.toMatch(/\bFROM\s+events\b/i);
+            const plan = db.prepare(`EXPLAIN QUERY PLAN ${read}`).all("x") as Array<{ detail: string }>;
+            scans.push(...plan.map((p) => p.detail).filter((d) => /^SCAN\b/.test(d)));
+          }
+          expect(scans).toEqual([]);
+        });
+      });
+
       it("still replaces a plain fallback line, as before", async () => {
         const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
         queueRepo.routeToFallback(row.qitemId, "c@r", "first reason");

@@ -83,6 +83,9 @@ export function hasLiveHumanGate(item: {
 const AUTO_UNPARK_WAKE_TAG = "queue:auto-unpark:blocker";
 const AUTO_UNPARK_BLOCKER_TAG_PREFIX = "queue:auto-unpark:blocker-ref:";
 
+/** The actor on the transition routeToFallback writes; the row's own history is how a later reroute finds the line it wrote. */
+const FALLBACK_ACTOR = "system:queue-fallback";
+
 /** 0.5.1-53 Atom 1a — typed non-qitem gate blocker prefixes. A park may be gated on a fold / auth /
  *  external condition that is NOT a qitem and NOT a human seat; these prefixes make such a gate a
  *  first-class, compact-visible, downstream-classifiable blocker (the ruling detail rides a transition). */
@@ -3861,17 +3864,31 @@ export class QueueRepository {
       .run(ts, result, qitemId);
   }
 
-  /** The reason of the row's newest fallback reroute, read from the structured event routeToFallback emits
-   *  (the same events-by-qitem lookup closure-overdue uses). Null when the row was never rerouted. */
-  private lastFallbackReason(qitemId: string): string | null {
-    const row = this.db
-      .prepare(
-        `SELECT json_extract(payload, '$.reason') AS reason FROM events
-          WHERE type = 'qitem.fallback_routed' AND json_extract(payload, '$.qitemId') = ?
-          ORDER BY seq DESC LIMIT 1`,
-      )
-      .get(qitemId) as { reason: string | null } | undefined;
-    return row?.reason ?? null;
+  /**
+   * The fallback line `routeToFallback` last wrote on this row, read back from the row's own transitions (one
+   * newest-first seek on idx_queue_transitions_qitem_id_order, stopping at that reroute's transition). The
+   * transition note carries the reason as the same string the line was built from, so a reason that is not a
+   * string reads back as it was printed. `outcomeMayFollow` is true when the row closed from an open state
+   * after that reroute, the only way a close can have appended an outcome behind the line. Null when the row has no
+   * reroute transition, or its note is not in the shape this method writes.
+   */
+  private lastFallbackLine(qitemId: string): { line: string; outcomeMayFollow: boolean } | null {
+    const newestFirst = this.db.prepare(
+      "SELECT state, actor_session, transition_note FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id DESC",
+    );
+    let newerClosed = false;
+    let outcomeMayFollow = false;
+    for (const row of newestFirst.iterate(qitemId) as Iterable<{ state: string; actor_session: string; transition_note: string | null }>) {
+      if (newerClosed && isBlockerLive(row.state as QueueState)) outcomeMayFollow = true;
+      if (row.actor_session === FALLBACK_ACTOR && row.transition_note?.startsWith("fallback-routed: ")) {
+        const note = row.transition_note;
+        const open = note.indexOf(" (", note.indexOf(" → "));
+        if (open < 0 || !note.endsWith(")")) return null;
+        return { line: `fallback: ${note.slice(open + 2, -1)}`, outcomeMayFollow };
+      }
+      newerClosed = !isBlockerLive(row.state as QueueState);
+    }
+    return null;
   }
 
   /**
@@ -3889,15 +3906,15 @@ export class QueueRepository {
 
     // The field held only a fallback line before a close could store an outcome. The line this method last
     // wrote is replaced, as it always was; anything else in the field is an outcome (possibly after an
-    // earlier fallback line) and stays, with the new line after it. "The line it last wrote" is read from the
-    // reason of the row's newest fallback event, so no marker is stored in the text; with no such event the
-    // field is left whole.
+    // earlier fallback line) and stays, with the new line after it. "The line it last wrote" comes from the
+    // row's own transitions, so no marker is stored in the text. When the row has closed since, the field may
+    // end with an outcome that reads like that line, so then only a field that is exactly the line (an
+    // appended outcome would make it longer) is replaced; with no such reroute transition the field is left whole.
     const fallbackLine = `fallback: ${reason}`;
-    const lastWritten = this.lastFallbackReason(qitemId);
-    const lastLine = lastWritten === null ? null : `fallback: ${lastWritten}`;
-    const kept = !qitem.resolution || lastLine === null ? qitem.resolution
-      : qitem.resolution === lastLine ? null
-        : qitem.resolution.endsWith(`\n${lastLine}`) ? qitem.resolution.slice(0, -(lastLine.length + 1))
+    const last = qitem.resolution ? this.lastFallbackLine(qitemId) : null;
+    const kept = !qitem.resolution || last === null ? qitem.resolution
+      : qitem.resolution === last.line ? null
+        : !last.outcomeMayFollow && qitem.resolution.endsWith(`\n${last.line}`) ? qitem.resolution.slice(0, -(last.line.length + 1))
           : qitem.resolution;
     const nextResolution = kept ? `${kept}\n${fallbackLine}` : fallbackLine;
 
@@ -3922,7 +3939,7 @@ export class QueueRepository {
       this.transitionLog.append({
         qitemId,
         state: qitem.state,
-        actorSession: "system:queue-fallback",
+        actorSession: FALLBACK_ACTOR,
         transitionNote: `fallback-routed: ${originalDestination} → ${fallbackDestination} (${reason})`,
         closureTarget: qitem.state === "in-progress" ? this.retainedClaimBlocker(qitemId) : undefined,
       });
