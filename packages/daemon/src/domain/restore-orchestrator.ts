@@ -78,6 +78,7 @@ const LAUNCH_DEPENDENCY_KINDS = new Set(["delegates_to", "spawned_by"]);
 // usability, and lifecycle projection. Imported and re-exported here so the
 // existing export surface and the execution call sites below are unchanged.
 import { resolveActiveSnapshotSession, activeOccupantAmbiguityError, absentSeatResumeHistory, absentSeatResumeHistoryError } from "./active-occupant.js";
+import { effectiveRestorePolicy } from "./restore-policy.js";
 export { resolveActiveSnapshotSession } from "./active-occupant.js";
 export type { ActiveSnapshotSessionResolution } from "./active-occupant.js";
 
@@ -129,7 +130,7 @@ function snapshotLaunchOutcome(data: SnapshotData, nodeId: string, runtime: stri
       ? { kind: "decision", why: `had no running occupant for this seat when it was taken, but an earlier occupant left a '${prior.resumeType}' resume token` }
       : { kind: "fresh", why: "saves no session for this seat" };
   }
-  const policy = session.restorePolicy ?? "resume_if_possible";
+  const policy = effectiveRestorePolicy(runtime, session.restorePolicy);
   if (policy !== "resume_if_possible") return { kind: "fresh", why: `saves this seat with restore policy '${policy}'` };
   if (!session.resumeToken) return { kind: "decision", why: "has no resume token for this seat" };
   if (!session.resumeType || session.resumeType === "none") return { kind: "fresh", why: "records no resume source for this seat" };
@@ -907,7 +908,7 @@ export class RestoreOrchestrator {
       // this function (before the continuity consult); ambiguity already
       // returned there, so only resolved/none reach here.
       const snapSession = occupantResolution.kind === "resolved" ? occupantResolution.session : null;
-      const policy = snapSession?.restorePolicy ?? "resume_if_possible";
+      const policy = effectiveRestorePolicy(node.runtime, snapSession?.restorePolicy);
       const resumeSourceRecorded = !!snapSession?.resumeType && snapSession.resumeType !== "none";
       if (policy === "resume_if_possible" && snapSession && !snapSession.resumeToken && !freshRequested) {
         const sourceNote = resumeSourceRecorded
@@ -1124,7 +1125,7 @@ export class RestoreOrchestrator {
 
     // Check restore policy. OPR.0.3.4.2: a --fresh-listed seat (operation B)
     // deliberately skips the resume attempt; its launch reports `fresh-primed`.
-    const restorePolicy = session?.restorePolicy ?? "resume_if_possible";
+    const restorePolicy = effectiveRestorePolicy(node.runtime, session?.restorePolicy);
     const resumeType = session?.resumeType ?? null;
     const resumeToken = session?.resumeToken ?? null;
     const freshRequested = opts?.freshLogicalIds?.includes(node.logicalId) ?? false;

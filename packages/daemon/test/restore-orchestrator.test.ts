@@ -2785,6 +2785,66 @@ describe("RestoreOrchestrator", () => {
     }
   });
 
+  describe("a terminal seat has no conversation to resume", () => {
+    /** A saved seat whose session row carries `policy` and no resume token, as every session a relaunch creates does. */
+    function seatSnapshot(runtime: string, policy: string) {
+      const rig = rigRepo.createRig("test-rig");
+      db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-t", rig.id, "Infra");
+      const node = rigRepo.addNode(rig.id, "infra.ui", { runtime, podId: "pod-t", cwd: "." });
+      const session = sessionRegistry.registerSession(node.id, "infra-ui@test-rig");
+      sessionRegistry.updateStatus(session.id, "running");
+      db.prepare("UPDATE sessions SET restore_policy = ? WHERE id = ?").run(policy, session.id);
+      db.prepare(
+        "INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)"
+      ).run(node.id, "[]", "[]", JSON.stringify([
+        { type: "send_text", value: "rig tui", phase: "after_ready", appliesOn: ["fresh_start"], idempotent: false },
+      ]), runtime);
+      const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+      sessionRegistry.updateStatus(session.id, "exited");
+      db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+      return { snap, node };
+    }
+
+    async function restoreSeat(runtime: string, policy: string) {
+      const { snap, node } = seatSnapshot(runtime, policy);
+      const tmux = mockTmux({
+        sendText: vi.fn(async () => ({ ok: true as const })),
+        sendKeys: vi.fn(async () => ({ ok: true as const })),
+      });
+      const adapter = {
+        runtime,
+        listInstalled: vi.fn(async () => []),
+        project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+        deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+        checkReady: vi.fn(async () => ({ ready: true })),
+        launchHarness: vi.fn(async () => ({ ok: true as const })),
+      };
+      const result = await createOrchestrator({ tmux }).restore(snap.id, { adapters: { [runtime]: adapter } });
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error("restore failed");
+      const forecast = buildRestorePlanPreview(rigRepo.getRig(snap.rigId)!, snap, snap.data.sessions);
+      return { status: result.result.nodes.find((n) => n.nodeId === node.id)!.status, tmux, forecast };
+    }
+
+    it.each(["resume_if_possible", "relaunch_fresh", "checkpoint_only"])(
+      "relaunches a terminal seat saved with policy %s fresh and runs its startup actions",
+      async (policy) => {
+        const { status, tmux, forecast } = await restoreSeat("terminal", policy);
+        expect(status).toBe("fresh-primed");
+        expect(tmux.sendText).toHaveBeenCalledWith("infra-ui@test-rig", "rig tui");
+        expect(forecast.nodes[0]!.intendedAction).toBe("fresh-primed");
+        expect(forecast.nodes[0]!.freshRequired).toBe(false);
+      },
+    );
+
+    it("still stops an agent seat saved with resume_if_possible and no token", async () => {
+      const { status, tmux, forecast } = await restoreSeat("claude-code", "resume_if_possible");
+      expect(status).toBe("awaiting-decision");
+      expect(tmux.sendText).not.toHaveBeenCalledWith("infra-ui@test-rig", "rig tui");
+      expect(forecast.nodes[0]!.intendedAction).toBe("awaiting-decision");
+    });
+  });
+
   it("restore propagates launch warnings and writes transcript boundary marker with snapshot ID", async () => {
     const snap = seedRigAndSnapshot({ resumeType: "none" });
 

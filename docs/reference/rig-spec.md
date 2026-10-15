@@ -440,6 +440,8 @@ profile: none
 
 All three must be present together. Any partial combination is a validation error.
 
+A terminal has no conversation to resume. On restore its seat relaunches fresh and re-runs its startup actions; it never waits for a `--fresh` decision.
+
 ### agent_ref Rules
 
 - Must start with `local:` or `path:`

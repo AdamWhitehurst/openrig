@@ -1,6 +1,7 @@
 import type { SnapshotData, RestoreValidationBlocker, RigServicesRecord } from "./types.js";
 import { resolveSnapshotRestoreTopology } from "./restore-topology.js";
 import { resolveActiveSnapshotSession } from "./active-occupant.js";
+import { effectiveRestorePolicy } from "./restore-policy.js";
 import { reanchorBuiltinStartupFile, reanchorShippedProjectionEntry } from "./builtin-startup-files.js";
 
 // Shared read-only validation. Keep restore's refusal order and replay eligibility here.
@@ -118,7 +119,7 @@ export function validatePreRestore(
       consumesReplay = true;
     } else {
       const sess = resolution.session;
-      const policy = sess.restorePolicy ?? "resume_if_possible";
+      const policy = effectiveRestorePolicy(node.runtime, sess.restorePolicy);
       if (freshListed || policy !== "resume_if_possible") consumesReplay = true;
       else if (!sess.resumeToken) consumesReplay = false;
       else if (!!sess.resumeType && sess.resumeType !== "none") consumesReplay = false;
