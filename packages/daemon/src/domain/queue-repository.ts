@@ -3868,7 +3868,7 @@ export class QueueRepository {
    * Where, in the row's `resolution`, the fallback line `routeToFallback` last wrote begins; null when it cannot be
    * told, and the field is then left whole. The row's own transitions say what that reroute printed: a newest-first
    * seek by row on the live log, then on the archive the retention sweep moves an aged closed row's transitions to,
-   * stopping at the reroute's transition, whose note is `fallback-routed: <from> → <to> (<reason>)`. The line is
+   * stopping at the reroute's own transition (the in-process one, with no identity provenance), whose note is `fallback-routed: <from> → <to> (<reason>)`. The line is
    * `fallback: <reason>`, built from the same printed reason, so it starts at a line start `i` of the field with
    * `fallback: ` there and the rest of the field, `r`, satisfying note ends with ` (r)`. Neither the destinations nor
    * the chain are consulted, so how a value was stored cannot matter. At most one `i` can satisfy it when the field
@@ -3884,12 +3884,17 @@ export class QueueRepository {
     let newerClosed = false;
     let outcomeMayFollow = false;
     for (const table of ["queue_transitions", ...(detectTable(this.db, "queue_transitions_archive") ? ["queue_transitions_archive"] : [])]) {
+      // The reroute's transition is written in-process, so it has no identity provenance; the update route records one
+      // on every write and takes the actor and note from the request, so a transition it wrote can carry the same
+      // actor and note without being a reroute (the trust rule replyToChoiceFor uses). A schema without the column
+      // predates the update route's provenance and reads every row as unstamped.
+      const stamped = (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some((c) => c.name === "identity_provenance");
       const newestFirst = this.db.prepare(
-        `SELECT state, actor_session, transition_note FROM ${table} WHERE qitem_id = ? ORDER BY transition_id DESC`,
+        `SELECT state, actor_session, transition_note, ${stamped ? "identity_provenance" : "NULL AS identity_provenance"} FROM ${table} WHERE qitem_id = ? ORDER BY transition_id DESC`,
       );
-      for (const row of newestFirst.iterate(qitemId) as Iterable<{ state: string; actor_session: string; transition_note: string | null }>) {
+      for (const row of newestFirst.iterate(qitemId) as Iterable<{ state: string; actor_session: string; transition_note: string | null; identity_provenance: string | null }>) {
         if (newerClosed && isBlockerLive(row.state as QueueState)) outcomeMayFollow = true;
-        if (row.actor_session === FALLBACK_ACTOR && row.transition_note?.startsWith("fallback-routed: ")) {
+        if (row.identity_provenance === null && row.actor_session === FALLBACK_ACTOR && row.transition_note?.startsWith("fallback-routed: ")) {
           note = row.transition_note;
           break;
         }

@@ -612,6 +612,35 @@ describe("queue routes", () => {
         });
       });
 
+      // The update route takes the actor and the note from the request, so a note-only update can carry both of a
+      // reroute's marks; only the reroute's own transition (written in-process, with no identity provenance) counts.
+      describe("a note-only update that carries a reroute's actor and note", () => {
+        const FORGED = { transitionNote: "fallback-routed: worker@rig \u2192 next@rig (user text)" };
+
+        it.each([
+          ["with the fallback actor", "system:queue-fallback"],
+          ["with an ordinary actor", "b@r"],
+        ])("is accepted as before and does not decide which line a fallback replaces, %s", async (_label, actor) => {
+          const qitemId = await rowIn("in-progress");
+          await post(qitemId, { ...closeWith("done"), resolution: "kept prefix\nfallback: user text" });
+          await post(qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" });
+          const forged = await post(qitemId, FORGED, actor);
+          expect(forged.status).toBe(200);
+          expect((await show(qitemId)).resolution).toBe("kept prefix\nfallback: user text");
+          queueRepo.routeToFallback(qitemId, "c@r", "next");
+          expect((await show(qitemId)).resolution).toBe("kept prefix\nfallback: user text\nfallback: next");
+        });
+
+        it("a real reroute before it is still the one found", async () => {
+          const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+          queueRepo.routeToFallback(row.qitemId, "c@r", "user text");
+          queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
+          expect((await post(row.qitemId, { transitionNote: "fallback-routed: x@r \u2192 y@r (something else)" }, "system:queue-fallback")).status).toBe(200);
+          queueRepo.routeToFallback(row.qitemId, "d@r", "next");
+          expect((await show(row.qitemId)).resolution).toBe("fallback: next");
+        });
+      });
+
       describe("when the retention archiver has moved the row's transitions", () => {
         /** Move every transition of the closed row into the archive, as the retention sweep does for an aged terminal row. */
         async function archive(qitemId: string): Promise<void> {
