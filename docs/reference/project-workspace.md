@@ -237,12 +237,12 @@ rig workflow instantiate ./spec.workflow.md \
   you set, then your `--tags`, after the tags the workflow system writes. Tags
   compose as in `rig queue create`: duplicates collapse, so `--slice S --tags
   slice:S` is one tag.
-- `--tags` is refused locally when it carries what the workflow runtime reads back to route packets:
-  `workflow`, `handoff`, `gate`, `entry`, `resume`, `re-route`,
-  `workflow-exception`, and the `workflow:`, `instance:`, `step:`,
+- `--tags` is refused locally when it carries what the workflow runtime reads
+  back to route packets: `workflow`, `handoff`, `gate`, `entry`, `resume`,
+  `re-route`, `workflow-exception`, and the `workflow:`, `instance:`, `step:`,
   `exception:`, `occurrence:` and `recovery-for:` prefixes, a `project:`,
-  `mission:` or `slice:` tag that contradicts its flag, or a second value of the
-  same key.
+  `mission:` or `slice:` tag that contradicts its flag, or a second value of
+  the same key.
 - `rig workflow instantiate-lifecycle` needs no flags: it takes the project and
   mission from the lifecycle identity it compiles. A compiled step's packets
   carry the `slice:<directory>` of the slice that step was compiled from, even
