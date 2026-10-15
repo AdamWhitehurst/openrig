@@ -51,6 +51,19 @@ describe.skipIf(process.env["OPENRIG_E2E_REAL_CODEX"] === "1")("fixture homes ar
     expect(leftovers(tmp)).toEqual([]);
   });
 
+  it("keeps os.tmpdir() as given when the package opts out, and still removes the homes", () => {
+    const { tmp, openrigHome, home, tmpdir, scratch } = runSetup({ OPENRIG_TEST_KEEP_TMPDIR: "1" });
+    // No TMPDIR of its own: a test's temp dir is made straight under the TMPDIR the run was given (it is the
+    // test's to remove, as before)...
+    expect(tmpdir).toBe(tmp);
+    expect(path.dirname(scratch)).toBe(tmp);
+    expect(fs.readdirSync(tmp).filter((name) => name.startsWith("o-"))).toEqual([]);
+    // ...but the fixture homes go with the worker.
+    expect(fs.existsSync(openrigHome)).toBe(false);
+    expect(fs.existsSync(home)).toBe(false);
+    expect(fixtureEntries(tmp)).toEqual([]);
+  });
+
   it.each(["SIGTERM", "SIGINT", "SIGHUP"] as const)("removes both homes and its TMPDIR when the worker is ended by %s, and still dies of it", async (signal) => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-home-signal-"));
     roots.push(tmp);

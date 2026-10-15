@@ -73,8 +73,12 @@ const fixtureHome =
         // The worker's own TMPDIR, so every os.tmpdir() mkdtemp a test makes lands in a directory removed with
         // the homes. The name is short on purpose: it adds 9 characters ("o-" + 6 + "/") to each such path,
         // and a Unix socket path is capped (104 bytes on macOS, where TMPDIR is already ~49 long).
-        createdTmp = fs.mkdtempSync(path.join(os.tmpdir(), "o-"));
-        process.env["TMPDIR"] = createdTmp;
+        // A package whose tests are tied to the length of the temp path (the tui's Unix socket tests) opts out with
+        // test.env OPENRIG_TEST_KEEP_TMPDIR=1 in its vitest config and keeps the TMPDIR it was given.
+        if (process.env["OPENRIG_TEST_KEEP_TMPDIR"] !== "1") {
+          createdTmp = fs.mkdtempSync(path.join(os.tmpdir(), "o-"));
+          process.env["TMPDIR"] = createdTmp;
+        }
         return h;
       })();
 // Remove the homes (and the worker TMPDIR) this process created when it ends: nothing else ever does, and a full run leaves two per
