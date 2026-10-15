@@ -62,6 +62,7 @@ for (const key of [
 // home (still fixture-scoped via the marker) so path-shape assertions hold against it.
 const existingHome = process.env["OPENRIG_HOME"];
 let createdHome: string | undefined;
+let createdTmp: string | undefined;
 const fixtureHome =
   existingHome && fs.existsSync(path.join(existingHome, ".openrig-fixture"))
     ? existingHome
@@ -69,9 +70,14 @@ const fixtureHome =
         const h = fs.mkdtempSync(path.join(os.tmpdir(), ".openrig-test-fixture-home-"));
         fs.writeFileSync(path.join(h, ".openrig-fixture"), "");
         createdHome = h;
+        // The worker's own TMPDIR, so every os.tmpdir() mkdtemp a test makes lands in a directory removed with
+        // the homes. The name is short on purpose: it adds 9 characters ("o-" + 6 + "/") to each such path,
+        // and a Unix socket path is capped (104 bytes on macOS, where TMPDIR is already ~49 long).
+        createdTmp = fs.mkdtempSync(path.join(os.tmpdir(), "o-"));
+        process.env["TMPDIR"] = createdTmp;
         return h;
       })();
-// Remove the homes this process created when it ends: nothing else ever does, and a full run leaves two per
+// Remove the homes (and the worker TMPDIR) this process created when it ends: nothing else ever does, and a full run leaves two per
 // worker (a run on 2026-10-14 left ~65,000, 6.2 GB, in the RAM-backed /tmp). A hook here, not a globalSetup
 // teardown: the homes are made inside the workers, which a teardown in the runner cannot name. Vitest ends a
 // finished worker with SIGTERM, which skips "exit" hooks, so the signals clean up too and then take their
@@ -80,10 +86,11 @@ const fixtureHome =
 // run's, is never ours to remove.
 if (createdHome) {
   const home = createdHome;
+  const tmp = createdTmp;
   const remove = () => {
     if (!fs.existsSync(path.join(home, ".openrig-fixture"))) return;
     // A failed removal (busy, permissions) must not turn a signal or a clean exit into a crash.
-    for (const dir of [home, `${home}-user-home`]) {
+    for (const dir of [home, `${home}-user-home`, ...(tmp ? [tmp] : [])]) {
       try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* leave it: the worker is ending */ }
     }
   };
