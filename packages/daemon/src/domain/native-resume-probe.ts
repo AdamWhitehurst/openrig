@@ -257,18 +257,23 @@ export function isProbeShellReady(input: ProbeShellReadyInput): boolean {
 }
 
 const AUTO_MODE_HINT = "(shift+tab to cycle)";
+const AUTO_MODE_HEAD = "⏵⏵ auto mode on";
+// Shorter than this could still be the accept-edits bar (`⏵⏵ a…`).
+const AUTO_MODE_MIN = "⏵⏵ auto";
 
-/** Claude's auto-mode footer line. A narrow pane cuts it short (`…(shift+tab to cy`), and vim mode puts
+/** Claude's auto-mode footer line. A narrow pane squeezes it: the hint is cut short (`…(shift+tab to cy`) or
+ * dropped (`⏵⏵ auto mode on      · …`), and the mode name itself can be cut (`⏵⏵ auto mode`). Vim mode puts
  * a mode marker such as `-- INSERT --` or `-- NORMAL --` ahead of it (the set `CLAUDE_MODE_FOOTER` accepts).
  * Only that mode bar is accepted: this is screen text, never identity proof. */
 function isClaudeAutoModeFooter(line: string): boolean {
-  const bar = line.trim().replace(/^-- [A-Z]+ --\s+/, "");
-  const head = "⏵⏵ auto mode on";
-  if (!bar.startsWith(head)) return false;
-  const rest = bar.slice(head.length);
-  // The hint's opening parenthesis must be there: the bare mode name is not enough to call the bar a footer.
-  if (!rest.startsWith(" (")) return false;
-  const tail = rest.slice(1).replace(/…$/, "");
+  const bar = line.trim().replace(/^-- [A-Z]+ --\s+/, "").replace(/…$/, "").trimEnd();
+  if (bar.length < AUTO_MODE_MIN.length) return false;
+  if (!bar.startsWith(AUTO_MODE_HEAD)) return `${AUTO_MODE_HEAD} ${AUTO_MODE_HINT}`.startsWith(bar);
+  const rest = bar.slice(AUTO_MODE_HEAD.length);
+  // The hint is dropped (and other segments may follow after a `·`), or it is there whole or cut short.
+  if (/^(?:\s+·.*)?$/.test(rest)) return true;
+  if (!rest.startsWith(" ")) return false;
+  const tail = rest.slice(1);
   return AUTO_MODE_HINT.startsWith(tail)
     || (tail.startsWith(AUTO_MODE_HINT) && /^(?:\s+·.*)?$/.test(tail.slice(AUTO_MODE_HINT.length)));
 }
