@@ -201,7 +201,13 @@ function missionTags(raw: string | null): string[] {
  *  mentions `A` both reach this check and are decided here. */
 function rowBindsToMission(raw: string | null, references: readonly string[]): boolean {
   const tagged = missionTags(raw);
-  return tagged.length === 0 || tagged.some((t) => references.includes(t));
+  return tagged.length === 0 || tagged.some((t) => namesMission(t, references));
+}
+
+/** Exact match, folding ASCII case the way the SQL LIKE that selects candidates does. */
+function namesMission(tag: string, references: readonly string[]): boolean {
+  const fold = (value: string): string => value.replace(/[A-Z]/g, (c) => c.toLowerCase());
+  return references.some((reference) => fold(reference) === fold(tag));
 }
 
 interface SliceFacts {
@@ -608,7 +614,7 @@ function readWaveMap(db: Database.Database, missions: string[], project?: string
         ORDER BY ts_created DESC`,
     )
     .all(...missions.map((mission) => `%mission:${mission}%`)) as Array<{ qitem_id: string; body: string | null; tags: string | null }>;
-  const selectedRow = row.find(r => missionTags(r.tags).some((t) => missions.includes(t)) && (!project || belongsToProject(r.tags, project)));
+  const selectedRow = row.find(r => missionTags(r.tags).some((t) => namesMission(t, missions)) && (!project || belongsToProject(r.tags, project)));
   if (!selectedRow?.body) return { rowId: INDETERMINATE, waves: [] };
   const block = selectedRow.body.match(WAVE_MAP_BLOCK);
   if (!block) return { rowId: INDETERMINATE, waves: [] };

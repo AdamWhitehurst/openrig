@@ -379,6 +379,18 @@ describe("execution view — S27 (OPR.0.5.6.27)", () => {
       expect(await laneIds()).toContain("qitem-id-form");
     });
 
+    it("matches the mission tag with ASCII case folded, as the selecting LIKE does", async () => {
+      addRow("qitem-cased", [`mission:${MISSION.toUpperCase()}`, "slice:OPR.9.9.33"], "Tag written in upper case.");
+      expect(await laneIds()).toContain("qitem-cased");
+    });
+
+    it("binds a row tagged with two missions to both, because it names both", async () => {
+      addRow("qitem-two-missions", [`mission:${MISSION}`, "mission:other-mission", "slice:OPR.9.9.33"], "Names two missions.");
+      expect(await laneIds()).toContain("qitem-two-missions");
+      const other = (await projector.show("execution", { mission: "other-mission" })).rows[0] as Record<string, unknown>;
+      expect((other.q1_lanes as Record<string, unknown>[]).map((l) => l.qitem_id)).toContain("qitem-two-missions");
+    });
+
     it("does not let another mission's wave-map row replace this mission's", async () => {
       db.prepare(
         `INSERT INTO queue_items (qitem_id, ts_created, ts_updated, source_session, destination_session, state, priority, tier, tags, body)
