@@ -263,7 +263,8 @@ const AUTO_MODE_MIN = "⏵⏵ auto";
 
 /** Claude's auto-mode footer line. A narrow pane squeezes it: the hint is cut short (`…(shift+tab to cy`) or
  * dropped (`⏵⏵ auto mode on      · …`), and the mode name itself can be cut (`⏵⏵ auto mode`). Vim mode puts
- * a mode marker such as `-- INSERT --` or `-- NORMAL --` ahead of it (the set `CLAUDE_MODE_FOOTER` accepts).
+ * a mode marker such as `-- INSERT --` or `-- NORMAL --` ahead of it (`VIM_MARKER`, the same set as `CLAUDE_MODE_FOOTER`
+ * in session-transport.ts).
  * Only that mode bar is accepted: this is screen text, never identity proof. */
 function isClaudeAutoModeFooter(line: string): boolean {
   const bar = line.trim().replace(VIM_MARKER, "").replace(/…$/, "").trimEnd();
