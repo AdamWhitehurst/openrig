@@ -718,17 +718,10 @@ export async function buildExecutionView(deps: ExecutionViewDeps, opts?: { missi
     if (matches.length === 1) mission = matches[0]!.dir;
   }
   if (mission === INDETERMINATE && missionsRoot) {
-    // In-progress rows pick the mission first. Only when none does, a row parked
-    // on an `external:` gate picks it, so a mission whose only live rows are
-    // waiting lanes does not lose the default view to a newer planned release.
     const active = deps.db
       .prepare(`SELECT tags, body FROM queue_items WHERE state = 'in-progress' ORDER BY ts_updated DESC`)
       .all() as Array<{ tags: string | null; body: string | null }>;
-    const waiting = (deps.db
-      .prepare(`SELECT tags, body, blocked_on FROM queue_items WHERE state = 'blocked' ORDER BY ts_updated DESC`)
-      .all() as Array<{ tags: string | null; body: string | null; blocked_on: string | null }>)
-      .filter((row) => isTypedGateBlocker(row.blocked_on) && row.blocked_on!.startsWith("external:"));
-    for (const row of [...active, ...waiting]) {
+    for (const row of active) {
       if (opts?.project && !belongsToProject(row.tags, opts.project)) continue;
       const tag = parseTags(row.tags).find((value) => value.startsWith("mission:"));
       // Canonical tags win; the conventional handoff line keeps older/body-only batons visible.
