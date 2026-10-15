@@ -31,6 +31,9 @@ const STARTUP_SUBMIT_CAPTURE_LINES = 200;
 // still showed that paste collapsed. Only that transient is looked at again, 200 ms apart, up to this many
 // times: about 5 s of waiting per send, plus capture time. Nothing is typed meanwhile.
 const STARTUP_SUBMIT_SETTLE_LOOKS = 25;
+// A prompt still staged after a guarded retry is retried again, up to this many retries in all, each after
+// the 200 ms look. Every retry is guarded: Enter goes in only while the composer holds exactly the text we typed.
+const STARTUP_SUBMIT_RETRIES = 2;
 
 /** Pending context belongs to this occupant and is consumed before delivery starts. */
 export function hasPendingFreshStartup(db: Database.Database, nodeId: string, sessionId: string): boolean {
@@ -971,21 +974,28 @@ export class StartupOrchestrator {
           ? "Startup submission is unverified: the current composer boundary was not recognized."
           : "Startup submission is unverified: the current composer does not positively match the complete prompt.");
       }
-      phase = "guarded_retry";
-      diagnostic.retry = "threw"; // Replaced when the transport returns normally.
-      const retry = await this.sessionTransport.send(tmuxSession, "", {
-        submitOnly: true,
-        expectedStagedText: text,
-        submitOnlyCaptureLines: STARTUP_SUBMIT_CAPTURE_LINES,
-        requireFullStagedText: true,
-        onStartupMismatch: (evidence) => { diagnostic.observations.push({ ...evidence, phase: "guarded_retry" }); },
-      });
-      diagnostic.retry = retry.ok ? "ok" : "refused_or_failed";
-      phase = "after_retry";
-      await this.sleep(200);
-      const after = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES);
-      if (!after?.trim()) { record(after); return unverified("Startup submission capture is unavailable after the guarded retry."); }
-      const observed = inspectStartupStagedText(after, text, input.adapter.runtime);
+      let retry: Awaited<ReturnType<SessionTransport["send"]>>;
+      let after: string | null;
+      let observed: ReturnType<typeof inspectStartupStagedText>;
+      let retries = 0;
+      do {
+        phase = "guarded_retry";
+        diagnostic.retry = "threw"; // Replaced when the transport returns normally.
+        retry = await this.sessionTransport.send(tmuxSession, "", {
+          submitOnly: true,
+          expectedStagedText: text,
+          submitOnlyCaptureLines: STARTUP_SUBMIT_CAPTURE_LINES,
+          requireFullStagedText: true,
+          onStartupMismatch: (evidence) => { diagnostic.observations.push({ ...evidence, phase: "guarded_retry" }); },
+        });
+        diagnostic.retry = retry.ok ? "ok" : "refused_or_failed";
+        phase = "after_retry";
+        await this.sleep(200);
+        after = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES);
+        if (!after?.trim()) { record(after); return unverified("Startup submission capture is unavailable after the guarded retry."); }
+        observed = inspectStartupStagedText(after, text, input.adapter.runtime);
+        // A refused retry is not repeated; only a retry whose Enter went in and was lost again is.
+      } while (observed === "staged" && retry.ok && ++retries < STARTUP_SUBMIT_RETRIES);
       if (observed === "staged") {
         const warning = `Startup prompt still staged in ${tmuxSession}; press Enter in that pane.`;
         input.stagedSubmissionWarning = warning;

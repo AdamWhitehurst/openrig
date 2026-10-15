@@ -291,6 +291,56 @@ describe("queue routes", () => {
     expect(job).toMatchObject({ target_session: "b@r", interval_seconds: 45, state: "active" });
   });
 
+  describe("GET /:qitemId closing transition", () => {
+    const update = (qitemId: string, body: Record<string, unknown>) => app.request(`/api/queue/${qitemId}/update`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+      body: JSON.stringify(body),
+    });
+    const show = async (qitemId: string) => (await app.request(`/api/queue/${qitemId}`)).json() as Promise<Record<string, any>>;
+
+    it("a closed row carries the transition that closed it: state, reason, actor, time and note", async () => {
+      const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+      queueRepo.claim({ qitemId: row.qitemId, destinationSession: "b@r" });
+      expect((await update(row.qitemId, { state: "done", closureReason: "no-follow-on", transitionNote: "shipped it" })).status).toBe(200);
+      const closing = (await show(row.qitemId)).closingTransition;
+      expect(closing).toMatchObject({ state: "done", closureReason: "no-follow-on", closureTarget: null, actorSession: "b@r", transitionNote: "shipped it" });
+      expect(Number.isNaN(Date.parse(closing.ts))).toBe(false);
+    });
+
+    it("a later note on the closed row does not replace the closing note", async () => {
+      const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+      queueRepo.claim({ qitemId: row.qitemId, destinationSession: "b@r" });
+      await update(row.qitemId, { state: "done", closureReason: "no-follow-on", transitionNote: "the report" });
+      expect((await update(row.qitemId, { transitionNote: "afterthought" })).status).toBe(200);
+      expect((await show(row.qitemId)).closingTransition).toMatchObject({ closureReason: "no-follow-on", transitionNote: "the report" });
+    });
+
+    it("a canceled row carries its note even with no closure reason", async () => {
+      const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+      expect((await update(row.qitemId, { state: "canceled", transitionNote: "no longer needed" })).status).toBe(200);
+      expect((await show(row.qitemId)).closingTransition).toMatchObject({ state: "canceled", closureReason: null, transitionNote: "no longer needed" });
+    });
+
+    it.each(["pending", "in-progress", "blocked"])("a %s row has no closing block", async (state) => {
+      const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+      if (state !== "pending") queueRepo.claim({ qitemId: row.qitemId, destinationSession: "b@r" });
+      if (state === "blocked") await update(row.qitemId, { state: "blocked", blockedOn: "external:x", transitionNote: "continuation: wait", wakeAfterSeconds: 60 });
+      const item = await show(row.qitemId);
+      expect(item.state).toBe(state);
+      expect(item).not.toHaveProperty("closingTransition");
+    });
+
+    it("a reopened row has no closing block until it closes again", async () => {
+      const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+      queueRepo.claim({ qitemId: row.qitemId, destinationSession: "b@r" });
+      await update(row.qitemId, { state: "done", closureReason: "no-follow-on", transitionNote: "first close" });
+      expect((await update(row.qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" })).status).toBe(200);
+      expect(await show(row.qitemId)).not.toHaveProperty("closingTransition");
+      await update(row.qitemId, { state: "done", closureReason: "no-follow-on", transitionNote: "second close" });
+      expect((await show(row.qitemId)).closingTransition).toMatchObject({ transitionNote: "second close" });
+    });
+  });
+
   // 0.5.1-54 DR-1 — the create-path failed-nudge surface (the NAMED, human/agent-visible read path).
   it("DR-1: GET /undelivered surfaces the failed-nudge pending strand, V1-only", async () => {
     const failed = await queueRepo.create({ sourceSession: "a@rig", destinationSession: "b@rig", body: "x" });

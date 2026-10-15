@@ -1101,8 +1101,19 @@ export function queueRoutes(): Hono {
     // person's alias from its spelling (there may be no wake result yet, e.g. --no-nudge).
     // The owner notification level is what the Slack selector keys on: a registered person who
     // is also a seat with a pane is pane-bound, yet the gateway may still post the row to them.
+    const closing = repo.closingTransition(qitemId, item.state);
     return c.json({
       ...item,
+      // A closed row's outcome (its note and reason) lives only in the transition log; omitted while the row is open.
+      ...(closing ? { closingTransition: {
+        transitionId: closing.transitionId,
+        ts: closing.ts,
+        state: closing.state,
+        closureReason: closing.closureReason,
+        closureTarget: closing.closureTarget,
+        actorSession: closing.actorSession,
+        transitionNote: closing.transitionNote,
+      } } : {}),
       destinationClass: repo.classifyDestinationOf(item.destinationSession).class,
       ownerNotificationLevel: repo.transitionLog.latestOwnerNotificationForQitem(qitemId)?.ownerNotificationLevel ?? null,
     });
