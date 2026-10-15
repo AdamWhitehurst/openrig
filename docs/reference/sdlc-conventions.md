@@ -160,10 +160,12 @@ Part B or add a mandatory review gate.
 The project readiness that `rig proof show --project` reports counts only
 missions whose `mission.yaml` carries `metadata.status: active` or
 `metadata.status: release-candidate`. `rig scope mission create` writes
-`active`, including for a release mission, so a new mission counts from the
-start. Change it to `release-candidate` when a release is ready to judge, or to
-any other value (for example `paused`) to leave the mission out of the rollup.
-Missions created before this default carry no status; add the line by hand to
+`metadata.status: planned`, for ordinary and release missions alike, so creating
+a mission does not change the project's readiness. A `planned` mission stays
+outside the rollup, even after its slices are accepted, until someone changes
+its status to `active` (or `release-candidate` for a release that is ready to
+judge). Nothing changes the status automatically. Missions created before this
+default carry no status and are not counted either; add the line by hand to
 include them.
 
 The three sections project into the UI's one review structure: a vertical

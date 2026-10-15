@@ -14,7 +14,7 @@ import YAML from "yaml";
 
 import { scopeCommand } from "../src/commands/scope.js";
 import { readFrontmatter } from "../src/lib/scope/scope-fs.js";
-import { readProjectReadiness, recordJudgment } from "../../daemon/src/domain/proof/judgments.js";
+import { readMissionReadiness, readProjectReadiness, readSliceReadiness, recordJudgment } from "../../daemon/src/domain/proof/judgments.js";
 
 function mktemp(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "rig-scope-cmd-"));
@@ -782,23 +782,23 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
     expect(JSON.parse(r.stdout).ok).toBe(false);
   });
 
-  it("seeds metadata.status: active so the mission counts toward the project rollup", async () => {
+  it("seeds metadata.status: planned so a new mission stays outside the project rollup", async () => {
     const r = await run(["mission", "create", "experiments-foo", "--json"], env.missionsRoot);
     expect(r.exitCode).toBe(0);
     const manifest = YAML.parse(
       fs.readFileSync(path.join(JSON.parse(r.stdout).mission.path, "mission.yaml"), "utf8"),
     ) as { metadata?: { status?: string }; composition: { slices: unknown[] } };
-    expect(manifest.metadata?.status).toBe("active");
+    expect(manifest.metadata?.status).toBe("planned");
     expect(manifest.composition.slices).toEqual([]);
   });
 
-  it("seeds active for the release template too, since an in-progress release is not yet a candidate", async () => {
+  it("seeds planned for the release template too", async () => {
     const r = await run(["mission", "create", "release-0.6.0", "--json"], env.missionsRoot);
     expect(JSON.parse(r.stdout).mission.template).toBe("release");
     const manifest = YAML.parse(
       fs.readFileSync(path.join(JSON.parse(r.stdout).mission.path, "mission.yaml"), "utf8"),
     ) as { metadata?: { status?: string } };
-    expect(manifest.metadata?.status).toBe("active");
+    expect(manifest.metadata?.status).toBe("planned");
   });
 
   it("keeps metadata.status when a slice is later added to the mission", async () => {
@@ -809,23 +809,29 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
       fs.readFileSync(path.join(env.missionsRoot, "experiments-foo", "mission.yaml"), "utf8"),
     ) as { metadata?: { status?: string }; composition: { slices: unknown[] } };
     expect(manifest.composition.slices).toHaveLength(1);
-    expect(manifest.metadata?.status).toBe("active");
+    expect(manifest.metadata?.status).toBe("planned");
   });
 
-  it("a freshly created mission whose only item is accepted makes the project read ready", async () => {
-    // Fresh project root so the pre-existing fixture missions (no manifest) stay out of the rollup.
-    const root = mktemp();
-    try {
-      const missions = path.join(root, "missions");
-      writeFile(path.join(root, "project.yaml"), YAML.stringify({
+  describe("project readiness", () => {
+    let project: string;
+    let missions: string;
+    beforeEach(() => {
+      project = mktemp();
+      missions = path.join(project, "missions");
+      writeFile(path.join(project, "project.yaml"), YAML.stringify({
         kind: "project",
         metadata: { id: "trial" },
         proofPolicy: { judges: ["judge@trial"] },
         missions: { root: "missions" },
       }));
       fs.mkdirSync(missions, { recursive: true });
-      expect((await run(["mission", "create", "trial", "--json"], missions)).exitCode).toBe(0);
-      const sliceRun = await run(["slice", "create", "trial", "only", "--json"], missions);
+    });
+    afterEach(() => { fs.rmSync(project, { recursive: true, force: true }); });
+
+    /** Create a mission with one slice whose only item is accepted; returns the mission dir. */
+    async function missionWithAcceptedSlice(name: string): Promise<string> {
+      expect((await run(["mission", "create", name, "--json"], missions)).exitCode).toBe(0);
+      const sliceRun = await run(["slice", "create", name, "only", "--json"], missions);
       expect(sliceRun.exitCode).toBe(0);
       const sliceDir = JSON.parse(sliceRun.stdout).slice.path as string;
       writeFile(
@@ -833,12 +839,9 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
         `---\nid: only\nstatus: done\n---\n# only\n\n## Proof contract\n- [x] Prove it.\n`,
       );
       writeFile(path.join(sliceDir, "proof", "evidence.md"), "Observed outcome.\n");
-      const scope = `trial/slices/${path.basename(sliceDir)}`;
-      expect(readProjectReadiness(missions).state).toBe("not-ready");
-      const { readSliceReadiness } = await import("../../daemon/src/domain/proof/judgments.js");
       const item = readSliceReadiness(sliceDir).items[0]!;
       recordJudgment(missions, {
-        scope,
+        scope: `${name}/slices/${path.basename(sliceDir)}`,
         item: item.id,
         verdict: "accept",
         reason: "Independent accept judgment",
@@ -846,10 +849,36 @@ describe("rig scope mission create (HG-14 + HG-15)", () => {
         expectedRevision: item.revision,
         expectedPrevious: null,
       }, "judge@trial", "transport:v1");
-      expect(readProjectReadiness(missions).state).toBe("ready");
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
+      return path.join(missions, name);
     }
+
+    function setStatus(missionDir: string, status: string): void {
+      const manifestPath = path.join(missionDir, "mission.yaml");
+      const doc = YAML.parseDocument(fs.readFileSync(manifestPath, "utf8"));
+      doc.setIn(["metadata", "status"], status);
+      fs.writeFileSync(manifestPath, String(doc), "utf8");
+    }
+
+    it("a ready project stays ready after creating an empty ordinary mission and an empty release mission", async () => {
+      const existing = await missionWithAcceptedSlice("existing");
+      setStatus(existing, "active");
+      expect(readProjectReadiness(missions).state).toBe("ready");
+
+      expect((await run(["mission", "create", "experiments-foo", "--json"], missions)).exitCode).toBe(0);
+      expect(readProjectReadiness(missions).state).toBe("ready");
+      expect((await run(["mission", "create", "release-0.6.0", "--json"], missions)).exitCode).toBe(0);
+      expect(readProjectReadiness(missions).state).toBe("ready");
+    });
+
+    it("a planned mission is not counted after its slices are accepted, and is once set to active", async () => {
+      const created = await missionWithAcceptedSlice("trial");
+      expect(readMissionReadiness(created).state).toBe("ready");
+      expect(readMissionReadiness(created).historicalStatus).toBe("planned");
+      // Not counted: no active mission, so the project is not ready.
+      expect(readProjectReadiness(missions).state).toBe("not-ready");
+      setStatus(created, "active");
+      expect(readProjectReadiness(missions).state).toBe("ready");
+    });
   });
 
   it("mission create auto-scaffolds NOTES.md with placeholders substituted", async () => {
