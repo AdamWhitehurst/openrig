@@ -91,8 +91,7 @@ describe("SeatHandoverService source execution (OPR.0.5.5.5)", () => {
   });
 
   function tmux(): TmuxAdapter {
-    return { hasSession, createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, sendText, sendKeys, capturePaneScreen, getDefaultShell, getPaneCommand,
-      getSessionEnv: async () => undefined, setSessionEnv: async () => {}, unsetSessionEnv: async () => {} } as unknown as TmuxAdapter;
+    return { hasSession, createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, sendText, sendKeys, capturePaneScreen, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
   }
 
   function codexAdapter(): RuntimeAdapter {

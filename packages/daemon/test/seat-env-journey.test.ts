@@ -30,6 +30,8 @@ function mockTmux() {
   return {
     createSession: vi.fn(async (_name: string, _cwd?: string, _env?: Record<string, string>) => ({ ok: true as const })),
     killSession: vi.fn(async () => ({ ok: true as const })),
+    setSessionEnv: vi.fn(async (_session: string, _key: string, _value: string) => {}),
+    unsetSessionEnv: vi.fn(async (_session: string, _key: string) => {}),
     sendText: vi.fn(async () => ({ ok: true as const })),
     sendKeys: vi.fn(async () => ({ ok: true as const })),
     hasSession: vi.fn(async () => true),
@@ -168,6 +170,15 @@ describe("env: reaches the seats from a rig spec", () => {
     await launch(f, { env: { SHARED: "from-flag", EXTRA: "1" } });
     expect(envOf(f, "dev-impl")).toMatchObject({ SHARED: "from-flag", MEMBER_ONLY: "member", EXTRA: "1" });
     expect(envOf(f, "dev-plain")).toMatchObject({ SHARED: "from-flag", EXTRA: "1" });
+    // The session environment is put back as soon as each first pane exists, so a later pane starts from the spec.
+    expect(f.tmux.setSessionEnv.mock.calls.map(([s, k, v]) => [s, k, v]).sort()).toEqual([
+      ["dev-impl@env-journey", "SHARED", "from-member"],
+      ["dev-plain@env-journey", "SHARED", "from-rig"],
+    ]);
+    expect(f.tmux.unsetSessionEnv.mock.calls.map(([s, k]) => [s, k]).sort()).toEqual([
+      ["dev-impl@env-journey", "EXTRA"],
+      ["dev-plain@env-journey", "EXTRA"],
+    ]);
     f.db.close();
   });
 

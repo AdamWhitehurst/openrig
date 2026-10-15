@@ -93,8 +93,7 @@ describe("SeatHandoverService", () => {
   });
 
   function tmux(): TmuxAdapter {
-    return { hasSession, createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, sendText, sendKeys, capturePaneScreen, getDefaultShell, getPaneCommand,
-      getSessionEnv: async () => undefined, setSessionEnv: async () => {}, unsetSessionEnv: async () => {} } as unknown as TmuxAdapter;
+    return { hasSession, createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, sendText, sendKeys, capturePaneScreen, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
   }
 
   function codexAdapter(): RuntimeAdapter {
@@ -997,7 +996,6 @@ describe("SeatHandoverService", () => {
     ]);
     vi.spyOn(adapter, "setRemainOnExit").mockResolvedValue({ ok: false, code: "no_server", message: "no server running" });
     vi.spyOn(adapter, "signalPaneProcess").mockResolvedValue({ ok: true });
-    vi.spyOn(adapter, "getSessionEnv").mockResolvedValue(undefined); // this seat declared no env, so there is nothing to reset
     vi.spyOn(adapter, "respawnPane").mockImplementation(async () => {
       expect(store.readCurrent(node.id)).toBeNull();
       return { ok: false, code: "no_server", message: "no server running" };
