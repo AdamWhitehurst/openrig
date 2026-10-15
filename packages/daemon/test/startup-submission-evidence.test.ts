@@ -112,3 +112,25 @@ describe("composer footers seen on healthy launches", () => {
     expect(inspectStartupStagedText(composer("", footer), expected)).toBe("unverified");
   });
 });
+
+describe("a rule and a mode-bar line inside the prompt text", () => {
+  // The prompt starts with a newline, then a rule, then a line that begins like a mode bar. Claude shows the text
+  // as typed, so these two lines sit inside the composer, above its real closing rule.
+  const prompt = "\n──────────\n⏵⏵ not a mode bar, part of the prompt";
+  const pane = (footer: string) => `❯ ${prompt}\n────────────────────\n  ${footer}\n`;
+
+  it.each(["? for shortcuts", "paste again to expand", "⏵⏵ accept edits on (shift+tab to cycle)", "-- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)"])(
+    "still reads the prompt as staged under the recognized footer %s", footer => {
+      expect(inspectStartupStagedText(pane(footer), prompt)).toBe("staged");
+    });
+
+  it.each(["-- NORMAL --", "Working…", "some other footer"])("stays unverified, never clear, under the unrecognized footer %j", footer => {
+    expect(inspectStartupStagedText(pane(footer), prompt)).toBe("unverified");
+  });
+
+  it("does not take a rule in the prompt for the closing rule when a mode-bar line follows it", () => {
+    const text = "first\n──────────\n⏸ plan mode on\nlast";
+    const frame = `❯ ${text}\n────────────────────\n  -- NORMAL --\n`;
+    expect(inspectStartupStagedText(frame, text)).toBe("unverified");
+  });
+});

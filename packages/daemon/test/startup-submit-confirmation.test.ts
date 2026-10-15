@@ -346,6 +346,32 @@ describe("startup prompt submission", () => {
     expect(f.tmux.sendKeys).toHaveBeenCalledTimes(1);
   });
 
+  // A startup prompt can contain a rule and then a line that begins like a mode bar. Those lines sit inside the composer,
+  // so they are not its closing rule, and a prompt that is still staged must not read as submitted.
+  describe("a rule and a mode-bar line inside the startup prompt text", () => {
+    const text = "\n──────────\n⏵⏵ not a mode bar, part of the prompt";
+    const startWith = async (footer: string) => {
+      const f = fixture(Infinity);
+      f.tmux.capturePaneContent.mockImplementation(async () => `Previous turn\n❯ ${f.composer()}\n────────────────────\n  ${footer}\n`);
+      const result = await f.start({ resolvedStartupFiles: [],
+        startupActions: [{ type: "send_text", value: text, phase: "after_ready", appliesOn: ["fresh_start"], idempotent: true }] });
+      return { f, result };
+    };
+
+    it("warns that the prompt is still staged under a footer the check recognises", async () => {
+      const { f, result } = await startWith("? for shortcuts");
+      expect(result).toMatchObject({ ok: true, startupStatus: "ready", submission: { status: "staged", warning: expect.stringContaining("press Enter in that pane") } });
+      expect(f.submitted).toEqual([]);
+    });
+
+    it("keeps the warning, as unverified, under a footer it does not recognise", async () => {
+      const { f, result } = await startWith("-- NORMAL --");
+      expect(result).toMatchObject({ ok: true, startupStatus: "ready", submission: { status: "unverified" } });
+      expect(result.warnings).toEqual(expect.arrayContaining([expect.stringContaining("Startup submission unverified")]));
+      expect(f.submitted).toEqual([]);
+    });
+  });
+
   // The Claude proof line follows only a startup prompt observed as submitted; it is never typed onto
   // pending input (controls from review50-r2's review of #719).
   const proofActions = (identity: boolean): StartupInput["startupActions"] => [

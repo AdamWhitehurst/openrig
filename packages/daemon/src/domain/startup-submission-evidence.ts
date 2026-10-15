@@ -30,13 +30,14 @@ export function composerRegion(pane: string | null, runtime: string | null = nul
   const inputAt = findComposerInputLineIndex(lines, promptClass);
   let end = -1;
   if (inputAt >= 0) {
-    // Prompt text can itself contain rules (the startup challenge does).
+    // Prompt text can itself contain rules (the startup challenge does), and a rule in the prompt can be followed by a
+    // line that looks like a mode bar. The composer's closing rule is the last rule on the screen: only the footer
+    // lines come after it. An unrecognized footer under it leaves the region unverified rather than falling back to
+    // a rule inside the prompt.
     for (let i = lines.length - 1; i > inputAt; i--) {
-      if (/^[─═-]{10,}$/.test(lines[i]!.trim())
-        && isComposerFooter((lines.slice(i + 1).find((next) => next.trim()) ?? "").trim())) {
-        end = i;
-        break;
-      }
+      if (!/^[─═-]{10,}$/.test(lines[i]!.trim())) continue;
+      if (isComposerFooter((lines.slice(i + 1).find((next) => next.trim()) ?? "").trim())) end = i;
+      break;
     }
   }
   const body = inputAt < 0 || end < 0 || composerPromptIsAmbiguous(lines, inputAt, promptClass)
