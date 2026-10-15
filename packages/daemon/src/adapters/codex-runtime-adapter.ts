@@ -115,6 +115,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
   private resolveGitAddDirs: CodexGitAddDirResolver;
   private prepareTeamWorkspace?: PrepareCodexTeamWorkspace;
   private resolveManagedConfigSettings?: () => Promise<{ enabled: boolean; codexVersion?: string }>;
+  private resolveHooksEnabled?: () => Promise<boolean>;
   // OPR.0.4.1.10 FR-B — absolute path to the daemon's own shipped activity-relay.cjs,
   // resolved by startup from import.meta.dirname. Used by ensureCodexActivityHooks
   // (FR-A) to write config-layer [hooks] command entries that are cwd-independent and
@@ -141,9 +142,12 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     prepareTeamWorkspace?: PrepareCodexTeamWorkspace;
     /** Resolves the hooks setting and Codex version that ensureManagedConfig applies. Absent: no managed config write. */
     resolveManagedConfigSettings?: () => Promise<{ enabled: boolean; codexVersion?: string }>;
+    /** Whether runtime.codex.hooks_enabled is on, without resolving the Codex version. Absent: nothing is stripped. */
+    resolveHooksEnabled?: () => Promise<boolean>;
   }) {
     this.tmux = deps.tmux;
     this.resolveManagedConfigSettings = deps.resolveManagedConfigSettings;
+    this.resolveHooksEnabled = deps.resolveHooksEnabled;
     this.prepareTeamWorkspace = deps.prepareTeamWorkspace;
     this.seatLaunchEnvironment = deps.seatLaunchEnvironment;
     this.fs = deps.fsOps;
@@ -175,6 +179,22 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       this.ensureCodexFeatureFlag(enabled, { codexVersion });
       if (enabled) this.ensureCodexActivityHooks();
       else this.removeCodexActivityHooks();
+    } catch (err) {
+      console.error(`[openrig] runtime setup warning: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Boot step for a daemon without Codex seats: when runtime.codex.hooks_enabled is false,
+   * strip OpenRig's managed hooks block, as every boot did before. Removal writes only when
+   * the block is present, so a config without it stays byte-identical, and with hooks enabled
+   * nothing is touched. Without this an operator with no Codex seat has no OpenRig way to
+   * remove a stale block. A failure warns.
+   */
+  async stripManagedHooksIfDisabled(): Promise<void> {
+    if (!this.resolveHooksEnabled) return;
+    try {
+      if (!(await this.resolveHooksEnabled())) this.removeCodexActivityHooks();
     } catch (err) {
       console.error(`[openrig] runtime setup warning: ${(err as Error).message}`);
     }

@@ -22,12 +22,12 @@ function fixture() {
   return { root, home, codexHome, cwd, config, env };
 }
 
-async function startDaemon(f: ReturnType<typeof fixture>) {
+async function startDaemon(f: ReturnType<typeof fixture>, hooksEnabled = true) {
   vi.resetModules();
   vi.spyOn(os, "homedir").mockReturnValue(f.home);
   for (const [k, v] of Object.entries(f.env)) vi.stubEnv(k, v);
   vi.stubEnv("OPENRIG_DB", path.join(f.root, "instance.sqlite")); vi.stubEnv("OPENRIG_NO_KERNEL", "1");
-  vi.stubEnv("OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED", "true"); vi.stubEnv("OPENRIG_URL", undefined); vi.stubEnv("OPENRIG_PORT", undefined);
+  vi.stubEnv("OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED", String(hooksEnabled)); vi.stubEnv("OPENRIG_URL", undefined); vi.stubEnv("OPENRIG_PORT", undefined);
   const { createDaemon } = await import("../src/startup.js");
   return createDaemon({ dbPath: process.env.OPENRIG_DB!, tmuxExec: async () => "", cmuxFactory: async () => { throw Error("fixture: no cmux"); } });
 }
@@ -47,6 +47,41 @@ it("a daemon with no Codex seat does not create config.toml", async () => {
   const f = fixture();
   const daemon = await startDaemon(f);
   try { expect(fs.existsSync(f.config)).toBe(false); } finally { daemon.db.close(); }
+}, 60000);
+
+it("a daemon with no Codex seat and hooks enabled leaves a block an earlier daemon wrote as it was", async () => {
+  const f = fixture(); fs.writeFileSync(f.config, USER_CONFIG);
+  await launchableAdapter(f, true).ensureManagedConfig();
+  const written = fs.readFileSync(f.config);
+  expect(written.toString()).toContain(HOOKS_BLOCK);
+  const daemon = await startDaemon(f);
+  try { expect(fs.readFileSync(f.config)).toEqual(written); } finally { daemon.db.close(); }
+}, 60000);
+
+it("a daemon with no Codex seat and hooks disabled strips a stale managed block at boot", async () => {
+  const f = fixture(); fs.writeFileSync(f.config, USER_CONFIG);
+  await launchableAdapter(f, true).ensureManagedConfig();
+  expect(fs.readFileSync(f.config, "utf8")).toContain(HOOKS_BLOCK);
+  const daemon = await startDaemon(f, false);
+  try {
+    expect(daemon.db.prepare("SELECT count(*) AS n FROM nodes WHERE runtime = 'codex'").get()).toEqual({ n: 0 });
+    const text = fs.readFileSync(f.config, "utf8");
+    expect(text).not.toContain(HOOKS_BLOCK);
+    expect(text).toContain(USER_CONFIG);
+  } finally { daemon.db.close(); }
+}, 60000);
+
+it("a daemon with no Codex seat and hooks disabled leaves a config without the block byte-identical, or absent", async () => {
+  const f = fixture(); fs.writeFileSync(f.config, USER_CONFIG);
+  const before = fs.statSync(f.config).mtimeMs;
+  const daemon = await startDaemon(f, false);
+  try {
+    expect(fs.readFileSync(f.config, "utf8")).toBe(USER_CONFIG);
+    expect(fs.statSync(f.config).mtimeMs).toBe(before);
+  } finally { daemon.db.close(); }
+  const g = fixture();
+  const other = await startDaemon(g, false);
+  try { expect(fs.existsSync(g.config)).toBe(false); } finally { other.db.close(); }
 }, 60000);
 
 it("a daemon that boots with a Codex seat still writes the hooks block and trust", async () => {

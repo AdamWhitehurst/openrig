@@ -135,12 +135,7 @@ it("seatless startup, disable and projection preserve the other home's bytes; st
   vi.stubEnv('OPENRIG_RUNTIME_CODEX_HOOKS_ENABLED', 'false');
   const second = await start();
   try {
-    const selectedConfig = path.join(f.selected, 'config.toml'), written = fs.readFileSync(selectedConfig);
-    expect(written.toString()).toContain('# BEGIN OPENRIG MANAGED ACTIVITY HOOKS');
-    // A daemon without Codex seats leaves a block it finds untouched; the next launch honours the disable.
-    expect(fs.readFileSync(selectedConfig)).toEqual(written);
-    await (second.deps.runtimeAdapters!.codex as CodexRuntimeAdapter).ensureManagedConfig();
-    expect(fs.readFileSync(selectedConfig, 'utf8')).not.toContain('# BEGIN OPENRIG MANAGED ACTIVITY HOOKS');
+    expect(fs.readFileSync(path.join(f.selected, 'config.toml'), 'utf8')).not.toContain('# BEGIN OPENRIG MANAGED ACTIVITY HOOKS');
     expect(fs.readFileSync(f.firstConfig)).toEqual(before);
     expect(fs.readdirSync(path.join(f.home, '.codex')).sort()).toEqual(['config.toml', 'history.jsonl']);
     expect(fs.readFileSync(path.join(f.home, '.codex/history.jsonl'), 'utf8')).toBe('{"fixture":"first-home"}\n');
