@@ -1836,6 +1836,65 @@ describe("rig queue CLI", () => {
       expect(calls.find((c) => c.path === "/api/queue/qitem-x/update")?.body).toMatchObject({ state: "done", resolution: "Fixed in #42" });
     });
 
+    it.each([
+      ["canceled", []],
+      ["denied", []],
+      ["failed", []],
+      ["handed-off", ["--closure-reason", "handed_off_to", "--closure-target", "next@rig"]],
+    ])("update --state %s --resolution posts the text, kept as typed", async (state, extra) => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", "--state", state, ...extra, "--resolution", "  two\nlines \u2713 "]);
+      expect(calls.find((c) => c.path === "/api/queue/qitem-x/update")?.body).toMatchObject({ state, resolution: "  two\nlines \u2713 " });
+      expect(process.exitCode).toBeUndefined();
+    });
+
+    it.each([
+      ["no --state", ["--resolution", "Fixed"]],
+      ["a note only", ["--note", "n", "--resolution", "Fixed"]],
+      ["--state in-progress", ["--state", "in-progress", "--resolution", "Fixed"]],
+      ["--state pending", ["--state", "pending", "--resolution", "Fixed"]],
+      ["--state blocked", ["--state", "blocked", "--blocked-on", "external:x", "--wake-after", "1h", "--resolution", "Fixed"]],
+    ])("update --resolution with %s is a usage error before anything is sent", async (_label, args) => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", ...args]);
+      expect(calls).toEqual([]);
+      expect(process.exitCode).toBe(1);
+      expect(errors.join("\n")).toContain("--resolution");
+      expect(errors.join("\n")).toContain("done, canceled, denied, failed or handed-off");
+    });
+
+    it.each([[""], ["   "], ["\n\t"]])("update --state done --resolution %j is a usage error before anything is sent", async (text) => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", "--state", "done", "--closure-reason", "no-follow-on", "--resolution", text]);
+      expect(calls).toEqual([]);
+      expect(process.exitCode).toBe(1);
+      expect(errors.join("\n")).toContain("needs text");
+    });
+
+    it("a --resolution usage error with --json is a JSON error on stderr", async () => {
+      const { deps, calls } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      program.exitOverride();
+      await program.parseAsync(["node", "rig", "queue", "update", "qitem-x", "--state", "pending", "--resolution", "x", "--json"]);
+      expect(calls).toEqual([]);
+      expect(JSON.parse(errors[0])).toMatchObject({ error: "resolution_needs_closing_state" });
+    });
+
+    it("update --resolution --help names only what the CLI itself checks", async () => {
+      const { deps } = makeDeps();
+      const program = createProgram({ queueDeps: deps });
+      const help = program.commands.find((c) => c.name() === "queue")!.commands.find((c) => c.name() === "update")!.helpInformation();
+      expect(help).toContain("--resolution <text>");
+      expect(help).not.toContain("resolution_not_admitted");
+      expect(help).not.toContain("resolution_already_closed");
+    });
+
     it("update without --resolution sends no resolution", async () => {
       const { deps, calls } = makeDeps();
       const program = createProgram({ queueDeps: deps });

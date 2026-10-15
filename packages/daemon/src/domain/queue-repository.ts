@@ -343,8 +343,8 @@ export interface QueueUpdateInput {
   transitionNote?: string;
   closureReason?: string;
   closureTarget?: string;
-  /** The outcome text stored in queue_items.resolution with a terminal close, on a row still open.
-   *  Appended after a pod-fallback value the row already carries. */
+  /** The outcome stored in queue_items.resolution when this update closes a row that is still open;
+   *  appended after anything the row already carries. Ignored on every other update. */
   resolution?: string;
   /**
    * PL-004 Phase D extension: when set, persists the queue_items.handed_off_to
@@ -2485,7 +2485,6 @@ export class QueueRepository {
       const disallowed = input.reopen === true
         || input.closureReason != null
         || input.closureTarget != null
-        || input.resolution != null
         || input.handedOffTo != null
         || input.blockedOn != null
         || input.wakeWatchdogId != null
@@ -2529,23 +2528,6 @@ export class QueueRepository {
         "invalid_state",
         `state=${input.state} not valid; valid: ${QUEUE_STATES.join(", ")}`
       );
-    }
-    if (input.resolution != null && isBlockerLive(input.state)) {
-      throw new QueueRepositoryError(
-        "resolution_not_admitted",
-        `a resolution is stored with a close; the '${input.state}' transition leaves the row open. Close the item (--state done|canceled|denied|failed|handed-off) or drop --resolution.`,
-        { requestedState: input.state },
-      );
-    }
-    if (input.resolution != null && !isBlockerLive(qitem.state)) {
-      throw new QueueRepositoryError(
-        "resolution_already_closed",
-        `qitem ${input.qitemId} is already '${qitem.state}'; a resolution is stored with the close and a closed row's resolution is not rewritten. Nothing was written.`,
-        { currentState: qitem.state },
-      );
-    }
-    if (input.resolution != null && input.resolution.trim().length === 0) {
-      throw new QueueRepositoryError("resolution_empty", "--resolution needs text; nothing was written", {});
     }
     if ((input.wakeWatchdogId != null || input.wakeAfterSeconds != null) && input.state !== "blocked") {
       throw new QueueRepositoryError(
@@ -2851,11 +2833,15 @@ export class QueueRepository {
     // NULL. The prior `COALESCE(?, blocked_on)` preserved the blocker on every non-blocked
     // transition, leaving dead blockers that nothing audits (the root-cause strand).
     const nextBlockedOn = input.state === "blocked" ? effectiveBlockedOn : null;
-    // A pod-fallback reroute already put "fallback: <reason>" here; a closing resolution goes after it
-    // on its own line so neither is lost. Only an open row reaches this with a resolution (refused above once closed).
-    const nextResolution = input.resolution == null
+    // The outcome is used only as non-blank text on the update that closes an open row; on any other
+    // update the field is ignored and the row answers as it would without it. It goes after what the row
+    // already carries (a pod-fallback line, or an earlier close's outcome) on its own line, text as sent.
+    const closingResolution = typeof input.resolution === "string" && input.resolution.trim().length > 0
+      && isBlockerLive(qitem.state) && !isBlockerLive(input.state)
+      ? input.resolution : null;
+    const nextResolution = closingResolution === null
       ? qitem.resolution
-      : qitem.resolution ? `${qitem.resolution}\n${input.resolution}` : input.resolution;
+      : qitem.resolution ? `${qitem.resolution}\n${closingResolution}` : closingResolution;
     const notification = this.classifyOwnerNotification({
       action: "update",
       destinationSession: qitem.destinationSession,
@@ -3877,6 +3863,14 @@ export class QueueRepository {
     const originalDestination = qitem.destinationSession;
     const newChain = JSON.stringify([...(qitem.chainOfRecord ?? []), `fallback-from:${originalDestination}`]);
 
+    // The field held only a fallback line before a close could store an outcome. A lone fallback line is
+    // replaced as it always was; anything else is an outcome (possibly after an earlier fallback line), and
+    // the new line goes after it so the outcome is not erased.
+    const fallbackLine = `fallback: ${reason}`;
+    const nextResolution = !qitem.resolution || /^fallback: [^\n]*$/.test(qitem.resolution)
+      ? fallbackLine
+      : `${qitem.resolution}\n${fallbackLine}`;
+
     const txn = this.db.transaction(() => {
       this.db
         .prepare(
@@ -3887,7 +3881,7 @@ export class QueueRepository {
                  resolution = ?
            WHERE qitem_id = ?`
         )
-        .run(fallbackDestination, ts, newChain, `fallback: ${reason}`, qitemId);
+        .run(fallbackDestination, ts, newChain, nextResolution, qitemId);
       // A park timer targets the owner that parked the row. Once the row belongs to someone else it must not keep
       // waking the old owner, so it ends here like any other exit from the park. A repeating wait is left running:
       // it resolves its recipient from the row's current owner at delivery (evaluateQueueWait).

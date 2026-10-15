@@ -291,86 +291,150 @@ describe("queue routes", () => {
     expect(job).toMatchObject({ target_session: "b@r", interval_seconds: 45, state: "active" });
   });
 
-  describe("update --resolution", () => {
-    const update = (qitemId: string, body: Record<string, unknown>) => app.request(`/api/queue/${qitemId}/update`, {
-      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+  describe("update resolution", () => {
+    type Start = "pending" | "in-progress" | "blocked" | "done" | "canceled" | "handed-off" | "failed" | "denied";
+    const post = (qitemId: string, body: Record<string, unknown>, session = "b@r") => app.request(`/api/queue/${qitemId}/update`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": session },
       body: JSON.stringify(body),
     });
     const show = async (qitemId: string) => (await app.request(`/api/queue/${qitemId}`)).json() as Promise<Record<string, any>>;
-    const claimed = async () => {
+    const closeWith = (state: Start): Record<string, unknown> =>
+      state === "done" ? { state, closureReason: "no-follow-on" }
+        : state === "handed-off" ? { state, closureReason: "handed_off_to", closureTarget: "next@r" }
+          : { state };
+    async function rowIn(start: Start) {
       const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+      if (start === "pending") return row.qitemId;
       queueRepo.claim({ qitemId: row.qitemId, destinationSession: "b@r" });
-      return row;
-    };
+      if (start === "blocked") queueRepo.update({ qitemId: row.qitemId, actorSession: "b@r", state: "blocked", blockedOn: "external:x", wakeAfterSeconds: 60, transitionNote: "continuation: wait" });
+      else if (start !== "in-progress") queueRepo.update({ qitemId: row.qitemId, actorSession: "b@r", ...closeWith(start) } as never);
+      return row.qitemId;
+    }
+    /** What a request did: its status and error, the row afterwards, and what it wrote to the log and event stream. */
+    async function observe(start: Start, body: Record<string, unknown>) {
+      const qitemId = await rowIn(start);
+      const transitionsBefore = queueRepo.listTransitions(qitemId).length;
+      const eventsBefore = bus.replayAll(0).length;
+      const res = await post(qitemId, body);
+      const payload = await res.json() as Record<string, any>;
+      const item = await show(qitemId);
+      return {
+        status: res.status, error: payload.error ?? null,
+        state: item.state, closureReason: item.closureReason, closureTarget: item.closureTarget,
+        resolution: item.resolution as string | null,
+        transitionsWritten: queueRepo.listTransitions(qitemId).length - transitionsBefore,
+        eventsWritten: bus.replayAll(0).length - eventsBefore,
+      };
+    }
+    /** The same request with and without `resolution`: the daemon answers both alike (main ignores the field). */
+    async function expectSameAsWithoutResolution(start: Start, body: Record<string, unknown>, resolution: unknown) {
+      const without = await observe(start, body);
+      const withField = await observe(start, { ...body, resolution });
+      expect(withField).toEqual(without);
+      return withField;
+    }
 
     it.each([
-      ["done", { closureReason: "no-follow-on" }],
-      ["canceled", {}],
-      ["denied", {}],
-      ["failed", {}],
-    ])("a %s close stores the resolution and show returns it", async (state, extra) => {
-      const row = await claimed();
-      const res = await update(row.qitemId, { state, ...extra, resolution: "Fixed in #42; verified on staging", transitionNote: "closing" });
+      ["in-progress", { state: "pending" }],
+      ["in-progress", { state: "in-progress", transitionNote: "still going" }],
+      ["in-progress", { state: "blocked", blockedOn: "external:x", wakeAfterSeconds: 60, transitionNote: "continuation: wait" }],
+      ["done", { state: "in-progress", reopen: true, transitionNote: "more to do" }],
+      ["canceled", { state: "pending", reopen: true, transitionNote: "more to do" }],
+      ["handed-off", { state: "in-progress", reopen: true, transitionNote: "more to do" }],
+      ["in-progress", { transitionNote: "just a note" }],
+      ["done", { transitionNote: "just a note" }],
+      ["done", { state: "done", closureReason: "no-follow-on", transitionNote: "again" }],
+      ["canceled", { state: "canceled", transitionNote: "again" }],
+      ["handed-off", { state: "handed-off", closureReason: "handed_off_to", closureTarget: "next@r", transitionNote: "again" }],
+      ["failed", { state: "failed" }],
+      ["denied", { state: "denied" }],
+      ["failed", { state: "done", closureReason: "no-follow-on" }],
+    ] as Array<[Start, Record<string, unknown>]>)("%s row, %j: text in resolution changes nothing about the answer or the writes", async (start, body) => {
+      const result = await expectSameAsWithoutResolution(start, body, "an outcome");
+      expect(result.resolution).toBeNull();
+    });
+
+    it.each([[""], ["   "], ["\n\t "]])("blank text %j on an ordinary close is ignored: the row closes with no resolution", async (text) => {
+      const result = await expectSameAsWithoutResolution("in-progress", closeWith("done"), text);
+      expect(result).toMatchObject({ status: 200, state: "done", resolution: null, transitionsWritten: 1, eventsWritten: 1 });
+    });
+
+    it.each([[0], [42], [false], [true], [{}], [[]], [["text"]], [null]])("a non-string %j on an ordinary close is ignored: the row closes and resolution is unchanged", async (value) => {
+      const result = await expectSameAsWithoutResolution("in-progress", closeWith("done"), value);
+      expect(result).toMatchObject({ status: 200, state: "done", resolution: null, transitionsWritten: 1, eventsWritten: 1 });
+    });
+
+    it.each(["done", "canceled", "denied", "failed", "handed-off"] as const)("a %s close stores the text exactly as sent and show returns it", async (state) => {
+      const text = "Fixed in #42\n  second line, indented ✓ é中文 🚀  ";
+      const qitemId = await rowIn("in-progress");
+      const res = await post(qitemId, { ...closeWith(state), resolution: text, transitionNote: "closing" });
       expect(res.status).toBe(200);
-      expect((await res.json()).resolution).toBe("Fixed in #42; verified on staging");
-      expect(await show(row.qitemId)).toMatchObject({ state, resolution: "Fixed in #42; verified on staging" });
+      expect((await res.json()).resolution).toBe(text);
+      expect(await show(qitemId)).toMatchObject({ state, resolution: text });
     });
 
-    it.each(["in-progress", "blocked", "pending"])("is refused on a non-terminal update to %s, and nothing is written", async (state) => {
-      const row = await claimed();
-      const res = await update(row.qitemId, { state, resolution: "too early", blockedOn: state === "blocked" ? "external:x" : undefined, wakeAfterSeconds: state === "blocked" ? 60 : undefined, transitionNote: "n" });
-      expect(res.status).toBe(400);
-      expect((await res.json()).error).toBe("resolution_not_admitted");
-      expect(await show(row.qitemId)).toMatchObject({ state: "in-progress", resolution: null });
+    it("a close without the field leaves the column as it was", async () => {
+      const qitemId = await rowIn("in-progress");
+      await post(qitemId, closeWith("done"));
+      expect((await show(qitemId)).resolution).toBeNull();
     });
 
-    it("is refused on a note-only update and on a repeat of the row's closed state", async () => {
-      const row = await claimed();
-      expect((await update(row.qitemId, { transitionNote: "n", resolution: "r" })).status).toBe(400);
-      await update(row.qitemId, { state: "done", closureReason: "no-follow-on" });
-      expect((await update(row.qitemId, { state: "done", resolution: "late" })).status).toBe(400);
-      expect((await show(row.qitemId)).resolution).toBeNull();
+    it("a closed row keeps its outcome when a later request sends another", async () => {
+      const qitemId = await rowIn("in-progress");
+      await post(qitemId, { ...closeWith("failed"), resolution: "first" });
+      expect((await post(qitemId, { ...closeWith("failed"), resolution: "second" })).status).toBe(200);
+      expect((await post(qitemId, { ...closeWith("done"), resolution: "third" })).status).toBe(200);
+      expect((await show(qitemId)).resolution).toBe("first");
     });
 
-    it.each([
-      ["failed", "failed"],
-      ["denied", "done"],
-      ["denied", "denied"],
-      ["failed", "canceled"],
-    ])("is refused on a row already closed %s when closing it again as %s, and the stored resolution stays", async (first, again) => {
-      const row = await claimed();
-      expect((await update(row.qitemId, { state: first, resolution: "first" })).status).toBe(200);
-      const res = await update(row.qitemId, { state: again, ...(again === "done" ? { closureReason: "no-follow-on" } : {}), resolution: "second" });
-      expect(res.status).toBe(400);
-      expect((await res.json()).error).toBe("resolution_already_closed");
-      expect(await show(row.qitemId)).toMatchObject({ state: first, resolution: "first" });
+    it("an acknowledged reopen keeps the first outcome and the second close appends its own", async () => {
+      const qitemId = await rowIn("in-progress");
+      await post(qitemId, { ...closeWith("done"), resolution: "first outcome" });
+      expect((await post(qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do", resolution: "ignored on reopen" })).status).toBe(200);
+      expect((await show(qitemId)).resolution).toBe("first outcome");
+      await post(qitemId, { ...closeWith("done"), resolution: "second outcome" });
+      expect((await show(qitemId)).resolution).toBe("first outcome\nsecond outcome");
     });
 
-    it("is refused when blank, and a refused close leaves the row open", async () => {
-      const row = await claimed();
-      const res = await update(row.qitemId, { state: "done", closureReason: "no-follow-on", resolution: "   " });
-      expect(res.status).toBe(400);
-      expect((await res.json()).error).toBe("resolution_empty");
-      expect((await show(row.qitemId)).state).toBe("in-progress");
-    });
-
-    it("keeps a pod-fallback resolution and appends the closing resolution after it", async () => {
+    it("a close appends its outcome after the fallback line", async () => {
       const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
       queueRepo.routeToFallback(row.qitemId, "c@r", "b@r unreachable");
-      expect((await show(row.qitemId)).resolution).toBe("fallback: b@r unreachable");
       queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
-      const res = await app.request(`/api/queue/${row.qitemId}/update`, {
-        method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "c@r" },
-        body: JSON.stringify({ state: "done", closureReason: "no-follow-on", resolution: "Handled by c" }),
-      });
-      expect(res.status).toBe(200);
+      expect((await post(row.qitemId, { ...closeWith("done"), resolution: "Handled by c" }, "c@r")).status).toBe(200);
       expect((await show(row.qitemId)).resolution).toBe("fallback: b@r unreachable\nHandled by c");
     });
 
-    it("a close without --resolution leaves the column as it was", async () => {
-      const row = await claimed();
-      await update(row.qitemId, { state: "done", closureReason: "no-follow-on" });
-      expect((await show(row.qitemId)).resolution).toBeNull();
+    describe("a fallback after a stored outcome", () => {
+      it("keeps the outcome and adds the fallback line after it", async () => {
+        const qitemId = await rowIn("in-progress");
+        await post(qitemId, { ...closeWith("done"), resolution: "Fixed in #42" });
+        await post(qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" });
+        queueRepo.routeToFallback(qitemId, "c@r", "b@r unreachable");
+        expect((await show(qitemId)).resolution).toBe("Fixed in #42\nfallback: b@r unreachable");
+      });
+
+      it("keeps an outcome that sits after an earlier fallback line", async () => {
+        const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+        queueRepo.routeToFallback(row.qitemId, "c@r", "first reason");
+        queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
+        await post(row.qitemId, { ...closeWith("done"), resolution: "Handled by c" }, "c@r");
+        await post(row.qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" }, "c@r");
+        queueRepo.routeToFallback(row.qitemId, "d@r", "second reason");
+        expect((await show(row.qitemId)).resolution).toBe("fallback: first reason\nHandled by c\nfallback: second reason");
+      });
+
+      it("still replaces a plain fallback line, as before", async () => {
+        const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+        queueRepo.routeToFallback(row.qitemId, "c@r", "first reason");
+        queueRepo.routeToFallback(row.qitemId, "d@r", "second reason");
+        expect((await show(row.qitemId)).resolution).toBe("fallback: second reason");
+      });
+
+      it("a row with no resolution gets the fallback line, as before", async () => {
+        const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+        queueRepo.routeToFallback(row.qitemId, "c@r", "b@r unreachable");
+        expect((await show(row.qitemId)).resolution).toBe("fallback: b@r unreachable");
+      });
     });
   });
 

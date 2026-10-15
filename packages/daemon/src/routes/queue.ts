@@ -151,9 +151,6 @@ export function queueRoutes(): Hono {
         : err.code === "invalid_state" ? 400
         : err.code === "state_or_note_required" ? 400
         : err.code === "note_append_fields_not_admitted" ? 400
-        : err.code === "resolution_not_admitted" ? 400
-        : err.code === "resolution_empty" ? 400
-        : err.code === "resolution_already_closed" ? 400
         : err.code === "terminal_reopen_requires_ack" ? 409
         : err.code === "terminal_reopen_target_invalid" ? 400
         : err.code === "reopen_note_required" ? 400
@@ -612,7 +609,7 @@ export function queueRoutes(): Hono {
       transitionNote?: string;
       closureReason?: string;
       closureTarget?: string;
-      resolution?: string;
+      resolution?: unknown;
       blockedOn?: string;
       wakeWatchdogId?: string;
       wakeAfterSeconds?: number;
@@ -636,7 +633,8 @@ export function queueRoutes(): Hono {
         transitionNote: body.transitionNote,
         closureReason: body.closureReason,
         closureTarget: body.closureTarget,
-        resolution: body.resolution,
+        // Only text can be an outcome; any other value is treated as absent.
+        resolution: typeof body.resolution === "string" ? body.resolution : undefined,
         // OPR.0.4.4.19 FR-6 — the leg-1 park surface: blockedOn plus the
         // park-time summary/evidence_ref persist inputs.
         blockedOn: body.blockedOn,
