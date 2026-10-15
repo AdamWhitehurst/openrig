@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,12 +8,15 @@ import { migrate } from "../src/db/migrate.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { WorkflowRuntime } from "../src/domain/workflow-runtime.js";
-import { WorkflowProjectorError } from "../src/domain/workflow-projector.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
 import { WorkflowSpecCache } from "../src/domain/workflow-spec-cache.js";
 import { SliceIndexer } from "../src/domain/slices/slice-indexer.js";
 import { SliceDetailProjector } from "../src/domain/slices/slice-detail-projector.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
+import { createDaemon } from "../src/startup.js";
+import type { CmuxTransportFactory } from "../src/adapters/cmux-transport.js";
+import type { ExecFn } from "../src/adapters/tmux.js";
+import { expandRigRelativeTarget, isRigRelativeTarget } from "../src/domain/workflow-rig-placeholder.js";
 
 // A reusable workflow spec can write `member@{rig}` in preferred_targets;
 // `{rig}` resolves to the instance's bound rig (--rig), so one spec
@@ -122,22 +125,6 @@ describe("workflow preferred_targets: member@{rig}", () => {
     expect(entryOwner(r.instance.instanceId)).toBe("ops-watcher@rig-b");
   });
 
-  it("refuses {rig} with no bound rig, before creating an instance", async () => {
-    let thrown: unknown;
-    try {
-      await instantiate(relativePath);
-    } catch (err) {
-      thrown = err;
-    }
-    expect(thrown).toBeInstanceOf(WorkflowProjectorError);
-    const e = thrown as WorkflowProjectorError;
-    expect(e.code).toBe("rig_placeholder_unbound");
-    expect(e.message).toContain("{rig}");
-    expect(e.message).toContain("--rig");
-    const n = db.prepare(`SELECT COUNT(*) AS c FROM workflow_instances`).get() as { c: number };
-    expect(n.c).toBe(0);
-  });
-
   it("literal member@rig entries behave as before, bound or not", async () => {
     const unbound = await instantiate(literalPath);
     expect(entryOwner(unbound.instance.instanceId)).toBe("ops-watcher@rig-a");
@@ -161,16 +148,16 @@ describe("workflow preferred_targets: member@{rig}", () => {
     expect(next).toBe("ops-finisher@rig-b");
   });
 
-  it("validate on an unbound spec says a {rig} exception target resolves at instantiate, not 'unregistered'", () => {
+  it("validate on an unbound spec keeps a {rig} exception target 'unregistered' and says it needs a bound rig", () => {
     const specPath = join(tmp, "exception.yaml");
     writeFileSync(specPath, SPEC_RIG_RELATIVE + "  exception_routing:\n    orchestrator_role: watcher\n");
     const { exceptionReadiness } = runtime.validate(specPath);
     expect(exceptionReadiness.routes.length).toBeGreaterThan(0);
     for (const route of exceptionReadiness.routes) {
       expect(route.destinationSession).toBe("ops-watcher@{rig}");
-      expect(route.identity).not.toBe("unregistered");
-      expect(route.state).toBe("ready");
-      expect(route.message).toMatch(/resolves at instantiate against the bound rig/);
+      expect(route.identity).toBe("unregistered");
+      expect(route.state).toBe("unregistered");
+      expect(route.message).toMatch(/needs a bound rig \(--rig\) or a literal rig name/);
     }
   });
 
@@ -259,14 +246,6 @@ describe("workflow preferred_targets: member@{rig}", () => {
     expect(trail.step_role).toBe("watcher");
   });
 
-  it("an unknown spec-default target.rig leaves the instance unbound, so a {rig} spec is refused", async () => {
-    const specPath = join(tmp, "default-unknown.yaml");
-    writeFileSync(specPath, SPEC_RIG_RELATIVE.replace("  entry:", "  target:\n    rig: vanished-rig\n  entry:"));
-    await expect(instantiate(specPath)).rejects.toMatchObject({ code: "rig_placeholder_unbound" });
-    const n = db.prepare(`SELECT COUNT(*) AS c FROM workflow_instances`).get() as { c: number };
-    expect(n.c).toBe(0);
-  });
-
   it("the slice view of a bound instance shows the seat the packet went to, not the literal {rig}", async () => {
     const sliceRoot = join(tmp, "slices");
     mkdirSync(join(sliceRoot, "rr-slice"), { recursive: true });
@@ -312,5 +291,231 @@ describe("workflow preferred_targets: member@{rig}", () => {
     expect(runtime.inspect(instanceId).failures).toHaveLength(1);
     const resumed = await runtime.resume({ instanceId, occurrenceId: left, actorSession: "orch@orch" });
     expect(resumed.ownerSession).toBe("ops-watcher@rig-b");
+  });
+});
+
+// The same starts through the daemon's real wiring: startup.ts's rig-registry
+// admission check, not a `validateRig: () => true` fixture, so a literal
+// `{rig}` destination is refused exactly as it is in production.
+describe("member@{rig} through the real admission path", () => {
+  let daemon: Awaited<ReturnType<typeof createDaemon>>;
+  let tmp: string;
+
+  beforeAll(async () => {
+    const cmuxFactory: CmuxTransportFactory = async () => {
+      throw Object.assign(new Error(""), { code: "ENOENT" });
+    };
+    const tmuxExec: ExecFn = async () => "";
+    daemon = await createDaemon({ cmuxFactory, tmuxExec });
+    for (const name of ["rig-a", "rig-b", "prefix-rig-b", "orch"]) daemon.deps.rigRepo.createRig(name);
+    tmp = mkdtempSync(join(tmpdir(), "wf-rigrel-http-"));
+  });
+
+  afterAll(() => {
+    daemon.db.close();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  const watchStep = `    - id: watch
+      actor_role: watcher
+      allowed_exits:
+        - done
+`;
+  const withDefault = (yaml: string, defaultRig: string | null) =>
+    defaultRig === null ? yaml : yaml.replace("  entry:", `  target:\n    rig: ${defaultRig}\n  entry:`);
+  const specYaml = (id: string, roles: string, steps = watchStep) => `workflow:
+  id: ${id}
+  version: 1
+  objective: member@{rig} through admission
+  entry:
+    role: watcher
+  roles:
+${roles}  steps:
+${steps}`;
+
+  let n = 0;
+  function writeSpec(yaml: string): string {
+    const path = join(tmp, `spec-${++n}.yaml`);
+    writeFileSync(path, yaml);
+    return path;
+  }
+
+  const count = (table: string) => (daemon.db.prepare(`SELECT COUNT(*) AS c FROM ${table}`).get() as { c: number }).c;
+  const entryDestination = (instanceId: string) => (daemon.db.prepare(`SELECT destination_session FROM queue_items WHERE qitem_id = (
+    SELECT json_extract(current_frontier_json, '$[0]') FROM workflow_instances WHERE instance_id = ?)`)
+    .get(instanceId) as { destination_session: string }).destination_session;
+
+  async function start(yaml: string, extra: Record<string, string> = {}) {
+    const res = await daemon.app.request("/api/workflow/instantiate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ specPath: writeSpec(yaml), rootObjective: "t", createdBySession: "orch@orch", ...extra }),
+    });
+    return { status: res.status, body: (await res.json()) as Record<string, any> };
+  }
+
+  // The four shapes whose {rig} is never the entry target actually used.
+  const STARTS: Record<string, { yaml: string; extra?: Record<string, string> }> = {
+    "a literal entry with {rig} only in a later role": {
+      yaml: specYaml("start-later-role", `    watcher:
+      preferred_targets:
+        - ops-watcher@rig-a
+    finisher:
+      preferred_targets:
+        - ops-finisher@{rig}
+`, `    - id: watch
+      actor_role: watcher
+      allowed_exits:
+        - handoff
+      next_hop:
+        mode: require
+        suggested_roles:
+          - finisher
+    - id: finish
+      actor_role: finisher
+      allowed_exits:
+        - done
+`),
+    },
+    "a literal entry with {rig} only in a role that never runs": {
+      yaml: specYaml("start-unused-role", `    watcher:
+      preferred_targets:
+        - ops-watcher@rig-a
+    spare:
+      preferred_targets:
+        - ops-spare@{rig}
+`),
+    },
+    "a literal first preferred target with {rig} second": {
+      yaml: specYaml("start-literal-first", `    watcher:
+      preferred_targets:
+        - ops-watcher@rig-a
+        - ops-watcher@{rig}
+`),
+    },
+    "a {rig} role with an explicit entryOwnerSession": {
+      yaml: specYaml("start-explicit-owner", `    watcher:
+      preferred_targets:
+        - ops-watcher@{rig}
+`),
+      extra: { entryOwnerSession: "ops-watcher@rig-a" },
+    },
+  };
+
+  const UNBOUND: Array<[string, string | null]> = [
+    ["no binding", null],
+    ["a spec default rig that is not registered", "vanished-rig"],
+  ];
+
+  describe.each(Object.entries(STARTS))("%s", (_name, shape) => {
+    it.each(UNBOUND)("still starts with %s: one instance, one entry packet, owner on rig-a", async (_label, defaultRig) => {
+      const instances = count("workflow_instances");
+      const packets = count("queue_items");
+      const { status, body } = await start(withDefault(shape.yaml, defaultRig), shape.extra);
+      expect(status).toBe(201);
+      expect(body.instance.boundRig).toBeNull();
+      expect(count("workflow_instances")).toBe(instances + 1);
+      expect(count("queue_items")).toBe(packets + 1);
+      expect(entryDestination(body.instance.instanceId)).toBe("ops-watcher@rig-a");
+    });
+  });
+
+  const ENTRY_RIG_RELATIVE = specYaml("start-entry-rig-relative", `    watcher:
+      preferred_targets:
+        - ops-watcher@{rig}
+`);
+
+  it("a bound start expands the selected {rig} entry target", async () => {
+    const { status, body } = await start(ENTRY_RIG_RELATIVE, { targetRig: "rig-b" });
+    expect(status).toBe(201);
+    expect(body.instance.boundRig).toBe("rig-b");
+    expect(entryDestination(body.instance.instanceId)).toBe("ops-watcher@rig-b");
+  });
+
+  it.each(UNBOUND)("an unbound start whose selected entry target is member@{rig} is still 400 unknown_destination_rig with %s, and nothing is created", async (_label, defaultRig) => {
+    const instances = count("workflow_instances");
+    const packets = count("queue_items");
+    const { status, body } = await start(withDefault(ENTRY_RIG_RELATIVE, defaultRig));
+    expect(status).toBe(400);
+    expect(body.error).toBe("unknown_destination_rig");
+    expect(body.message).toContain("ops-watcher@{rig}");
+    expect(count("workflow_instances")).toBe(instances);
+    expect(count("queue_items")).toBe(packets);
+  });
+
+  it("an unbound later hop that selects member@{rig} fails at its own hop, with main's error", async () => {
+    const yaml = specYaml("start-later-hop", `    watcher:
+      preferred_targets:
+        - ops-watcher@rig-a
+    finisher:
+      preferred_targets:
+        - ops-finisher@{rig}
+`, `    - id: watch
+      actor_role: watcher
+      allowed_exits:
+        - handoff
+      next_hop:
+        mode: require
+        suggested_roles:
+          - finisher
+    - id: finish
+      actor_role: finisher
+      allowed_exits:
+        - done
+`);
+    const started = await start(yaml);
+    expect(started.status).toBe(201);
+    const res = await daemon.app.request("/api/workflow/project", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instanceId: started.body.instance.instanceId,
+        currentPacketId: started.body.entryQitemId,
+        exit: "handoff",
+        actorSession: "ops-watcher@rig-a",
+        resultNote: "next",
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json() as { error: string }).error).toBe("unknown_destination_rig");
+  });
+
+  describe("only a trailing @{rig} is the form", () => {
+    const roles = (target: string) => `    watcher:
+      preferred_targets:
+        - ${target}
+`;
+
+    it("braces in the member part stay literal: ops-{rig}@rig-a keeps its destination when bound", async () => {
+      const { status, body } = await start(specYaml("start-member-braces", roles("ops-{rig}@rig-a")), { targetRig: "rig-b" });
+      expect(status).toBe(201);
+      expect(entryDestination(body.instance.instanceId)).toBe("ops-{rig}@rig-a");
+    });
+
+    // `prefix-rig-b` is registered, so replacing `{rig}` inside the rig name would reach it.
+    it.each([["bound", { targetRig: "rig-b" }], ["unbound", {}]])(
+      "a partial rig name stays literal and is refused as on main (%s): ops-watcher@prefix-{rig}",
+      async (_label, extra) => {
+        const instances = count("workflow_instances");
+        const { status, body } = await start(specYaml("start-partial-rig", roles("ops-watcher@prefix-{rig}")), extra);
+        expect(status).toBe(400);
+        expect(body.error).toBe("unknown_destination_rig");
+        expect(count("workflow_instances")).toBe(instances);
+      },
+    );
+  });
+});
+
+describe("member@{rig} helper", () => {
+  it("detects and expands only a trailing @{rig}", () => {
+    expect(isRigRelativeTarget("ops-watcher@{rig}")).toBe(true);
+    expect(isRigRelativeTarget("ops-{rig}@rig-a")).toBe(false);
+    expect(isRigRelativeTarget("ops-watcher@prefix-{rig}")).toBe(false);
+    expect(isRigRelativeTarget("ops-watcher@{rig}-suffix")).toBe(false);
+    expect(expandRigRelativeTarget("ops-watcher@{rig}", "rig-b")).toBe("ops-watcher@rig-b");
+    expect(expandRigRelativeTarget("{rig}@{rig}", "rig-b")).toBe("{rig}@rig-b");
+    expect(expandRigRelativeTarget("ops-{rig}@rig-a", "rig-b")).toBe("ops-{rig}@rig-a");
+    expect(expandRigRelativeTarget("ops-watcher@prefix-{rig}", "rig-b")).toBe("ops-watcher@prefix-{rig}");
+    expect(expandRigRelativeTarget("ops-watcher@{rig}", null)).toBe("ops-watcher@{rig}");
   });
 });

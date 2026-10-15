@@ -44,7 +44,6 @@ import {
 import { loadHostRegistry } from "./hosts/hosts-registry-reader.js";
 import type { HostRegistryLookupFn } from "./workflow-validator.js";
 import { WorkflowSpecCache, WorkflowSpecError, bindRowToRig } from "./workflow-spec-cache.js";
-import { RIG_PLACEHOLDER, rolesUsingRigPlaceholder } from "./workflow-rig-placeholder.js";
 import { WorkflowStepTrailLog } from "./workflow-step-trail-log.js";
 import {
   type SeatLivenessCheckFn,
@@ -527,20 +526,9 @@ export class WorkflowRuntime {
 
     // `member@{rig}` in preferred_targets resolves against the bound rig.
     // The instance row stores that binding, so every later read of this
-    // instance's spec expands the same way. With no bound rig there is
-    // nothing to resolve against: refuse now rather than route to a
-    // literal "{rig}" seat.
-    const placeholderRoles = rolesUsingRigPlaceholder(specRow.spec);
-    if (placeholderRoles.length > 0) {
-      if (boundRig === null) {
-        throw new WorkflowProjectorError(
-          "rig_placeholder_unbound",
-          `cannot instantiate: role ${placeholderRoles.map((r) => `"${r}"`).join(", ")} in spec ${specRow.name}@${specRow.version} uses ${RIG_PLACEHOLDER} in preferred_targets, but this instance is not bound to a rig. Pass --rig <name> to bind it, or write the rig name into the target.`,
-          { specPath: input.specPath, roles: placeholderRoles },
-        );
-      }
-      specRow = bindRowToRig(specRow, boundRig);
-    }
+    // instance's spec expands the same way. With no bound rig the target
+    // stays literal and is handled at the hop that selects it.
+    specRow = bindRowToRig(specRow, boundRig);
 
     // OPR.0.4.6.WF2 FR-2: static harness-pin reconciliation for EVERY
     // pinned step at instantiate (the earliest knowable moment against

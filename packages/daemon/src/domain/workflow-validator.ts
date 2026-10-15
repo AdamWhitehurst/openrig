@@ -20,7 +20,7 @@
 import type { WorkflowSpec, WorkflowStepSpec } from "./workflow-types.js";
 import { resolveNextStep } from "./workflow-projector.js";
 import { isHumanSeatSession } from "./human-route-enforcer.js";
-import { RIG_PLACEHOLDER } from "./workflow-rig-placeholder.js";
+import { isRigRelativeTarget } from "./workflow-rig-placeholder.js";
 
 export interface ValidationIssue {
   code: string;
@@ -451,7 +451,7 @@ export class WorkflowValidator {
       // can still be resolved at runtime via runtime-adapter / claim.
       for (const [roleName, role] of Object.entries(spec.roles ?? {})) {
         // A `member@{rig}` target has no seat to probe until an instance binds a rig.
-        const targets = (role?.preferred_targets ?? []).filter((t) => !t.includes(RIG_PLACEHOLDER));
+        const targets = (role?.preferred_targets ?? []).filter((t) => !isRigRelativeTarget(t));
         if (targets.length === 0) continue;
         const liveAny = targets.some((t) => seatLivenessCheck(t).alive);
         if (!liveAny) {
