@@ -175,8 +175,9 @@ export function boundedProbeExec(
       // Yield once to I/O before deciding: if the event loop stalled past the drain timer, the pipes' end events
       // may be queued behind it, and a closed-stdio descendant must not be taken for one holding the output.
       void drained.then(() => new Promise((r) => setImmediate(r))).then(() => (open().length > 0 ? end() : undefined)).then(() => {
-        if (code === 0) resolve(stdout);
-        else if (endedByStop.has(child)) reject(new ProbeStoppedError(cmd, "ended"));
+        // The stop first: a probe it ended has no answer, even if it trapped TERM and exited 0 with a version.
+        if (endedByStop.has(child)) reject(new ProbeStoppedError(cmd, "ended"));
+        else if (code === 0) resolve(stdout);
         else {
           const output = [stdout.trim(), stderr.trim()].filter(Boolean).join("\n");
           // code, signal and stderr as execAsync's rejection carries them, for the failure classifiers.

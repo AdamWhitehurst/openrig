@@ -1,6 +1,6 @@
 import { statSync } from "node:fs";
 import path from "node:path";
-import { boundedProbeExec } from "./bounded-probe-exec.js";
+import { boundedProbeExec, ProbeTimeoutError } from "./bounded-probe-exec.js";
 import type { ExecFn } from "./tmux.js";
 import { execCommand } from "./tmux-exec.js";
 
@@ -26,6 +26,13 @@ export const execPreflightCommand: ExecFn = async (cmd) => {
   if (runtimeVersionProbeCwd(cmd) === undefined) return execCommand(cmd);
   return versionProbe(cmd);
 };
+
+/** The message for a version check that hit its time limit: the check and the limit, nothing from the runtime.
+ *  Undefined for any other failure. */
+export function runtimeProbeTimeout(err: unknown): string | undefined {
+  if (!(err instanceof ProbeTimeoutError)) return undefined;
+  return `\`${err.command}\` didn't answer within ${Math.round(err.timeoutMs / 1000)} s`;
+}
 
 /** Do not echo a runtime's arbitrary output, environment, paths or stack trace.
  * Retain only bounded process status and recognisable failure categories. */

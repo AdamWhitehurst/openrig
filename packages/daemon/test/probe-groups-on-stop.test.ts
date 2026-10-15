@@ -250,4 +250,44 @@ describe.skipIf(process.platform === "win32")("a daemon that stops during a runt
       db.close();
     }
   });
+
+  it.each(["stopRuntimeProbes", "endRunningProbeGroups"] as const)("a probe the stop ended is no answer even if it exits 0 with a version (%s)", async (ending) => {
+    vi.resetModules();
+    const fresh = await import("../src/adapters/bounded-probe-exec.js");
+    cleanups.push(() => fresh.endRunningProbeGroups(200));
+    const { RuntimeVerifier } = await import("../src/domain/runtime-verifier.js");
+    const db = createDb();
+    migrate(db, ALL_MIGRATIONS);
+    const root = scratch();
+    const bin = path.join(root, "bin");
+    fs.mkdirSync(bin);
+    // Traps TERM, prints a different version and exits 0: what the stop does to it is its own business.
+    fs.writeFileSync(path.join(bin, "codex"),
+      `#!/bin/sh\ntrap 'echo codex-cli 9.9.9; exit 0' TERM\nsleep 600 &\necho $! > ${path.join(root, "child.pid")}\nwait\n`, { mode: 0o755 });
+    const savedPath = process.env.PATH;
+    try {
+      await new RuntimeVerifier({ exec: async () => "codex-cli 1.0.0", db }).verifyCodex();
+      const before = db.prepare("SELECT * FROM runtime_verifications WHERE runtime = 'codex'").all();
+      expect(before).toHaveLength(1);
+
+      process.env.PATH = `${bin}${path.delimiter}${savedPath}`;
+      const direct = fresh.boundedProbeExec()("codex --version").then((out) => ({ out }), (err: unknown) => ({ err }));
+      const verifying = new RuntimeVerifier({ exec: async () => { throw new Error("unused"); }, db, probeExec: fresh.boundedProbeExec() }).verifyCodex();
+      const outcome = verifying.then(() => undefined, (err: unknown) => err);
+      await readPid(path.join(root, "child.pid"));
+      // Both probes must be up (and have installed their trap) before the stop.
+      await new Promise((r) => setTimeout(r, 300));
+
+      await fresh[ending](500);
+
+      expect(await outcome).toBeInstanceOf(fresh.ProbeStoppedError);
+      const ended = await direct;
+      expect("out" in ended).toBe(false);
+      expect((ended as { err: unknown }).err).toBeInstanceOf(fresh.ProbeStoppedError);
+      expect(db.prepare("SELECT * FROM runtime_verifications WHERE runtime = 'codex'").all()).toEqual(before);
+    } finally {
+      process.env.PATH = savedPath;
+      db.close();
+    }
+  });
 });
