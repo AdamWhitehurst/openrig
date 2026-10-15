@@ -983,6 +983,32 @@ describe("Claude footers in a narrow or vim-mode pane", () => {
     expect(probeFrame(paneContent, false)).toMatchObject({ status: "resumed", code: "active_runtime" });
   });
 
+  // Only the current mode bar (the last one under the composer prompt) decides: a stale or copied line elsewhere
+  // in the pane must neither stand in for the identity proof an auto-mode bar needs nor hide a current accept bar.
+  const withBars = (...bars: string[]) => `Conversation\n❯\n${bars.map((bar) => `  ${bar}`).join("\n")}\n`;
+
+  it("a stale truncated accept line does not skip the identity gate of the current auto-mode bar", () => {
+    const pane = withBars("-- INSERT -- ⏵⏵ accept", "-- INSERT -- ⏵⏵ auto mode");
+    expect(probeFrame(pane, false)).toMatchObject({ status: "inconclusive", code: "claude_auto_identity_required" });
+    expect(probeFrame(pane, true)).toMatchObject({ status: "resumed", code: "active_runtime" });
+  });
+
+  it("a stale auto-mode line above the current truncated accept bar reads as accept-edits", () => {
+    for (const stale of ["-- INSERT -- ⏵⏵ auto mode", "⏵⏵ auto mode on (shift+tab to cycle)"]) {
+      expect(probeFrame(withBars(stale, "-- INSERT -- ⏵⏵ accept"), false)).toMatchObject({ status: "resumed", code: "active_runtime" });
+    }
+  });
+
+  it("a truncated accept line above the prompt, or alone with no prompt, is not a mode bar", () => {
+    expect(probeFrame("-- INSERT -- ⏵⏵ accept\nConversation\n❯\n", false)).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+    expect(probeFrame("Conversation\n  -- INSERT -- ⏵⏵ accept\n", false)).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+  });
+
+  it.each(["⏵⏵ a", "-- INSERT -- ⏵⏵ a", "⏵⏵", "⏵⏵ ac"])("%s is too short to say which mode it is", (bar) => {
+    expect(probeFrame(withBars(bar), false)).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+    expect(probeFrame(withBars(bar), true)).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
+  });
+
   it("needs the composer prompt as well", () => {
     expect(assessNativeResumeProbe({ runtime: "claude-code", paneCommand: "2.1.296",
       paneContent: "Conversation\n  ⏵⏵ auto mode on (shift+tab to cy\n" })).toMatchObject({ status: "inconclusive", code: "awaiting_runtime" });
