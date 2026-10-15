@@ -53,6 +53,19 @@ describe("homeIsolationAdvisory", () => {
     expect(explicit).toMatch(/(?<![A-Z_])HOME=/);
   });
 
+  it("warns when the isolation root contains the real home", () => {
+    const d = dirs();
+    for (const input of [
+      { openrigHome: d.real, home: d.real },
+      { openrigHome: d.root, home: d.real },
+      { openrigHome: d.root, home: d.scratch, codexHome: path.join(d.scratch, ".codex") },
+      { openrigHome: path.join(d.scratch, ".openrig"), home: path.parse(d.root).root },
+    ]) {
+      const msg = homeIsolationAdvisory({ accountHome: d.real, ...input });
+      expect(msg, JSON.stringify(input)).toContain(`contains the real home ${d.real}`);
+    }
+  });
+
   it("warns when the isolated OPENRIG_HOME and HOME carry the real CODEX_HOME", () => {
     const d = dirs();
     const real = path.join(d.real, ".codex");

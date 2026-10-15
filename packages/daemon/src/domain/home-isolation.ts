@@ -31,7 +31,8 @@ function isInside(child: string, parent: string): boolean {
  * passwd home, which a scratch HOME variable doesn't change. The isolation root is whichever of HOME and
  * OPENRIG_HOME contains the other (a scratch HOME carrying its own `.openrig`, or a HOME nested inside
  * OPENRIG_HOME), except that the account's own home is never a root. HOME is a leak when neither contains
- * the other, or when it is the account home (OPENRIG_HOME=~/.openrig-dev with the real HOME); CODEX_HOME (explicit, or `<HOME>/.codex`) is a leak
+ * the other, or when it is the account home (OPENRIG_HOME=~/.openrig-dev with the real HOME);
+ * a root that contains the account home (OPENRIG_HOME=<account home>, or HOME=/) isn't isolated at all; CODEX_HOME (explicit, or `<HOME>/.codex`) is a leak
  * when it is outside the root. Returns undefined for the default layout and for consistent isolation.
  */
 export function homeIsolationAdvisory(input: { openrigHome: string; home: string; codexHome?: string; accountHome?: string }): string | undefined {
@@ -49,6 +50,11 @@ export function homeIsolationAdvisory(input: { openrigHome: string; home: string
   const rigContainsHome = isInside(home, openrigHome);
   const homeInside = homeContainsRig || rigContainsHome;
   const root = homeContainsRig ? home : openrigHome;
+  if (isInside(canonical(accountHome), root)) {
+    return `[openrig] home isolation advisory: OPENRIG_HOME=${input.openrigHome} is not the default location, `
+      + `but the isolated root ${root} contains the real home ${accountHome}, so nothing inside it is isolated. `
+      + `Point OPENRIG_HOME, HOME and CODEX_HOME at a directory that does not contain the real home, or unset OPENRIG_HOME. Starting anyway.`;
+  }
   const codexHome = canonical(input.codexHome || nodePath.join(input.home, ".codex"));
   const leaks: string[] = [];
   if (!homeInside) leaks.push(`HOME=${input.home}`);
