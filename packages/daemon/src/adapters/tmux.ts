@@ -39,10 +39,6 @@ export interface TmuxFileOps {
   bufferName(): string;
 }
 
-/** The size a new seat session is created at and keeps (`window-size manual`). */
-const SEAT_PANE_COLUMNS = 200;
-const SEAT_PANE_ROWS = 50;
-
 // One source for the staged script's name: the generator (defaultTmuxFileOps) and the matcher
 // (isStagedSendScriptPath) are both built from it.
 const SEND_SCRIPT_PREFIX = "openrig-tmux-send-";
@@ -604,14 +600,12 @@ export class TmuxAdapter {
       OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS: "",
       ...env,
     };
-    // A detached session is 80x24 and a narrow client attached later shrinks it, which truncates the TUI's footer.
-    const size = ["-x", String(SEAT_PANE_COLUMNS), "-y", String(SEAT_PANE_ROWS)];
-    const argv = ["tmux", "new-session", "-d", "-s", name, ...size];
+    const argv = ["tmux", "new-session", "-d", "-s", name];
     if (cwd != null) argv.push("-c", cwd);
     for (const [k, v] of Object.entries(seatEnv)) argv.push("-e", `${k}=${v}`);
     // The pane new-session itself made: an after-new-session hook may select another window.
     argv.push("-P", "-F", "#{pane_id}");
-    const legacyParts = ["tmux", "new-session", "-d", "-s", shellQuote(name), ...size];
+    const legacyParts = ["tmux", "new-session", "-d", "-s", shellQuote(name)];
     if (cwd != null) legacyParts.push("-c", shellQuote(cwd));
     for (const [k, v] of Object.entries(seatEnv)) legacyParts.push("-e", shellQuote(`${k}=${v}`));
     legacyParts.push("-P", "-F", shellQuote("#{pane_id}"));
@@ -625,7 +619,6 @@ export class TmuxAdapter {
     // their identity to every new pane. Mark it removed for this session only
     // and restart the fresh pane so its shell starts without it. The session
     // exists either way, so a failure here is a warning, never a failed launch.
-    const warnings: string[] = [];
     try {
       if (await this.excludeParentSessionEnv(exactTarget(name, "session"), Object.keys(seatEnv))) {
         if (!/^%\d+$/.test(created)) throw new Error(`new-session reported no pane id ("${created}"), so no pane was restarted`);
@@ -633,13 +626,10 @@ export class TmuxAdapter {
         if (cwd != null) respawn.push("-c", cwd);
         await this.run(respawn, posixJoinArgv(respawn));
       }
+      return { ok: true };
     } catch (err) {
-      warnings.push(parentSessionEnvWarning(name, err));
+      return { ok: true, warnings: [parentSessionEnvWarning(name, err)] };
     }
-    // Hold the size: without this the next client to attach resizes the window to itself.
-    const kept = await this.setWindowOption(name, "window-size", "manual");
-    if (!kept.ok) warnings.push(`Could not fix the pane size of ${name}; a narrow client attached later can shrink it: ${kept.message}`);
-    return warnings.length ? { ok: true, warnings } : { ok: true };
   }
 
   /** Mark the server's inherited parent-session identity as removed in one
