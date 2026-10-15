@@ -3865,37 +3865,45 @@ export class QueueRepository {
   }
 
   /**
-   * The fallback line `routeToFallback` last wrote on this row, read back from the row's own transitions: a
-   * newest-first seek by row on the live log, then on the archive the retention sweep moves an aged closed
-   * row's transitions to, stopping at that reroute's transition. That transition's note is
-   * `fallback-routed: <from> → <to> (<reason>)`. Nothing else writes the row's destination or adds a
-   * `fallback-from:` entry to its chain, so `<to>` is the row's destination now and `<from>` is the last chain entry;
-   * the note's prefix is rebuilt from those and what remains, minus the closing parenthesis, is the reason exactly
-   * as it was printed into the line, whatever characters the reason and the destinations hold. `outcomeMayFollow`
-   * is true when the row closed from an open state after that reroute, the only way a close can have appended an
-   * outcome behind the line. Null when the row has no such reroute transition, or its note is not the one the row
-   * predicts, so the field is then left whole.
+   * Where, in the row's `resolution`, the fallback line `routeToFallback` last wrote begins; null when it cannot be
+   * told, and the field is then left whole. The row's own transitions say what that reroute printed: a newest-first
+   * seek by row on the live log, then on the archive the retention sweep moves an aged closed row's transitions to,
+   * stopping at the reroute's transition, whose note is `fallback-routed: <from> → <to> (<reason>)`. The line is
+   * `fallback: <reason>`, built from the same printed reason, so it starts at a line start `i` of the field with
+   * `fallback: ` there and the rest of the field, `r`, satisfying note ends with ` (r)`. Neither the destinations nor
+   * the chain are consulted, so how a value was stored cannot matter. At most one `i` can satisfy it when the field
+   * ends with that line: a longer `r` would have to be preceded in the note by ` (`, and a shorter one starts inside the
+   * reason, right after a newline, which is not ` (`.
+   *
+   * A close that came after that reroute from an open state may have appended an outcome behind the line, and an
+   * outcome can read like the line, so then only a field that is nothing but the line (`i` = 0, which an appended
+   * outcome would lengthen) is accepted.
    */
-  private lastFallbackLine(qitem: QueueItem): { line: string; outcomeMayFollow: boolean } | null {
-    const from = qitem.chainOfRecord?.at(-1);
-    if (!from?.startsWith("fallback-from:")) return null;
-    const prefix = `fallback-routed: ${from.slice("fallback-from:".length)} → ${qitem.destinationSession} (`;
-    const tables = ["queue_transitions", ...(detectTable(this.db, "queue_transitions_archive") ? ["queue_transitions_archive"] : [])];
+  private fallbackLineStart(qitemId: string, resolution: string): number | null {
+    let note: string | null = null;
     let newerClosed = false;
     let outcomeMayFollow = false;
-    for (const table of tables) {
+    for (const table of ["queue_transitions", ...(detectTable(this.db, "queue_transitions_archive") ? ["queue_transitions_archive"] : [])]) {
       const newestFirst = this.db.prepare(
         `SELECT state, actor_session, transition_note FROM ${table} WHERE qitem_id = ? ORDER BY transition_id DESC`,
       );
-      for (const row of newestFirst.iterate(qitem.qitemId) as Iterable<{ state: string; actor_session: string; transition_note: string | null }>) {
+      for (const row of newestFirst.iterate(qitemId) as Iterable<{ state: string; actor_session: string; transition_note: string | null }>) {
         if (newerClosed && isBlockerLive(row.state as QueueState)) outcomeMayFollow = true;
         if (row.actor_session === FALLBACK_ACTOR && row.transition_note?.startsWith("fallback-routed: ")) {
-          const note = row.transition_note;
-          if (!note.startsWith(prefix) || !note.endsWith(")")) return null;
-          return { line: `fallback: ${note.slice(prefix.length, -1)}`, outcomeMayFollow };
+          note = row.transition_note;
+          break;
         }
         newerClosed = !isBlockerLive(row.state as QueueState);
       }
+      if (note !== null) break;
+    }
+    if (note === null) return null;
+    const printed = note;
+    const startsHere = (i: number) =>
+      resolution.startsWith("fallback: ", i) && (i === 0 || resolution[i - 1] === "\n") && printed.endsWith(` (${resolution.slice(i + "fallback: ".length)})`);
+    if (outcomeMayFollow) return startsHere(0) ? 0 : null;
+    for (let i = 0; i < resolution.length; i = resolution.indexOf("\n", i) + 1 || resolution.length) {
+      if (startsHere(i)) return i;
     }
     return null;
   }
@@ -3920,11 +3928,8 @@ export class QueueRepository {
     // end with an outcome that reads like that line, so then only a field that is exactly the line (an
     // appended outcome would make it longer) is replaced; with no such reroute transition the field is left whole.
     const fallbackLine = `fallback: ${reason}`;
-    const last = qitem.resolution ? this.lastFallbackLine(qitem) : null;
-    const kept = !qitem.resolution || last === null ? qitem.resolution
-      : qitem.resolution === last.line ? null
-        : !last.outcomeMayFollow && qitem.resolution.endsWith(`\n${last.line}`) ? qitem.resolution.slice(0, -(last.line.length + 1))
-          : qitem.resolution;
+    const start = qitem.resolution ? this.fallbackLineStart(qitemId, qitem.resolution) : null;
+    const kept = qitem.resolution && start !== null ? qitem.resolution.slice(0, Math.max(0, start - 1)) : qitem.resolution;
     const nextResolution = kept ? `${kept}\n${fallbackLine}` : fallbackLine;
 
     const txn = this.db.transaction(() => {

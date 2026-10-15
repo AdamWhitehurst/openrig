@@ -545,6 +545,73 @@ describe("queue routes", () => {
         expect((await show(row.qitemId)).resolution).toBe("fallback: last");
       });
 
+      // What the route stores can print differently from what it received (a number destination is stored as text
+      // with a ".0"), and create takes any chainOfRecord. The earlier line is found without either.
+      describe("whatever the route received for the destination, the chain and the reason", () => {
+        const createRow = (extra: Record<string, unknown> = {}) => app.request("/api/queue/create", {
+          method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "a@r" },
+          body: JSON.stringify({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false, ...extra }),
+        }).then(async (res) => { expect(res.status).toBe(201); return (await res.json() as { qitemId: string }).qitemId; });
+        const fallbackTo = (qitemId: string, to: unknown, reason: unknown) => app.request(`/api/queue/${qitemId}/fallback`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fallbackDestination: to, reason }),
+        });
+
+        it.each([[1], [null], [{}], [["fallback-from:x"]], ["fallback-from:", 7]] as unknown[][])(
+          "a row created with chainOfRecord %j takes an outcome, then a fallback, as main does", async (...chain) => {
+            const qitemId = await createRow({ chainOfRecord: chain });
+            queueRepo.claim({ qitemId, destinationSession: "b@r" });
+            await post(qitemId, { ...closeWith("done"), resolution: "outcome" });
+            await post(qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" });
+            expect((await fallbackTo(qitemId, "c@r", "next")).status).toBe(200);
+            expect((await show(qitemId)).resolution).toBe("outcome\nfallback: next");
+          });
+
+        it.each([5, 1.5, 1e21, 123456789012345680000, "5", " lead@r ", "c@r\nd@r"])(
+          "a later fallback replaces the line written for the destination %j", async (destination) => {
+            const qitemId = await createRow();
+            expect((await fallbackTo(qitemId, destination, "first")).status).toBe(200);
+            expect((await fallbackTo(qitemId, "d@r", "next")).status).toBe(200);
+            expect((await show(qitemId)).resolution).toBe("fallback: next");
+          });
+
+        // Every pairing of an awkward first destination and first reason, reroute twice, as main does.
+        const destinations: unknown[] = ["c@r", "c@r (x", "c@r (x) \u2192 (y", " \u2192 ", ")", "(", 5, 2.5, "a\nb"];
+        const reasons: unknown[] = ["first", "", " (", ") (", "a (b) c", "x\nfallback: y", "fallback: ", true, { a: 1 }, ["r", 2], 7, 0.5];
+        it("a later fallback replaces the earlier line for every pairing of awkward destination and reason", async () => {
+          const wrong: string[] = [];
+          for (const destination of destinations) {
+            for (const reason of reasons) {
+              const qitemId = await createRow();
+              await fallbackTo(qitemId, destination, reason);
+              await fallbackTo(qitemId, "d@r (y)", "next");
+              const got = (await show(qitemId)).resolution;
+              if (got !== "fallback: next") wrong.push(`${JSON.stringify(destination)} / ${JSON.stringify(reason)} -> ${JSON.stringify(got)}`);
+            }
+          }
+          expect(wrong).toEqual([]);
+        });
+
+        it("keeps an outcome that looks like the line, whatever the destination and reason held", async () => {
+          const wrong: string[] = [];
+          for (const destination of destinations) {
+            for (const reason of reasons) {
+              const qitemId = await createRow();
+              await fallbackTo(qitemId, destination, reason);
+              const owner = () => queueRepo.getById(qitemId)!.destinationSession;
+              queueRepo.claim({ qitemId, destinationSession: owner() });
+              const first = (await show(qitemId)).resolution as string;
+              queueRepo.update({ qitemId, actorSession: owner(), state: "done", closureReason: "no-follow-on", resolution: first });
+              queueRepo.update({ qitemId, actorSession: owner(), state: "in-progress", reopen: true, transitionNote: "more to do" } as never);
+              await fallbackTo(qitemId, "d@r", "next");
+              const got = (await show(qitemId)).resolution;
+              if (got !== `${first}\n${first}\nfallback: next`) wrong.push(`${JSON.stringify(destination)} / ${JSON.stringify(reason)} -> ${JSON.stringify(got)}`);
+            }
+          }
+          expect(wrong).toEqual([]);
+        });
+      });
+
       describe("when the retention archiver has moved the row's transitions", () => {
         /** Move every transition of the closed row into the archive, as the retention sweep does for an aged terminal row. */
         async function archive(qitemId: string): Promise<void> {
@@ -593,14 +660,13 @@ describe("queue routes", () => {
           queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
           await post(row.qitemId, closeWith("done"), "c@r");
           await archive(row.qitemId);
-          const lookup = queueRepo as unknown as { lastFallbackLine(qitem: unknown): { line: string } | null };
-          const item = queueRepo.getById(row.qitemId)!;
+          const lookup = queueRepo as unknown as { fallbackLineStart(qitemId: string, resolution: string): number | null };
           const seen: string[] = [];
           const prepare = db.prepare.bind(db);
           db.prepare = ((sql: string) => { seen.push(sql); return prepare(sql); }) as typeof db.prepare;
-          let found: { line: string } | null = null;
-          try { found = lookup.lastFallbackLine(item); } finally { db.prepare = prepare as typeof db.prepare; }
-          expect(found).toMatchObject({ line: "fallback: first" });
+          let found: number | null = null;
+          try { found = lookup.fallbackLineStart(row.qitemId, "fallback: first"); } finally { db.prepare = prepare as typeof db.prepare; }
+          expect(found).toBe(0);
           expect(seen.some((read) => /queue_transitions_archive/.test(read))).toBe(true);
           const scans = seen.filter((read) => !/sqlite_master/.test(read)).flatMap((read) =>
             (db.prepare(`EXPLAIN QUERY PLAN ${read}`).all(...(read.match(/\?/g) ?? []).map(() => "x")) as Array<{ detail: string }>)
@@ -637,11 +703,10 @@ describe("queue routes", () => {
         it("finds the row's earlier fallback line without scanning a table", async () => {
           const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
           queueRepo.routeToFallback(row.qitemId, "c@r", "first reason");
-          const lookup = queueRepo as unknown as { lastFallbackLine(qitem: unknown): { line: string } | null };
-          let found: { line: string } | null = null;
-          const item = queueRepo.getById(row.qitemId)!;
-          const sql = preparedDuring(() => { found = lookup.lastFallbackLine(item); });
-          expect(found).toEqual({ line: "fallback: first reason", outcomeMayFollow: false });
+          const lookup = queueRepo as unknown as { fallbackLineStart(qitemId: string, resolution: string): number | null };
+          let found: number | null = null;
+          const sql = preparedDuring(() => { found = lookup.fallbackLineStart(row.qitemId, "fallback: first reason"); });
+          expect(found).toBe(0);
           expect(sql.length).toBeGreaterThan(0);
           const scans: string[] = [];
           for (const read of sql.filter((r) => !/sqlite_master/.test(r))) {
