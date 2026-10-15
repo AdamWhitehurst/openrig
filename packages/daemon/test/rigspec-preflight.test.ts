@@ -171,8 +171,7 @@ describe("RigSpecPreflight", () => {
     const result = await createPreflight({ exec }).check(validSpec({ nodes: [{ id: "worker", runtime: "pi", cwd: "/" }] }));
     expect(result.ready).toBe(true);
     expect(result.errors).toEqual([]);
-    expect(result.warnings.join("\n")).toContain("`pi --version` didn't answer within 30 s");
-    expect(result.warnings.join("\n")).not.toMatch(/ETIMEDOUT|not available|install/);
+    expect(result.warnings).toEqual(["`pi --version` didn't answer within 30 s"]);
   });
 
   it("a runtime that fails some other way keeps its 'not available' error", async () => {

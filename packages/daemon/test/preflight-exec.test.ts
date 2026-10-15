@@ -81,9 +81,7 @@ describe("runtime version preflight cwd", () => {
     const exec = vi.fn().mockRejectedValue(new ProbeTimeoutError("pi --version", RUNTIME_PROBE_TIMEOUT_MS));
     const spec = { pods: [{ members: [{ runtime: "pi" }] }] } as RigSpec;
     expect(await verifyPiRuntimeAvailable(spec, exec, warnings)).toEqual([]);
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toContain("`pi --version` didn't answer within 30 s");
-    expect(warnings[0]).not.toMatch(/ETIMEDOUT|install|unknown/);
+    expect(warnings).toEqual(["`pi --version` didn't answer within 30 s"]);
   });
 
   it.each(["pi", "omp", "codex", "claude"])("preserves a healthy cwd for %s --version", (runtime) => {

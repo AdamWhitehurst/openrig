@@ -450,7 +450,7 @@ export async function verifyPiRuntimeAvailable(
 function piAvailabilityFailure(err: unknown, warnings: string[]): string[] {
   const timedOut = runtimeProbeTimeout(err);
   if (timedOut) {
-    warnings.push(`${timedOut}; launch continues. Check 'pi --version' in the pane's shell.`);
+    warnings.push(timedOut);
     return [];
   }
   const detail = runtimeProbeFailure(err);

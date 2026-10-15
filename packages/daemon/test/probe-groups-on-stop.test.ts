@@ -263,7 +263,7 @@ describe.skipIf(process.platform === "win32")("a daemon that stops during a runt
     fs.mkdirSync(bin);
     // Traps TERM, prints a different version and exits 0: what the stop does to it is its own business.
     fs.writeFileSync(path.join(bin, "codex"),
-      `#!/bin/sh\ntrap 'echo codex-cli 9.9.9; exit 0' TERM\nsleep 600 &\necho $! > ${path.join(root, "child.pid")}\nwait\n`, { mode: 0o755 });
+      `#!/bin/sh\ntrap 'echo codex-cli 9.9.9; exit 0' TERM\nsleep 600 &\necho $! > ${path.join(root, "ready")}.$$\nwait\n`, { mode: 0o755 });
     const savedPath = process.env.PATH;
     try {
       await new RuntimeVerifier({ exec: async () => "codex-cli 1.0.0", db }).verifyCodex();
@@ -274,9 +274,11 @@ describe.skipIf(process.platform === "win32")("a daemon that stops during a runt
       const direct = fresh.boundedProbeExec()("codex --version").then((out) => ({ out }), (err: unknown) => ({ err }));
       const verifying = new RuntimeVerifier({ exec: async () => { throw new Error("unused"); }, db, probeExec: fresh.boundedProbeExec() }).verifyCodex();
       const outcome = verifying.then(() => undefined, (err: unknown) => err);
-      await readPid(path.join(root, "child.pid"));
-      // Both probes must be up (and have installed their trap) before the stop.
-      await new Promise((r) => setTimeout(r, 300));
+      // Each probe writes its own marker once its trap is installed: stop only when both are up.
+      const markers = () => fs.readdirSync(root).filter((name) => name.startsWith("ready.") && fs.readFileSync(path.join(root, name), "utf-8").trim());
+      for (let i = 0; i < 400 && markers().length < 2; i++) await new Promise((r) => setTimeout(r, 25));
+      expect(markers()).toHaveLength(2);
+      for (const name of markers()) await readPid(path.join(root, name));
 
       await fresh[ending](500);
 
