@@ -49,7 +49,10 @@ one command away. Your memory of the fleet is a claim about the past.
   live custody and executable dependencies. An `INDETERMINATE` cell stays unknown rather than
   being filled from memory. A project that integrates somewhere other than `main` declares
   `arrangement.source.integration_ref` in `mission.yaml`, and the folded rung checks landed work
-  against it; a ref that is invalid or can't be resolved reads INDETERMINATE.
+  against it; a ref that is invalid or can't be resolved reads INDETERMINATE. The rung also reads
+  true from a recorded merge fact, a `merged:<pr-number>` tag on a row bound to the slice, because a
+  squash or rebase merge leaves the candidate off the ref; the fact decides even when the ref is
+  unusable or the slice has no candidate.
   **`rig view register`** turns a query you keep re-running into a first-class view.
 - **`rig config`** — bare, with no arguments: every key, every current value, and where each came
   from. Most agents assume compaction thresholds, snapshot cadence and scan intervals are hardcoded
