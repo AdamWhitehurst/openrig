@@ -8,6 +8,8 @@ import { eventsSchema } from "../src/db/migrations/003_events.js";
 import { streamItemsSchema } from "../src/db/migrations/023_stream_items.js";
 import { queueItemsSchema } from "../src/db/migrations/024_queue_items.js";
 import { queueTransitionsSchema } from "../src/db/migrations/025_queue_transitions.js";
+import { queueTransitionsArchiveSchema } from "../src/db/migrations/054_queue_transitions_archive.js";
+import { archiveIdentityProvenanceSchema } from "../src/db/migrations/082_archive_identity_provenance.js";
 import { watchdogJobsSchema } from "../src/db/migrations/031_watchdog_jobs.js";
 import { inboxEntriesSchema } from "../src/db/migrations/026_inbox_entries.js";
 import { outboxEntriesSchema } from "../src/db/migrations/027_outbox_entries.js";
@@ -56,11 +58,13 @@ describe("queue routes", () => {
       streamItemsSchema, // 067's stream_items ALTER needs its base table present
       queueItemsSchema,
       queueTransitionsSchema,
+      queueTransitionsArchiveSchema, // retention's archive; the archived-row fallback tests need it
       watchdogJobsSchema,
       inboxEntriesSchema,
       outboxEntriesSchema,
       queueTargetRepoSchema, // OPR.0.3.2.20: required for attention=1&targetRepo=X composition tests
       i3IdentityProvenanceSchema, // P21 §4 era-stamp column on the queue-spine stores (last: needs all 4 tables)
+      archiveIdentityProvenanceSchema, // the archive carries the same column, which retention requires
     ]);
     createWakeContractTable(db);
     bus = new EventBus(db);
@@ -520,6 +524,91 @@ describe("queue routes", () => {
         expect((await show(row.qitemId)).resolution).toBe("fallback: next");
       });
 
+      // The route takes any destination and any reason, and the reroute transition's note has both in it.
+      it.each([
+        ["a destination with ' ('", "c@r (x", "first"],
+        ["a destination with ' (' and ')'", "c@r (x) y", "first"],
+        ["a destination with ' \u2192 ('", "c@r \u2192 (x", "first"],
+        ["a reason with ' (' and ')'", "c@r", "a (b) c (d)"],
+        ["a destination and a reason with ' (' and ')'", "c@r (x)", "a (b) c)"],
+        ["an empty reason", "c@r (x", ""],
+      ])("a later fallback replaces the line written with %s", async (_label, firstDestination, firstReason) => {
+        const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+        const fallback = (to: string, reason: unknown) => app.request(`/api/queue/${row.qitemId}/fallback`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ fallbackDestination: to, reason }),
+        });
+        expect((await fallback(firstDestination, firstReason)).status).toBe(200);
+        expect((await fallback("d@r (y) \u2192 (z", "next")).status).toBe(200);
+        expect((await show(row.qitemId)).resolution).toBe("fallback: next");
+        expect((await fallback("e@r", "last")).status).toBe(200);
+        expect((await show(row.qitemId)).resolution).toBe("fallback: last");
+      });
+
+      describe("when the retention archiver has moved the row's transitions", () => {
+        /** Move every transition of the closed row into the archive, as the retention sweep does for an aged terminal row. */
+        async function archive(qitemId: string): Promise<void> {
+          // The sweep skips rows an active workflow still points at; this suite has no workflows.
+          db.exec("CREATE TABLE IF NOT EXISTS workflow_instances (instance_id TEXT PRIMARY KEY, status TEXT NOT NULL, current_frontier_json TEXT NOT NULL)");
+          const { archiveAgedTerminalTransitions } = await import("../src/domain/queue-retention.js");
+          const result = archiveAgedTerminalTransitions(db, { nowIso: new Date(Date.now() + 400 * 86_400_000).toISOString() });
+          expect(result.archivedQitems).toBeGreaterThan(0);
+          expect(db.prepare("SELECT COUNT(*) AS n FROM queue_transitions WHERE qitem_id = ?").get(qitemId)).toEqual({ n: 0 });
+        }
+
+        it("a fallback on the archived row replaces its earlier fallback line, as main does", async () => {
+          const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+          queueRepo.routeToFallback(row.qitemId, "c@r", "first");
+          queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
+          await post(row.qitemId, closeWith("done"), "c@r");
+          await archive(row.qitemId);
+          queueRepo.routeToFallback(row.qitemId, "d@r", "next");
+          expect((await show(row.qitemId)).resolution).toBe("fallback: next");
+        });
+
+        it("a reopened archived row is replaced the same way", async () => {
+          const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+          queueRepo.routeToFallback(row.qitemId, "c@r", "first");
+          queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
+          await post(row.qitemId, closeWith("done"), "c@r");
+          await archive(row.qitemId);
+          expect((await post(row.qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" }, "c@r")).status).toBe(200);
+          queueRepo.routeToFallback(row.qitemId, "d@r", "next");
+          expect((await show(row.qitemId)).resolution).toBe("fallback: next");
+        });
+
+        it("keeps an archived outcome that reads like the earlier fallback line", async () => {
+          const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+          queueRepo.routeToFallback(row.qitemId, "c@r", "first");
+          queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
+          await post(row.qitemId, { ...closeWith("done"), resolution: "kept\nfallback: first" }, "c@r");
+          await archive(row.qitemId);
+          queueRepo.routeToFallback(row.qitemId, "d@r", "next");
+          expect((await show(row.qitemId)).resolution).toBe("fallback: first\nkept\nfallback: first\nfallback: next");
+        });
+
+        it("finds the archived reroute by the row, without scanning the archive", async () => {
+          const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+          queueRepo.routeToFallback(row.qitemId, "c@r", "first");
+          queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
+          await post(row.qitemId, closeWith("done"), "c@r");
+          await archive(row.qitemId);
+          const lookup = queueRepo as unknown as { lastFallbackLine(qitem: unknown): { line: string } | null };
+          const item = queueRepo.getById(row.qitemId)!;
+          const seen: string[] = [];
+          const prepare = db.prepare.bind(db);
+          db.prepare = ((sql: string) => { seen.push(sql); return prepare(sql); }) as typeof db.prepare;
+          let found: { line: string } | null = null;
+          try { found = lookup.lastFallbackLine(item); } finally { db.prepare = prepare as typeof db.prepare; }
+          expect(found).toMatchObject({ line: "fallback: first" });
+          expect(seen.some((read) => /queue_transitions_archive/.test(read))).toBe(true);
+          const scans = seen.filter((read) => !/sqlite_master/.test(read)).flatMap((read) =>
+            (db.prepare(`EXPLAIN QUERY PLAN ${read}`).all(...(read.match(/\?/g) ?? []).map(() => "x")) as Array<{ detail: string }>)
+              .map((p) => p.detail).filter((d) => /^SCAN\b/.test(d)));
+          expect(scans).toEqual([]);
+        });
+      });
+
       describe("on a database with a long history", () => {
         /** The SQL the repository prepares while `run` executes. */
         function preparedDuring(run: () => void): string[] {
@@ -548,15 +637,16 @@ describe("queue routes", () => {
         it("finds the row's earlier fallback line without scanning a table", async () => {
           const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
           queueRepo.routeToFallback(row.qitemId, "c@r", "first reason");
-          const lookup = queueRepo as unknown as { lastFallbackLine(qitemId: string): { line: string } | null };
+          const lookup = queueRepo as unknown as { lastFallbackLine(qitem: unknown): { line: string } | null };
           let found: { line: string } | null = null;
-          const sql = preparedDuring(() => { found = lookup.lastFallbackLine(row.qitemId); });
+          const item = queueRepo.getById(row.qitemId)!;
+          const sql = preparedDuring(() => { found = lookup.lastFallbackLine(item); });
           expect(found).toEqual({ line: "fallback: first reason", outcomeMayFollow: false });
           expect(sql.length).toBeGreaterThan(0);
           const scans: string[] = [];
-          for (const read of sql) {
+          for (const read of sql.filter((r) => !/sqlite_master/.test(r))) {
             expect(read).not.toMatch(/\bFROM\s+events\b/i);
-            const plan = db.prepare(`EXPLAIN QUERY PLAN ${read}`).all("x") as Array<{ detail: string }>;
+            const plan = db.prepare(`EXPLAIN QUERY PLAN ${read}`).all(...(read.match(/\?/g) ?? []).map(() => "x")) as Array<{ detail: string }>;
             scans.push(...plan.map((p) => p.detail).filter((d) => /^SCAN\b/.test(d)));
           }
           expect(scans).toEqual([]);
