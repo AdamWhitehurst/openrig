@@ -1078,6 +1078,24 @@ export class TmuxAdapter {
     }
   }
 
+  /** Set one variable in a session's environment: what its next spawned process inherits, not a
+   *  running one. Callers that pass a value are putting it on a tmux command line. */
+  async setSessionEnv(session: string, key: string, value: string): Promise<void> {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) throw new Error("Invalid session environment key.");
+    const target = exactTarget(session, "session");
+    await this.run(["tmux", "set-environment", "-t", target, key, value],
+      `tmux set-environment -t ${shellQuote(target)} ${shellQuote(key)} ${shellQuote(value)}`);
+  }
+
+  /** Remove one variable from a session's environment, so a process spawned there afterwards
+   *  inherits the server's value for it, or none. */
+  async unsetSessionEnv(session: string, key: string): Promise<void> {
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) throw new Error("Invalid session environment key.");
+    const target = exactTarget(session, "session");
+    await this.run(["tmux", "set-environment", "-t", target, "-u", key],
+      `tmux set-environment -t ${shellQuote(target)} -u ${shellQuote(key)}`);
+  }
+
   /** OPR.0.4.3.28 Part C — usable-presence check for a session-env variable.
    *  Returns whether the var has a nonblank value, NEVER that value, and null
    *  when the session environment cannot be inspected. Listing the environment

@@ -48,9 +48,13 @@ export class ClaudeManagedLaunch {
       for (const json of [row?.rig, row?.member]) for (const key of Object.keys(parseStoredSeatEnv(json) ?? {})) keys.add(key);
     } catch { /* A database from before seat env has no columns to read. */ }
     if (session && this.readSessionEnv) {
-      for (const key of (await this.readSessionEnv(session, SEAT_ENV_KEYS_VAR) ?? "").split(",")) {
-        if (key) keys.add(key);
-      }
+      // A one-off name is a convenience on top of the declared ones. If tmux can't be read, the
+      // launch proceeds as it would for a seat with no one-off names.
+      try {
+        for (const key of (await this.readSessionEnv(session, SEAT_ENV_KEYS_VAR) ?? "").split(",")) {
+          if (key) keys.add(key);
+        }
+      } catch { /* No one-off names. */ }
     }
     return [...keys].filter(key => validateSeatEnvName(key) === null && !MANAGED_LAUNCH_KEYS.includes(key));
   }

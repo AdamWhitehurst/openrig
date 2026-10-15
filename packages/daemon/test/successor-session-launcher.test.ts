@@ -22,6 +22,8 @@ describe("SuccessorSessionLauncher", () => {
   let checkReady: ReturnType<typeof vi.fn>;
   let getDefaultShell: ReturnType<typeof vi.fn>;
   let getPaneCommand: ReturnType<typeof vi.fn>;
+  // The departing session's tmux environment, which the first launch filled in.
+  let sessionEnv: Map<string, string>;
 
   beforeEach(() => {
     db = createFullTestDb();
@@ -35,6 +37,7 @@ describe("SuccessorSessionLauncher", () => {
     // KI-14: default = healthy pane; the respawned pane comes up as a blank shell.
     getDefaultShell = vi.fn(async () => "/bin/zsh");
     getPaneCommand = vi.fn(async () => "zsh");
+    sessionEnv = new Map();
     // Cutover: default = retiree exits gracefully (dead right after SIGTERM), so no forced fallback.
     isPaneDead = vi.fn(async () => true);
     // A live successor is launched via the runtime adapter (launchHarness + readiness), not left as a
@@ -49,8 +52,17 @@ describe("SuccessorSessionLauncher", () => {
     return { runtime, launchHarness, checkReady } as unknown as RuntimeAdapter;
   }
 
+  function fakeTmux(): TmuxAdapter {
+    return {
+      createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand,
+      getSessionEnv: async (_session: string, key: string) => sessionEnv.get(key),
+      setSessionEnv: async (_session: string, key: string, value: string) => { sessionEnv.set(key, value); },
+      unsetSessionEnv: async (_session: string, key: string) => { sessionEnv.delete(key); },
+    } as unknown as TmuxAdapter;
+  }
+
   function launcher(tmuxOptionDefaults?: TmuxOptionDefaultsApplier): SuccessorSessionLauncher {
-    const tmux = { createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+    const tmux = fakeTmux();
     return new SuccessorSessionLauncher(tmux, discoveryRepo, {
       sessionEnv: { OPENRIG_HOME: "/home", HOME: "/daemon-home", CODEX_HOME: "/daemon-codex" },
       newId: () => "01ABCDEFG",
@@ -76,6 +88,46 @@ describe("SuccessorSessionLauncher", () => {
   it("a seat that declares no env gets no env keys variable", async () => {
     await launcher().createSuccessor({ node: { id: "node-1", runtime: "codex", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
     expect(respawnPane.mock.calls[0]![2].env).not.toHaveProperty("OPENRIG_SEAT_ENV_KEYS");
+  });
+
+  it("puts the departing session's launch env back to the spec's: one-off names go, declared ones are reset, the key list is rewritten", async () => {
+    sessionEnv.set("OPENRIG_SEAT_ENV_KEYS", "MODE,ONE_OFF,REGION");
+    sessionEnv.set("MODE", "one-off-value"); sessionEnv.set("ONE_OFF", "debug"); sessionEnv.set("REGION", "eu");
+    sessionEnv.set("OPENRIG_NODE_ID", "node-1");
+    const res = await launcher().createSuccessor({
+      node: { id: "node-1", runtime: "codex", cwd: "/w", seatEnv: { MODE: "fast", REGION: "eu" } },
+      departingSessionName: "dev-impl@rig",
+    });
+    expect(res.ok).toBe(true);
+    expect(Object.fromEntries(sessionEnv)).toEqual({ OPENRIG_NODE_ID: "node-1", OPENRIG_SEAT_ENV_KEYS: "MODE,REGION", MODE: "fast", REGION: "eu" });
+  });
+
+  it("clears the whole record when the spec declares nothing, and never touches an OPENRIG_ name even if it is listed", async () => {
+    sessionEnv.set("OPENRIG_SEAT_ENV_KEYS", "ONE_OFF,OPENRIG_NODE_ID");
+    sessionEnv.set("ONE_OFF", "debug"); sessionEnv.set("OPENRIG_NODE_ID", "node-1");
+    const res = await launcher().createSuccessor({ node: { id: "node-1", runtime: "codex", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+    expect(res.ok).toBe(true);
+    expect(Object.fromEntries(sessionEnv)).toEqual({ OPENRIG_NODE_ID: "node-1" });
+  });
+
+  it("leaves a seat that never had env alone", async () => {
+    const res = await launcher().createSuccessor({ node: { id: "node-1", runtime: "codex", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+    expect(res.ok).toBe(true);
+    expect(sessionEnv.size).toBe(0);
+  });
+
+  it("refuses with a structured result, before the pane is respawned, when the session env can't be reset", async () => {
+    sessionEnv.set("OPENRIG_SEAT_ENV_KEYS", "ONE_OFF");
+    const tmux = {
+      listPanes, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand,
+      getSessionEnv: async () => { throw new Error("Cannot read the session's launch environment."); },
+    } as unknown as TmuxAdapter;
+    const failing = new SuccessorSessionLauncher(tmux, discoveryRepo, {
+      runtimeAdapters: { codex: fakeAdapter("codex") }, readinessTimeoutMs: 50, sleep: async () => {}, exitPollMs: 1, exitTimeoutMs: 5,
+    });
+    const res = await failing.createSuccessor({ node: { id: "node-1", runtime: "codex", cwd: "/w" }, departingSessionName: "dev-impl@rig" });
+    expect(res).toMatchObject({ ok: false, code: "seat_env_reset_failed", step: "create_successor", replacementStarted: true });
+    expect(respawnPane).not.toHaveBeenCalled();
   });
 
   it("MONEY PROOF (0.5.2-07): the successor's launch binding carries the SPEC-pinned model, not the runtime default", async () => {
@@ -193,7 +245,7 @@ describe("SuccessorSessionLauncher", () => {
   });
 
   it("carries the supplied generation exactly and never lets ambient session env override it", async () => {
-    const tmux = { createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+    const tmux = fakeTmux();
     const subject = new SuccessorSessionLauncher(tmux, discoveryRepo, {
       sessionEnv: { OPENRIG_OCCUPANT_GENERATION: "stale-ambient-generation" },
       newId: () => "01ABCDEFG",
@@ -318,7 +370,7 @@ describe("SuccessorSessionLauncher", () => {
     afterEach(() => vi.useRealTimers());
 
     function timedLauncher(timeoutMs?: number, readinessSettings?: Pick<SettingsStore, "resolveOne">): SuccessorSessionLauncher {
-      const tmux = { createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+      const tmux = fakeTmux();
       return new SuccessorSessionLauncher(tmux, discoveryRepo, {
         runtimeAdapters: { codex: fakeAdapter("codex") },
         readinessTimeoutMs: timeoutMs ?? (readinessSettings ? undefined : 30_000),
@@ -438,7 +490,7 @@ describe("SuccessorSessionLauncher", () => {
   });
 
   it("no runtime adapter for the seat's runtime → structured failure, preserved seat NOT killed", async () => {
-    const tmux = { createSession, listPanes, killSession, respawnPane, setRemainOnExit, signalPaneProcess, isPaneDead, getDefaultShell, getPaneCommand } as unknown as TmuxAdapter;
+    const tmux = fakeTmux();
     const noAdapter = new SuccessorSessionLauncher(tmux, discoveryRepo, { newId: () => "01ABCDEFG", runtimeAdapters: {}, exitPollMs: 1, exitTimeoutMs: 5 });
     const res = await noAdapter.createSuccessor({ node: { id: "n", runtime: "codex", cwd: "/w" }, departingSessionName: "a@r" });
     expect(res).toMatchObject({ ok: false, step: "start_agent", code: "successor_runtime_unsupported" });

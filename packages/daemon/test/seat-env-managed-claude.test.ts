@@ -13,7 +13,7 @@ const exec = promisify(execFile);
 const cleanup: Array<() => void> = [];
 afterEach(() => { for (const f of cleanup.splice(0)) f(); });
 
-function fixture(opts: { rigEnv?: object; memberEnv?: object; sessionMarker?: string }) {
+function fixture(opts: { rigEnv?: object; memberEnv?: object; sessionMarker?: string; sessionReadFails?: boolean }) {
   const root = mkdtempSync(path.join(tmpdir(), "seat-env-claude-"));
   cleanup.push(() => rmSync(root, { recursive: true, force: true }));
   const bin = path.join(root, "bin"); const home = path.join(root, "home"); const cwd = path.join(root, "work");
@@ -34,7 +34,11 @@ printf '{"FOO":"%s","DECLARED_UNSET":"%s","LEAKED":"%s","HOME":"%s"}' "\${FOO-ab
   db.exec("INSERT INTO bindings VALUES ('b', 'node', 'seat@rig', '%1'); INSERT INTO occupant_tenures VALUES ('node', 'gen', 1)");
   const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: home };
   const reads: Array<[string, string]> = [];
-  const managed = new ClaudeManagedLaunch(db, env, {}, async (session, key) => { reads.push([session, key]); return opts.sessionMarker; });
+  const managed = new ClaudeManagedLaunch(db, env, {}, async (session, key) => {
+    reads.push([session, key]);
+    if (opts.sessionReadFails) throw new Error("Cannot read the session's launch environment.");
+    return opts.sessionMarker;
+  });
   const run = async (command: string, paneEnv: Record<string, string>) => {
     const { stdout } = await exec("/bin/sh", ["-c", command], { env: { PATH: "/usr/bin:/bin", ...paneEnv }, timeout: 5000 });
     return JSON.parse(stdout) as Record<string, string>;
@@ -59,6 +63,19 @@ describe.skipIf(process.platform === "win32")("managed Claude launch and a seat'
     const seen = await f.run(command, { FOO: "one-off" });
     expect(seen).toMatchObject({ FOO: "one-off", DECLARED_UNSET: "absent" });
     expect(f.reads).toEqual([["seat@rig", "OPENRIG_SEAT_ENV_KEYS"]]);
+  });
+
+  it("treats an unreadable session as having no one-off names, and still forwards the declared ones", async () => {
+    const f = fixture({ rigEnv: { FOO: "declared" }, sessionReadFails: true });
+    const command = (await f.managed.prepare(target, "auto")).command(["--permission-mode", "auto"]);
+    expect(f.reads).toEqual([["seat@rig", "OPENRIG_SEAT_ENV_KEYS"]]);
+    expect(await f.run(command, { FOO: "declared", LEAKED: "no" })).toMatchObject({ FOO: "declared", LEAKED: "absent" });
+  });
+
+  it("launches a seat with no env exactly as before when the session can't be read", async () => {
+    const f = fixture({ sessionReadFails: true });
+    const command = (await f.managed.prepare(target, "auto")).command(["--permission-mode", "auto"]);
+    expect(command).not.toMatch(/\$\{[A-Z_]+\+/);
   });
 
   it("never lets a declared name replace the launch's own HOME", async () => {

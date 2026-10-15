@@ -594,6 +594,54 @@ describe("Up CLI", () => {
     }
   });
 
+  async function withListener(handler: (url: string) => { status: number; body: unknown }, run: (upCalls: () => number) => Promise<void>) {
+    let upCalls = 0;
+    const origListeners = server.listeners("request");
+    server.removeAllListeners("request");
+    server.on("request", async (req: http.IncomingMessage, res: http.ServerResponse) => {
+      for await (const _chunk of req) { /* drain */ }
+      if (req.url === "/api/up") upCalls++;
+      const { status, body } = handler(req.url ?? "");
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    });
+    try {
+      await run(() => upCalls);
+    } finally {
+      server.removeAllListeners("request");
+      for (const l of origListeners) server.on("request", l as (...args: unknown[]) => void);
+    }
+  }
+
+  it.each([
+    ["a lowercase name", "lower=x", "not a valid name"],
+    ["a reserved name", "OPENRIG_URL=http://elsewhere", "reserved"],
+    ["an empty value", "EMPTY=", "must not be empty"],
+  ])("up --env with %s stops before contacting the daemon", async (_label, assignment, fragment) => {
+    await withListener(() => ({ status: 500, body: {} }), async (upCalls) => {
+      const { logs, exitCode } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "up", "/tmp/rig.yaml", "--env", assignment]);
+      });
+      expect(upCalls()).toBe(0);
+      expect(exitCode).toBe(1);
+      expect(logs.join("\n")).toContain(fragment);
+    });
+  });
+
+  it.each([
+    ["a rig name", ["up", "my-rig", "--env", "DEBUG=1"]],
+    ["a rig name with --existing", ["up", "my-rig", "--existing", "--env", "DEBUG=1"]],
+  ])("up --env with %s says a restore takes no --env and does not call /api/up", async (_label, args) => {
+    await withListener((url) => ({ status: 200, body: url.startsWith("/api/rigs/summary") ? [{ id: "r1", name: "my-rig", lifecycleState: "stopped" }] : [] }), async (upCalls) => {
+      const { logs, exitCode } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", ...args]);
+      });
+      expect(upCalls()).toBe(0);
+      expect(exitCode).toBe(1);
+      expect(logs.join("\n")).toContain("A restore keeps the rig's own env: block");
+    });
+  });
+
   // OPR.0.3.2.22 Bug 3 — path-form `rig up <spec-inside-install>` without
   // --cwd should default cwdOverride to process.cwd() so the spec's
   // member-level cwd: "." does not resolve into the OpenRig install root

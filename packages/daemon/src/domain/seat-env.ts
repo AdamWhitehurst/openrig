@@ -48,6 +48,15 @@ export function normalizeSeatEnv(raw: unknown): SeatEnv | undefined {
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
+/** The one-off env a request body carries, or undefined when it carries none this launch can
+ *  use. `/api/up` and `/api/bundles/install` answered requests with an `envOverride` field as if
+ *  the field weren't there before it meant something; a malformed one keeps getting that answer
+ *  rather than a new refusal. The CLI checks `--env` itself before sending. */
+export function readSeatEnvOverride(raw: unknown): SeatEnv | undefined {
+  if (raw === undefined || validateSeatEnv(raw, "envOverride").length > 0) return undefined;
+  return normalizeSeatEnv(raw);
+}
+
 /** Parse the `KEY=VALUE` form `rig up --env` takes. The value may contain `=`. */
 export function parseSeatEnvAssignment(text: string): { ok: true; name: string; value: string } | { ok: false; error: string } {
   const eq = text.indexOf("=");

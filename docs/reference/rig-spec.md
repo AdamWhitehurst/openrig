@@ -353,12 +353,25 @@ pods:
 ```
 
 - A seat gets the rig's `env` with its own `env` laid over it, name by name.
-- The same environment is applied on first launch, on `rig up <rig-name>` restore, and to the successor of a seat handover. Claude Code seats run with a cleared environment (`env -i`); the declared names are forwarded through it, except `PATH`, `HOME` and `CLAUDE_CONFIG_DIR`, which OpenRig sets for that launch itself.
-- `rig up <spec> --env KEY=VALUE` (repeatable) adds or overrides a value for that launch only. It is not saved: a later restore or handover uses the spec's `env:` again. To keep a value, put it in `env:`. `--env` does not apply to `rig up <rig-name>` (a restore).
+- The same environment is applied on first launch, on `rig up <rig-name>` restore, and to the successor of a seat handover.
+- `rig up <spec> --env KEY=VALUE` (repeatable) adds or overrides a value for one launch. A one-off value belongs to the terminal that launch creates: it stays in that terminal's environment for as long as the terminal lives. A restore, a handover successor or any later launch starts from the spec's `env:` alone, so the value is not saved and does not carry forward. To keep a value, put it in `env:`. `--env` does not apply to `rig up <rig-name>` (a restore); the CLI refuses that combination.
 - Names starting `OPENRIG_` are reserved for OpenRig and refused. Empty values are refused, because the launch omits empty variables.
 - `rig export` writes the rig and member `env:` back out.
 
-**Do not put secrets in `env:` or `--env`.** The values are passed to tmux on its command line and sit in the seat's process environment, so other local processes and users on the machine can read them (see #306). Use it for settings only; credentials belong in the provider's own login or a secret store the seat reads at run time.
+**Where the declared names reach, by runtime.** Declared values are handed to the seat's terminal as tmux environment, so most seats take them as given:
+
+- Plain Claude Code (no permission mode selected), Codex and terminal seats take a spec `HOME`, `PATH` or `CLAUDE_CONFIG_DIR` as given.
+- The cleared environment (`env -i`) belongs only to a managed Claude launch, which is the one used when a permission mode is selected for the seat (for example `permission_policy: builtin:auto`). It forwards the declared names through the cleared environment, except `PATH`, `HOME` and `CLAUDE_CONFIG_DIR`, which OpenRig sets for that launch itself, and `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN`, for which it sets its own renderer setting. A spec value for any of those four is not forwarded.
+- Codex seats run OpenRig's own Codex executable whatever a spec `PATH` says, and use the daemon's `CODEX_HOME` when the daemon has one.
+- On Pi and OMP seats the values reach the terminal but not the agent process: the runner hands the agent only its allowlisted environment.
+
+**Do not put secrets in `env:` or `--env`.** The values are not secret, and nothing here encrypts or hides them (see #306):
+
+- Spec values are stored in OpenRig's database and in rig snapshots, and `rig export` and bundles copy them, so a secret put there by mistake travels with the rig.
+- While a seat launches, the values are passed to tmux as command arguments, so other users and processes on the same machine can see them for that time. They then sit in the seat's process environment. Only the managed Claude launch command is value-free: it forwards names, and the terminal supplies the values.
+- A one-off `--env` value is not stored in the database or in snapshots, but it reaches tmux the same way, so it is visible in the same ways while that launch runs.
+
+Use `env:` for settings only. Credentials belong in the provider's own login or a secret store the seat reads at run time.
 
 ### Choosing the Claude instruction file
 

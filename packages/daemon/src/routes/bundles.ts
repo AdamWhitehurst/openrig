@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import { normalizeSeatEnv, validateSeatEnv, type SeatEnv } from "../domain/seat-env.js";
+import { readSeatEnvOverride } from "../domain/seat-env.js";
 import os from "node:os";
 import nodePath from "node:path";
 import { Hono } from "hono";
@@ -1122,12 +1122,7 @@ bundleRoutes.post("/install", async (c) => {
   const nonInterruptive = typeof body["nonInterruptive"] === "boolean" ? body["nonInterruptive"] : undefined;
   const targetRoot = typeof body["targetRoot"] === "string" ? body["targetRoot"] : undefined;
   const cwdOverride = typeof body["cwdOverride"] === "string" ? body["cwdOverride"] : undefined;
-  let envOverride: SeatEnv | undefined;
-  if (body["envOverride"] !== undefined) {
-    const envErrors = validateSeatEnv(body["envOverride"], "--env");
-    if (envErrors.length > 0) return c.json({ error: envErrors.join("; "), code: "invalid_env" }, 400);
-    envOverride = normalizeSeatEnv(body["envOverride"]);
-  }
+  const envOverride = readSeatEnvOverride(body["envOverride"]);
   // Item 2 / slice-05 Checkpoint 3.3: install-time compatibility check inputs
   const skipVersionCheck = body["skipVersionCheck"] === true;
   const clientCliVersion = typeof body["cliVersion"] === "string" ? body["cliVersion"] : undefined;

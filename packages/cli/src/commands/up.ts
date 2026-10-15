@@ -43,6 +43,19 @@ function isFilesystemRoot(cwd: string): boolean {
   return resolved === nodePath.parse(resolved).root;
 }
 
+/** The mistakes the daemon would refuse in an env: block, caught before anything is sent. */
+function checkEnvAssignment(assignment: string): string | null {
+  const eq = assignment.indexOf("=");
+  if (eq <= 0) return `expects KEY=VALUE, got "${assignment}"`;
+  const name = assignment.slice(0, eq);
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) return `"${name}" is not a valid name; names match ^[A-Z_][A-Z0-9_]*$`;
+  if (name.startsWith("OPENRIG_")) return `"${name}" is reserved; OPENRIG_* names belong to OpenRig`;
+  const value = assignment.slice(eq + 1);
+  if (value === "") return `${name}: value must not be empty`;
+  if (value.includes("\0")) return `${name}: value must not contain a NUL byte`;
+  return null;
+}
+
 // OPR.0.4.4.11 (arch return R11-2) — pre-dispatch detection of a topology
 // source for the --host rejection. Mirrors the daemon's FR-1 detection
 // contract without importing the daemon package: `.rigtopology` extension,
@@ -117,12 +130,13 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
       const deps = getDepsF();
       const envOverride: Record<string, string> = {};
       for (const assignment of opts.env ?? []) {
-        const eq = assignment.indexOf("=");
-        if (eq <= 0) {
-          console.error(`--env expects KEY=VALUE, got "${assignment}"`);
+        const problem = checkEnvAssignment(assignment);
+        if (problem) {
+          console.error(`--env ${problem}`);
           process.exitCode = 1;
           return;
         }
+        const eq = assignment.indexOf("=");
         envOverride[assignment.slice(0, eq)] = assignment.slice(eq + 1);
       }
       const envOverrideBody = Object.keys(envOverride).length > 0 ? envOverride : undefined;
@@ -179,6 +193,12 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
           } else {
             console.error(HOST_TOPOLOGY_REJECTION);
           }
+          process.exitCode = 1;
+          return;
+        }
+        // The remote daemon restores a bare rig name from its own spec, so there is no launch for --env.
+        if (envOverrideBody && !source.includes("/") && !/\.(ya?ml|rigbundle|rigtopology)$/i.test(source)) {
+          console.error("--env applies to a new launch from a rig spec or bundle. A restore keeps the rig's own env: block; to change it, edit env: in the spec and launch again.");
           process.exitCode = 1;
           return;
         }
@@ -322,6 +342,13 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
         }
         return false;
       };
+      // A restore brings the rig back from its own spec, so there is no launch to apply --env to.
+      const refuseEnvOnRestore = (): boolean => {
+        if (!envOverrideBody) return false;
+        console.error("--env applies to a new launch from a rig spec or bundle. A restore keeps the rig's own env: block; to change it, edit env: in the spec and launch again.");
+        process.exitCode = 1;
+        return true;
+      };
       if (isRigName && await refuseArchivedName(source)) return;
       if (isRigName && !opts.existing) {
         try {
@@ -362,6 +389,7 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
         // "Turning on ..." per the rig's derived lifecycleState. Help text honesty:
         // "Recover" describes what `rig up` does; it does not promise success before
         // tester L4 VM proof completes.
+        if (sourceRef === source && refuseEnvOnRestore()) return;
         if (sourceRef === source && !opts.json) {
           const summaries = await fetchRigSummaries();
           const match = summaries.find((r) => r.name === source);
@@ -371,6 +399,8 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
             console.log(`Turning on rig "${source}"...`);
           }
         }
+      } else if (isRigName && opts.existing && refuseEnvOnRestore()) {
+        return;
       } else if (isRigName && opts.existing && !opts.json) {
         const summaries = await fetchRigSummaries();
         const match = summaries.find((r) => r.name === source);

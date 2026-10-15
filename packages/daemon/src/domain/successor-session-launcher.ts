@@ -1,5 +1,5 @@
 import { ulid } from "ulid";
-import { seatEnvLaunchVars, type SeatEnv } from "./seat-env.js";
+import { SEAT_ENV_KEYS_VAR, seatEnvLaunchVars, validateSeatEnvName, type SeatEnv } from "./seat-env.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { DiscoveryRepository } from "./discovery-repository.js";
 import type { RuntimeHint } from "./discovery-types.js";
@@ -226,6 +226,19 @@ export class SuccessorSessionLauncher {
       return { ok: false, code: "retiree_not_terminated", step: "create_successor", message: terminated.message, replacementStarted: false };
     }
     input.onReplacementStarted?.();
+    // The first launch put any one-off `rig up --env` values into the session's environment, and a
+    // respawned pane inherits that. A successor gets the spec's env and nothing else.
+    try {
+      await this.resetSessionSeatEnv(departingSession, input.node.seatEnv ?? {});
+    } catch (err) {
+      return {
+        ok: false,
+        code: "seat_env_reset_failed",
+        step: "create_successor",
+        replacementStarted: true,
+        message: `Could not reset the launch environment of "${departingSession}" for the successor: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
     // KI-14: the respawn command must be EXPLICIT. `respawn-pane` without a command re-runs the
     // pane's creation (or last-respawn) command — the default shell only for createSession panes.
     // Adopted/hand-recovered panes carry a full harness invocation there (`codex … resume
@@ -293,6 +306,23 @@ export class SuccessorSessionLauncher {
       appliedLaunch: started.appliedLaunch,
       ...(respawned.warnings ? { warnings: respawned.warnings } : {}),
     };
+  }
+
+  /**
+   * Put the session's launch environment back to what the spec declares. The first launch records
+   * every name it set, spec and one-off alike, in OPENRIG_SEAT_ENV_KEYS; the names recorded that the
+   * spec doesn't declare are removed, the declared ones get the spec's value, and the record is
+   * rewritten, so neither the successor's shell nor a managed Claude launch sees a one-off.
+   */
+  private async resetSessionSeatEnv(session: string, seatEnv: SeatEnv): Promise<void> {
+    const recorded = (await this.tmuxAdapter.getSessionEnv(session, SEAT_ENV_KEYS_VAR) ?? "").split(",").filter(Boolean);
+    for (const name of recorded) {
+      if (!(name in seatEnv) && validateSeatEnvName(name) === null) await this.tmuxAdapter.unsetSessionEnv(session, name);
+    }
+    const declared = Object.keys(seatEnv);
+    for (const name of declared) await this.tmuxAdapter.setSessionEnv(session, name, seatEnv[name]!);
+    if (declared.length > 0) await this.tmuxAdapter.setSessionEnv(session, SEAT_ENV_KEYS_VAR, declared.join(","));
+    else if (recorded.length > 0) await this.tmuxAdapter.unsetSessionEnv(session, SEAT_ENV_KEYS_VAR);
   }
 
   /**
