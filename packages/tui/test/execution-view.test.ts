@@ -539,6 +539,18 @@ describe("execution drill — one page from source, esc back", () => {
     expect(strip).not.toContain("working (self-report)");
   });
 
+  it("shows a lane's seat on the slice card when the row names the slice by its directory", () => {
+    const execution = executionFixture();
+    const lane = execution.q1_lanes[0]!;
+    lane["slice"] = "01-slice";
+    const working = text(executionSliceStripLines(execution, "OPR.0.5.8.1", "01-slice", 120, "active"));
+    expect(working).toContain("assignment  dev-1@rig · working (self-report)");
+    lane["waiting"] = { on: "external:pr-1293" };
+    lane["pickup"] = { state: "parked" };
+    const waiting = text(executionSliceStripLines(execution, "OPR.0.5.8.1", "01-slice", 120, "active"));
+    expect(waiting).toContain("assignment  dev-1@rig · waiting on external:pr-1293");
+  });
+
   it("renders through a SCOPES mission selection, opens rich slice detail, and preserves source drills", () => {
     const demo = demoSnapshot();
     const scopes = [...demo.scopes!, ...executionScopes()];

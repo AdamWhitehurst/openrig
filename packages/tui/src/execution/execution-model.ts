@@ -175,7 +175,7 @@ function sliceFacts(execution: ExecutionViewSnap, scopes: readonly MissionScopes
     const cells = Object.fromEntries(RUNGS.map((rung) => [rung, rungCell(ladder, rung)])) as Record<Rung, RungCell>;
     const seqIndex = seq.findIndex((item) => item["slice_id"] === id || item["dir"] === dir);
     const scope = missionScopes?.slices.find((slice) => slice.id === id || slice.dirName === dir) ?? null;
-    const lane = lanes.find((candidate) => candidate["slice"] === id) ?? null;
+    const lane = lanes.find((candidate) => candidate["slice"] === id || candidate["slice"] === dir) ?? null;
     return {
       id,
       dir,
