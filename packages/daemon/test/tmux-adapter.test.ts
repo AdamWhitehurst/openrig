@@ -306,7 +306,7 @@ describe("TmuxAdapter", () => {
 
       await adapter.createSession("r01-dev1-impl", "/home/user/code");
 
-      expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g", "tmux set-option -t =r01-dev1-impl: window-size manual"]); // clean server: nothing to exclude
+      expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g", "tmux set-option -w -t '=r01-dev1-impl:' 'window-size' 'manual'"]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
         "tmux new-session -d -s 'r01-dev1-impl' -x 200 -y 50 -c '/home/user/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
@@ -318,7 +318,7 @@ describe("TmuxAdapter", () => {
 
       await adapter.createSession("r01-dev1-impl", "/home/user/my project/code");
 
-      expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g", "tmux set-option -t =r01-dev1-impl: window-size manual"]); // clean server: nothing to exclude
+      expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g", "tmux set-option -w -t '=r01-dev1-impl:' 'window-size' 'manual'"]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
         "tmux new-session -d -s 'r01-dev1-impl' -x 200 -y 50 -c '/home/user/my project/code' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
@@ -330,7 +330,7 @@ describe("TmuxAdapter", () => {
 
       await adapter.createSession("r01-dev's session", "/tmp");
 
-      expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g", 'tmux set-option -t \'=r01-dev\'"\'"\'s session:\' window-size manual']); // clean server: nothing to exclude
+      expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g", `tmux set-option -w -t '=r01-dev'"'"'s session:' 'window-size' 'manual'`]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
         "tmux new-session -d -s 'r01-dev'\"'\"'s session' -x 200 -y 50 -c '/tmp' -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
@@ -342,7 +342,7 @@ describe("TmuxAdapter", () => {
 
       await adapter.createSession("r01-dev1-impl");
 
-      expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g", "tmux set-option -t =r01-dev1-impl: window-size manual"]); // clean server: nothing to exclude
+      expect(exec.mock.calls.map((c) => c[0]).slice(1)).toEqual(["tmux show-environment -g", "tmux set-option -w -t '=r01-dev1-impl:' 'window-size' 'manual'"]); // clean server: nothing to exclude
       expect(exec.mock.calls[0]![0]).toBe(
         "tmux new-session -d -s 'r01-dev1-impl' -x 200 -y 50 -e 'OPENRIG_TRANSCRIPTS_LINES=' -e 'OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=' -P -F '#{pane_id}'"
       );
@@ -1201,7 +1201,7 @@ describe("TmuxAdapter", () => {
         "tmux set-environment -t =dev-impl@rig -r CLAUDECODE",
         "tmux set-environment -t =dev-impl@rig -r CLAUDE_EFFORT",
         "tmux respawn-pane -k -t %9 -c /w",
-        "tmux set-option -t =dev-impl@rig: window-size manual",
+        "tmux set-option -w -t '=dev-impl@rig:' 'window-size' 'manual'",
       ]);
     });
 
@@ -1211,7 +1211,7 @@ describe("TmuxAdapter", () => {
       expect(exec.mock.calls.map((c) => c[0]).slice(2)).toEqual([
         "tmux set-environment -t =s -r HERDR_ENV",
         "tmux respawn-pane -k -t %9",
-        "tmux set-option -t =s: window-size manual",
+        "tmux set-option -w -t '=s:' 'window-size' 'manual'",
       ]);
     });
 

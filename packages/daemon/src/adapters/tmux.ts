@@ -637,12 +637,8 @@ export class TmuxAdapter {
       warnings.push(parentSessionEnvWarning(name, err));
     }
     // Hold the size: without this the next client to attach resizes the window to itself.
-    try {
-      const keep = ["tmux", "set-option", "-t", exactTarget(name, "window"), "window-size", "manual"];
-      await this.run(keep, posixJoinArgv(keep));
-    } catch (err) {
-      warnings.push(`Could not fix the pane size of ${name}; a narrow client attached later can shrink it: ${(err as Error).message}`);
-    }
+    const kept = await this.setWindowOption(name, "window-size", "manual");
+    if (!kept.ok) warnings.push(`Could not fix the pane size of ${name}; a narrow client attached later can shrink it: ${kept.message}`);
     return warnings.length ? { ok: true, warnings } : { ok: true };
   }
 

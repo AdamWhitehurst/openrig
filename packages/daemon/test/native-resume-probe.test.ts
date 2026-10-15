@@ -901,7 +901,7 @@ describe("native resume probe", () => {
   });
 });
 
-// A narrow pane cuts Claude's footer short, and vim mode puts `-- INSERT --` ahead of it. Screen text alone
+// A narrow pane cuts Claude's footer short, and vim mode puts a marker (`-- INSERT --`, `-- NORMAL --`) ahead of it. Screen text alone
 // still never proves the launched identity for an auto-mode seat, so those screens stay "inconclusive" without it.
 describe("Claude footers in a narrow or vim-mode pane", () => {
   const screen = (footer: string) => `Conversation\n──────────\n❯ \n──────────\n  ${footer}\n`;
@@ -911,6 +911,7 @@ describe("Claude footers in a narrow or vim-mode pane", () => {
   it.each([
     "⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
     "-- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)",
+    "-- NORMAL -- ⏵⏵ auto mode on (shift+tab to cycle)",
     "⏵⏵ auto mode on (shift+tab to cy",
     "⏵⏵ auto mode on (shift+tab to cycle…",
     "⏵⏵ auto mode on (",
@@ -925,6 +926,7 @@ describe("Claude footers in a narrow or vim-mode pane", () => {
     "⏵⏵ accept edits on (shift+t",
     "⏵⏵ accept edi",
     "-- INSERT -- ⏵⏵ accept",
+    "-- NORMAL -- ⏵⏵ accept edits on (shift+tab to cycle)",
   ])("an accept-edits footer reads as a running TUI: %s", footer => {
     expect(probe(footer)).toMatchObject({ status: "resumed", code: "active_runtime" });
   });
@@ -936,7 +938,7 @@ describe("Claude footers in a narrow or vim-mode pane", () => {
     "⏵⏵ auto mode only (shift+tab to cycle)",
     "auto mode on (shift+tab to cycle)",
     "I think ⏵⏵ auto mode on (shift+tab to cycle)",
-    "-- NORMAL -- ⏵⏵ auto mode on (shift+tab to cycle)",
+    "-- normal -- ⏵⏵ auto mode on (shift+tab to cycle)",
     "⏵⏵ bypass permissions on (shift+tab to cycle)",
     "? for shortcuts",
   ])("a non-ready or unrelated line is still not a ready footer: %s", footer => {

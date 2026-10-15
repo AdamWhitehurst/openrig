@@ -36,7 +36,7 @@ describe("tmux argv exec path", () => {
       "-e", "OPENRIG_TRANSCRIPTS_LINES=", "-e", "OPENRIG_TRANSCRIPTS_POLL_INTERVAL_SECONDS=",
       "-e", "PATH=/a b:/c", "-e", "EMPTY=",
       "-P", "-F", "#{pane_id}",
-    ], ["tmux", "show-environment", "-g"], ["tmux", "set-option", "-t", "=r01-dev1-impl:", "window-size", "manual"]]);
+    ], ["tmux", "show-environment", "-g"], ["tmux", "set-option", "-w", "-t", "=r01-dev1-impl:", "window-size", "manual"]]);
   });
 
   it("sendKeys passes key names as separate verbatim units", async () => {

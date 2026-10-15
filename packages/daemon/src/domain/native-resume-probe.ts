@@ -259,9 +259,10 @@ export function isProbeShellReady(input: ProbeShellReadyInput): boolean {
 const AUTO_MODE_HINT = "(shift+tab to cycle)";
 
 /** Claude's auto-mode footer line. A narrow pane cuts it short (`…(shift+tab to cy`), and vim mode puts
- * `-- INSERT --` ahead of it. Only that mode bar is accepted: this is screen text, never identity proof. */
+ * a mode marker such as `-- INSERT --` or `-- NORMAL --` ahead of it (the set `CLAUDE_MODE_FOOTER` accepts).
+ * Only that mode bar is accepted: this is screen text, never identity proof. */
 function isClaudeAutoModeFooter(line: string): boolean {
-  const bar = line.trim().replace(/^-- INSERT --\s+/, "");
+  const bar = line.trim().replace(/^-- [A-Z]+ --\s+/, "");
   const head = "⏵⏵ auto mode on";
   if (!bar.startsWith(head)) return false;
   const rest = bar.slice(head.length);
@@ -279,8 +280,8 @@ function looksLikeClaudeTui(paneContent: string): boolean {
   return (
     paneContent.includes("Claude Code v")
     || paneContent.includes("accept edits on")
-    // A narrow pane cuts the footer short; vim mode puts `-- INSERT --` ahead of it.
-    || /^[ \t]*(?:-- INSERT --[ \t]+)?⏵⏵ accept\b/m.test(paneContent)
+    // A narrow pane cuts the footer short; vim mode puts a marker such as `-- INSERT --` ahead of it.
+    || /^[ \t]*(?:-- [A-Z]+ --[ \t]+)?⏵⏵ accept\b/m.test(paneContent)
   );
 }
 
