@@ -438,6 +438,41 @@ describe("queue routes", () => {
         expect((await show(row.qitemId)).resolution).toBe("fallback: first reason\nHandled by c\nfallback: second reason");
       });
 
+      it("keeps an outcome that is itself one 'fallback: ' line", async () => {
+        const qitemId = await rowIn("in-progress");
+        await post(qitemId, { ...closeWith("done"), resolution: "fallback: yes" });
+        await post(qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" });
+        queueRepo.routeToFallback(qitemId, "c@r", "b@r unreachable");
+        expect((await show(qitemId)).resolution).toBe("fallback: yes\nfallback: b@r unreachable");
+      });
+
+      it("replaces a fallback line whose reason has a newline, as main does", async () => {
+        const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+        queueRepo.routeToFallback(row.qitemId, "c@r", "line one\nline two");
+        expect((await show(row.qitemId)).resolution).toBe("fallback: line one\nline two");
+        queueRepo.routeToFallback(row.qitemId, "d@r", "second");
+        expect((await show(row.qitemId)).resolution).toBe("fallback: second");
+      });
+
+      it("keeps an outcome that follows a fallback line whose reason has a newline", async () => {
+        const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
+        queueRepo.routeToFallback(row.qitemId, "c@r", "line one\nline two");
+        queueRepo.claim({ qitemId: row.qitemId, destinationSession: "c@r" });
+        await post(row.qitemId, { ...closeWith("done"), resolution: "Handled by c" }, "c@r");
+        await post(row.qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" }, "c@r");
+        queueRepo.routeToFallback(row.qitemId, "d@r", "second");
+        expect((await show(row.qitemId)).resolution).toBe("fallback: line one\nline two\nHandled by c\nfallback: second");
+      });
+
+      it("a fallback line added after an outcome is replaced by the next fallback, not piled up", async () => {
+        const qitemId = await rowIn("in-progress");
+        await post(qitemId, { ...closeWith("done"), resolution: "Fixed in #42" });
+        await post(qitemId, { state: "in-progress", reopen: true, transitionNote: "more to do" });
+        queueRepo.routeToFallback(qitemId, "c@r", "first");
+        queueRepo.routeToFallback(qitemId, "d@r", "second");
+        expect((await show(qitemId)).resolution).toBe("Fixed in #42\nfallback: second");
+      });
+
       it("still replaces a plain fallback line, as before", async () => {
         const row = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "x", nudge: false });
         queueRepo.routeToFallback(row.qitemId, "c@r", "first reason");

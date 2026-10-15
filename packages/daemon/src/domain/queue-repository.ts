@@ -3861,6 +3861,19 @@ export class QueueRepository {
       .run(ts, result, qitemId);
   }
 
+  /** The reason of the row's newest fallback reroute, read from the structured event routeToFallback emits
+   *  (the same events-by-qitem lookup closure-overdue uses). Null when the row was never rerouted. */
+  private lastFallbackReason(qitemId: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT json_extract(payload, '$.reason') AS reason FROM events
+          WHERE type = 'qitem.fallback_routed' AND json_extract(payload, '$.qitemId') = ?
+          ORDER BY seq DESC LIMIT 1`,
+      )
+      .get(qitemId) as { reason: string | null } | undefined;
+    return row?.reason ?? null;
+  }
+
   /**
    * Pod-fallback: redirect qitem to a fallback destination (e.g., when a seat
    * is unreachable). Emits qitem.fallback_routed; preserves chain_of_record.
@@ -3874,13 +3887,19 @@ export class QueueRepository {
     const originalDestination = qitem.destinationSession;
     const newChain = JSON.stringify([...(qitem.chainOfRecord ?? []), `fallback-from:${originalDestination}`]);
 
-    // The field held only a fallback line before a close could store an outcome. A lone fallback line is
-    // replaced as it always was; anything else is an outcome (possibly after an earlier fallback line), and
-    // the new line goes after it so the outcome is not erased.
+    // The field held only a fallback line before a close could store an outcome. The line this method last
+    // wrote is replaced, as it always was; anything else in the field is an outcome (possibly after an
+    // earlier fallback line) and stays, with the new line after it. "The line it last wrote" is read from the
+    // reason of the row's newest fallback event, so no marker is stored in the text; with no such event the
+    // field is left whole.
     const fallbackLine = `fallback: ${reason}`;
-    const nextResolution = !qitem.resolution || /^fallback: [^\n]*$/.test(qitem.resolution)
-      ? fallbackLine
-      : `${qitem.resolution}\n${fallbackLine}`;
+    const lastWritten = this.lastFallbackReason(qitemId);
+    const lastLine = lastWritten === null ? null : `fallback: ${lastWritten}`;
+    const kept = !qitem.resolution || lastLine === null ? qitem.resolution
+      : qitem.resolution === lastLine ? null
+        : qitem.resolution.endsWith(`\n${lastLine}`) ? qitem.resolution.slice(0, -(lastLine.length + 1))
+          : qitem.resolution;
+    const nextResolution = kept ? `${kept}\n${fallbackLine}` : fallbackLine;
 
     const txn = this.db.transaction(() => {
       this.db
