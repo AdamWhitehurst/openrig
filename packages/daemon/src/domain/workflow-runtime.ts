@@ -68,6 +68,7 @@ import type {
   WorkflowStepSpec,
   WorkflowStepTrailEntry,
 } from "./workflow-types.js";
+import { lifecycleScope, normalizeWorkflowScope, packetScopeTags, type WorkflowScope } from "./workflow-scope.js";
 import { compileProjectLifecycle, type LifecycleCompilation } from "./project-lifecycle-compiler.js";
 
 export interface WorkflowRuntimeDeps {
@@ -113,6 +114,14 @@ export interface InstantiateInput {
    * Absent AND no spec default = unbound (today's behavior).
    */
   targetRig?: string;
+  /**
+   * The project / mission / slice (and free-form tags) this instance works
+   * for. Normalized here (a reserved or contradicting tag throws
+   * WorkflowScopeError before any write), stored on the instance, and stamped
+   * on every packet it creates. A lifecycle instance takes project and mission
+   * from its compiled identity instead.
+   */
+  scope?: Pick<WorkflowScope, "project" | "mission" | "slice" | "tags">;
   lifecycle?: {
     operationKey: string;
     compiledInputDigest: string;
@@ -406,6 +415,9 @@ export class WorkflowRuntime {
         };
       }
     }
+    const scope = input.compiledLifecycle
+      ? lifecycleScope(input.compiledLifecycle.identity, input.compiledLifecycle.sliceDirs)
+      : normalizeWorkflowScope(input.scope ?? {});
     // OPR.0.3.3.04.1 (AC-3 reachability): a fresh operator runs
     // `workflow instantiate <discovered-name>` (e.g. `conveyor`), not a hidden
     // file path. Resolve the identifier against the seeded spec cache BY NAME
@@ -726,6 +738,7 @@ export class WorkflowRuntime {
         // OPR.0.4.6.FAC1: the resolved rig binding persists with the
         // instance row (same txn as the entry packet).
         boundRig,
+        scope,
         lifecycle: input.lifecycle
           ? {
               ...input.lifecycle,
@@ -777,6 +790,7 @@ export class WorkflowRuntime {
           `workflow:${specRow.name}`,
           `instance:${instance.instanceId}`,
           ...(entryGateException ? workflowExceptionTags(entryGateException.identity).filter((t) => !t.startsWith("workflow:") && !t.startsWith("instance:")) : []),
+          ...packetScopeTags(instance, entryStep.id),
         ],
         summary: entryGate?.summary ?? undefined,
         evidenceRef: entryGate?.evidenceRef ?? undefined,
@@ -1186,6 +1200,7 @@ export class WorkflowRuntime {
           "resume",
           `workflow:${instance.workflowName}`,
           `instance:${instance.instanceId}`,
+          ...packetScopeTags(instance, step.id),
         ],
         chainOfRecord: failedPacketId ? [failedPacketId] : undefined,
       });
@@ -1400,7 +1415,7 @@ export class WorkflowRuntime {
         }),
         priority: "routine",
         tier: "mode2",
-        tags: ["workflow", "resume", `workflow:${instance.workflowName}`, `instance:${instance.instanceId}`, `occurrence:${occurrence.occurrenceId}`],
+        tags: ["workflow", "resume", `workflow:${instance.workflowName}`, `instance:${instance.instanceId}`, `occurrence:${occurrence.occurrenceId}`, ...packetScopeTags(instance, step.id)],
         chainOfRecord: [occurrence.failedPacketId],
       });
       register(created.persistedEvent);
