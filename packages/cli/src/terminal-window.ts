@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir, hostname, networkInterfaces } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -28,7 +28,47 @@ export interface WindowDeps {
   herdrConfig(socketPath: string, columns?: number): string;
   /** Hosting terminal measurement also works for an agent shell tool with piped stdio. */
   columns?(): Promise<number | undefined>;
+  /** The Herdr the person is viewing from, when this process runs in a tmux pane someone is attached to. */
+  viewerEnv?(): Promise<ViewerHerdr | undefined>;
   notice?(message: string): void;
+}
+
+/** Herdr's own markers: TERM_PROGRAM=herdr, or the pane variables a tmux started inside a Herdr pane inherits. */
+function inHerdr(env: NodeJS.ProcessEnv): boolean {
+  return env["TERM_PROGRAM"] === "herdr" || (env["HERDR_ENV"] === "1" && !!env["HERDR_PANE_ID"] && !!env["HERDR_SOCKET_PATH"]);
+}
+
+/** The Herdr markers of the viewing client, or `tied` when clients active at the same moment sit in different Herdr sessions. */
+export type ViewerHerdr = { env: NodeJS.ProcessEnv } | { tied: true };
+
+const HERDR_VIEWER_KEYS = ["TERM_PROGRAM", "HERDR_ENV", "HERDR_PANE_ID", "HERDR_SOCKET_PATH", "HERDR_SESSION"];
+
+/**
+ * The Herdr the person is viewing from, given the clients attached to this process's tmux session. The client that
+ * was active last is the one whose keypress started this, so clients are ranked first and only the latest group's
+ * environments are read (`env` returns undefined for one that can't be read). If none is attached, or any of the
+ * latest group can't be read or isn't in Herdr, there is no answer and the caller keeps today's detection; an older
+ * client never stands in for a newer one. If the clients tied for latest are all in Herdr but in different
+ * endpoints there is no single Herdr to pick, and `tied` lets the caller say so.
+ */
+export function viewerHerdr(clients: Array<{ activity: number; env(): NodeJS.ProcessEnv | undefined }>): ViewerHerdr | undefined {
+  const latest = Math.max(...clients.map(client => client.activity));
+  const top = clients.filter(client => client.activity === latest).map(client => client.env());
+  if (!top.length || !top.every((env): env is NodeJS.ProcessEnv => !!env && inHerdr(env))) return undefined;
+  const endpoint = (env: NodeJS.ProcessEnv) => env["HERDR_SOCKET_PATH"] ?? env["HERDR_SESSION"] ?? "";
+  if (top.some(env => endpoint(env) !== endpoint(top[0]!))) return { tied: true };
+  return { env: Object.fromEntries(HERDR_VIEWER_KEYS.flatMap(key => top[0]![key] === undefined ? [] : [[key, top[0]![key]]])) };
+}
+
+/** A shared TUI runs in the daemon's tmux server, so its own environment never carries the viewer's Herdr markers. */
+async function withViewerHerdr(deps: WindowDeps): Promise<{ deps: WindowDeps; tied?: true }> {
+  if (inHerdr(deps.env) || !deps.viewerEnv) return { deps };
+  const viewer = await deps.viewerEnv().catch(() => undefined);
+  if (!viewer) return { deps };
+  if ("tied" in viewer) return { deps, tied: true };
+  const env = { ...deps.env };
+  for (const key of HERDR_VIEWER_KEYS) delete env[key];
+  return { deps: { ...deps, env: { ...env, ...viewer.env } } };
 }
 
 export function defaultWindowDeps(): WindowDeps {
@@ -47,6 +87,26 @@ export function defaultWindowDeps(): WindowDeps {
     id: () => randomUUID().slice(0, 12),
     notice: message => process.stderr.write(`${message}\n`),
     herdrConfig: (socketPath, columns) => prepareHerdrLaunchConfig(env, socketPath, columns),
+    viewerEnv: async () => {
+      // Reading a client's environment needs /proc; other platforms keep today's detection.
+      const pane = process.env["TMUX"] && process.env["TMUX_PANE"];
+      if (!pane || process.platform !== "linux") return undefined;
+      const listed = (await run("tmux", ["list-clients", "-t", pane, "-F", "#{client_activity} #{client_pid} #{client_control_mode}"], { encoding: "utf8", timeout: 1000 })).stdout;
+      const clients = listed.trim().split("\n").flatMap(line => {
+        const [activity, pid, control] = line.split(" ");
+        if (!activity || !pid || control === "1") return [];
+        const env = () => {
+          try {
+            return Object.fromEntries(readFileSync(`/proc/${Number(pid)}/environ`, "utf8").split("\0").flatMap(entry => {
+              const at = entry.indexOf("=");
+              return at > 0 ? [[entry.slice(0, at), entry.slice(at + 1)]] : [];
+            }));
+          } catch { return undefined; }
+        };
+        return [{ activity: Number(activity), env }];
+      });
+      return viewerHerdr(clients);
+    },
     columns: async () => {
       if (process.stdout.isTTY && process.stdout.columns > 0) return process.stdout.columns;
       try {
@@ -100,7 +160,7 @@ async function herdrBinary(deps: WindowDeps): Promise<string | null> {
 }
 
 /** New surfaces only. No System Events keystrokes or existing-terminal input. */
-async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((command: string) => Promise<{ app: string; surface: string; columns?: number }>) | { currentHerdr: true } | string> {
+async function windowLauncher(deps: WindowDeps, notes: string[], tiedViewers?: boolean): Promise<((command: string) => Promise<{ app: string; surface: string; columns?: number }>) | { currentHerdr: true } | string> {
   // Shell tools can pipe stdio while still running inside the person's terminal.
   const program = deps.env["TERM_PROGRAM"];
   const linuxHost = deps.platform !== "linux" ? undefined
@@ -109,9 +169,7 @@ async function windowLauncher(deps: WindowDeps, notes: string[]): Promise<((comm
   const host = !program || program === "tmux" ? deps.env["__CFBundleIdentifier"] ?? linuxHost : program;
   if (deps.env["CI"] && !["0", "false"].includes(deps.env["CI"])) return "This is a CI run.";
   if (deps.env["SSH_CONNECTION"] || deps.env["SSH_CLIENT"] || deps.env["SSH_TTY"]) return "This is an SSH session; no desktop window is opened over SSH.";
-  // A tmux started inside a Herdr pane sets TERM_PROGRAM=tmux but inherits Herdr's pane markers, so read those too.
-  const inHerdrPane = deps.env["HERDR_ENV"] === "1" && !!deps.env["HERDR_PANE_ID"] && !!deps.env["HERDR_SOCKET_PATH"];
-  if (host === "herdr" || inHerdrPane) return { currentHerdr: true };
+  if (inHerdr(deps.env)) return { currentHerdr: true };
   if (deps.platform === "darwin") {
     const inGhostty = host === "ghostty" || host === "com.mitchellh.ghostty";
     const inTerminal = host === "Apple_Terminal" || host === "com.apple.Terminal";
@@ -191,6 +249,7 @@ end run`;
       return { app, surface: "window-requested" };
     };
   }
+  if (tiedViewers) return "Clients attached to this tmux session from different Herdr sessions were active at the same moment, so there is no single Herdr to open in. Press a key in the one you are viewing, then try again.";
   return `Unrecognised or unavailable hosting terminal: ${JSON.stringify(host ?? "unknown")}.`;
 }
 
@@ -263,9 +322,11 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
         : `No terminal window was opened. ${reason} On the daemon's desktop, run: ${recovery}`), windowAttempted });
   const windowNotes: string[] = [];
   try {
+    const viewed = await withViewerHerdr(deps);
+    deps = viewed.deps;
     if (!localDaemon(client.baseUrl)) throw new Error("The window launcher must run on the daemon's own desktop; the configured daemon is remote.");
     if (requestedProvider && !["herdr", "tmux"].includes(requestedProvider)) throw new Error("--window supports herdr or tmux. Use cmux without --window.");
-    const launchWindow = await windowLauncher(deps, windowNotes);
+    const launchWindow = await windowLauncher(deps, windowNotes, viewed.tied);
     const measured = typeof launchWindow !== "string" ? await deps.columns?.().catch(() => undefined) : undefined;
     let viewportColumns = Number.isSafeInteger(measured) && measured! > 0 ? measured : undefined;
     const herdr = requestedProvider === "tmux" ? null : await herdrBinary(deps);

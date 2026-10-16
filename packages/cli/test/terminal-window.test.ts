@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { DaemonClient } from "../src/client.js";
-import { openTerminalWindow, type WindowDeps } from "../src/terminal-window.js";
+import { openTerminalWindow, viewerHerdr, type WindowDeps } from "../src/terminal-window.js";
 import { shellQuote } from "../src/cross-host-executor.js";
 
 function fixture(options: { herdr?: boolean; ghostty?: string; refusal?: number; empty?: boolean; alive?: boolean } = {}) {
@@ -671,5 +671,116 @@ describe("welcome launcher for desktop apps and an existing Herdr client", () =>
     const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
     expect(result).toMatchObject({ ok: false, windowAttempted: false });
     expect(f.post).not.toHaveBeenCalled();
+  });
+});
+
+describe("a TUI in the daemon's tmux server, viewed from a Herdr pane", () => {
+  const client = (activity: number, env: NodeJS.ProcessEnv | undefined) => ({ activity, env: () => env });
+  const markers = { TERM_PROGRAM: "herdr", HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", HERDR_SOCKET_PATH: "/fixture/.config/herdr/herdr.sock" };
+  // What the shared TUI's own process sees: the daemon's tmux server, no Herdr markers of the viewer's.
+  const tuiEnv = { HOME: "/fixture", WAYLAND_DISPLAY: "wayland-1", TERM_PROGRAM: "tmux", HERDR_SESSION: "stale" };
+  const linux = () => {
+    const f = fixture();
+    f.deps.platform = "linux";
+    f.deps.env = { ...tuiEnv };
+    f.preview.status.launch.socketPath = markers.HERDR_SOCKET_PATH;
+    return f;
+  };
+
+  it("opens the view in the Herdr of the client the person is attached with", async () => {
+    const f = linux();
+    f.deps.viewerEnv = async () => viewerHerdr([client(5, { ...markers, PATH: "/not/copied" })]);
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: true }); expect(result.window).toBeUndefined();
+    expect(f.post).toHaveBeenCalledWith("/api/terminal/open", expect.objectContaining({ view: "saved:kernel", provider: "herdr" }), expect.anything());
+    expect(f.deps.launch).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["no client is attached", async () => viewerHerdr([])],
+    ["the latest client is tied with one that has no Herdr", async () => viewerHerdr([client(5, markers), client(5, { TERM_PROGRAM: "ghostty" })])],
+    ["the newest client's environment can't be read, though an older client is in Herdr", async () => viewerHerdr([client(10, undefined), client(9, markers)])],
+    ["a client tied for newest can't be read", async () => viewerHerdr([client(10, undefined), client(10, markers)])],
+    ["the attached client has no Herdr", async () => viewerHerdr([client(5, { TERM_PROGRAM: "ghostty" })])],
+    ["the lookup fails", async () => { throw new Error("no tmux"); }],
+    ["the lookup is not available", undefined],
+  ])("keeps today's result when %s", async (_name, viewerEnv) => {
+    const f = linux();
+    f.deps.viewerEnv = viewerEnv as WindowDeps["viewerEnv"];
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: false, windowAttempted: false });
+    expect(result.error).toContain('Unrecognised or unavailable hosting terminal: "unknown"');
+    expect(f.post).not.toHaveBeenCalled();
+  });
+
+  it("leaves a process that is already in Herdr alone and does not ask tmux", async () => {
+    const f = linux();
+    f.deps.env = { ...tuiEnv, ...markers };
+    f.deps.viewerEnv = vi.fn(async () => { throw new Error("should not be asked"); });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: true });
+    expect(f.deps.viewerEnv).not.toHaveBeenCalled();
+  });
+
+  it("says clients in different Herdr sessions were active together, instead of calling the host unknown", async () => {
+    const f = linux();
+    f.deps.viewerEnv = async () => viewerHerdr([
+      client(5, markers),
+      client(5, { ...markers, HERDR_PANE_ID: "w9:p9", HERDR_SOCKET_PATH: "/fixture/.config/herdr/sessions/other/herdr.sock" }),
+    ]);
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result).toMatchObject({ ok: false, windowAttempted: false });
+    expect(result.error).toContain("different Herdr sessions were active at the same moment, so there is no single Herdr to open in");
+    expect(result.error).not.toContain("Unrecognised or unavailable hosting terminal");
+    // Names no endpoint or pane of either client; the command to run is the same one a failed open already prints.
+    expect(result.error).not.toContain("sessions/other");
+    expect(result.error).not.toContain("w9:p9");
+    expect(f.post).not.toHaveBeenCalled();
+    expect(f.deps.launch).not.toHaveBeenCalled();
+  });
+
+  it("keeps main's result for a desktop host it already accepts, even when tied clients are in different Herdr sessions", async () => {
+    const f = linux();
+    f.deps.env = { ...tuiEnv, GNOME_TERMINAL_SERVICE: ":1.2" };
+    f.deps.viewerEnv = async () => ({ tied: true });
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result.error ?? "").not.toContain("no single Herdr");
+    expect(f.deps.launch).toHaveBeenCalled();
+  });
+
+  it("refuses, as before, when the viewer's Herdr is not the daemon's", async () => {
+    const f = linux();
+    f.deps.viewerEnv = async () => viewerHerdr([client(5, { ...markers, HERDR_SOCKET_PATH: "/fixture/.config/herdr/sessions/other/herdr.sock" })]);
+    const result = await openTerminalWindow(f.client, "saved:kernel", undefined, f.deps);
+    expect(result.error).toContain("The current Herdr endpoint differs from the daemon's endpoint");
+    expect(f.post).not.toHaveBeenCalled();
+  });
+
+  describe("viewerHerdr", () => {
+    const other = { ...markers, HERDR_SOCKET_PATH: "/fixture/.config/herdr/sessions/other/herdr.sock", HERDR_PANE_ID: "w9:p9" };
+    it("takes the client that was active last, not the oldest or the first listed", () => {
+      expect(viewerHerdr([client(1, other), client(9, markers)])).toEqual({ env: markers });
+      expect(viewerHerdr([client(9, other), client(1, markers)])).toEqual({ env: other });
+    });
+    it("ranks before reading: an unreadable newest client, alone or tied, gives no answer, and an older client is never read", () => {
+      const older = vi.fn(() => markers as NodeJS.ProcessEnv | undefined);
+      expect(viewerHerdr([client(10, undefined), { activity: 9, env: older }])).toBeUndefined();
+      expect(viewerHerdr([{ activity: 9, env: older }, client(10, undefined)])).toBeUndefined();
+      expect(viewerHerdr([client(10, undefined), client(10, markers), client(9, other)])).toBeUndefined();
+      expect(older).not.toHaveBeenCalled();
+    });
+    it("has no answer when the last-active client is not in Herdr, even if an older one is", () => {
+      expect(viewerHerdr([client(1, markers), client(9, { TERM_PROGRAM: "ghostty" })])).toBeUndefined();
+    });
+    it("reports a tie across Herdr endpoints, picks one when the tied clients agree, and has no answer when one tied client has no Herdr", () => {
+      expect(viewerHerdr([client(9, markers), client(9, other)])).toEqual({ tied: true });
+      expect(viewerHerdr([client(9, markers), client(9, { ...other, HERDR_SOCKET_PATH: undefined, HERDR_SESSION: "other" })])).toEqual({ tied: true });
+      expect(viewerHerdr([client(9, markers), client(9, { ...markers, HERDR_PANE_ID: "w2:p2" })])).toBeDefined();
+      expect(viewerHerdr([client(9, markers), client(9, { TERM_PROGRAM: "ghostty" })])).toBeUndefined();
+    });
+    it("passes on only the Herdr markers", () => {
+      expect(viewerHerdr([client(1, { ...markers, HERDR_SESSION: "personal", SSH_TTY: "/dev/pts/1", PATH: "/x" })]))
+        .toEqual({ env: { ...markers, HERDR_SESSION: "personal" } });
+    });
   });
 });
