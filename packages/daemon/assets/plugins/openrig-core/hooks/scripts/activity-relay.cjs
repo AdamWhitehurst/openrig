@@ -206,7 +206,17 @@ function uid() {
   try { return typeof process.getuid === "function" ? String(process.getuid()) : "user"; } catch { return "user"; }
 }
 
+// OpenRig also copies this script into a seat's own settings.local.json hooks, so a seat that loads this plugin
+// as well would post every event twice. The plugin's manifest starts it with --from-plugin; when the daemon has
+// said the settings copy reports activity for the seat, the plugin's run exits. The settings copy is started
+// without that argument and always reports, and so does a seat that has no such variable (the plugin installed
+// on its own).
+function pluginRunIsRedundant(argv = process.argv, env = process.env) {
+  return argv.includes("--from-plugin") && firstString(env.OPENRIG_ACTIVITY_HOOKS_OWNED_BY_SETTINGS) === "1";
+}
+
 async function main() {
+  if (pluginRunIsRedundant()) return;
   const providerPayload = parseJson(await readStdin());
   const payload = buildOpenRigPayload(providerPayload);
   const identityPayload = buildSessionIdentityPayload(providerPayload, process.env);
@@ -230,4 +240,5 @@ module.exports = {
   parseJson,
   postHookPayload,
   resolveEndpoint,
+  pluginRunIsRedundant,
 };

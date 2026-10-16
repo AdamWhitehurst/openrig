@@ -37,6 +37,7 @@ import { CheckpointStore } from "./domain/checkpoint-store.js";
 import { SnapshotCapture } from "./domain/snapshot-capture.js";
 import { RestoreOrchestrator } from "./domain/restore-orchestrator.js";
 import { ClaudeManagedLaunch } from "./domain/claude-managed-launch.js";
+import { claudeCorePluginEnv } from "./domain/claude-core-plugin-env.js";
 import { ClaudeResumeAdapter } from "./adapters/claude-resume.js";
 import { CodexResumeAdapter } from "./adapters/codex-resume.js";
 import { codexDaemonSupportProbe } from "./domain/codex-daemon-support.js";
@@ -906,6 +907,10 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       logger: (...args) => console.log("[openrig]", ...args),
     });
     await vendorService.ensureLatest("openrig-core");
+    // Claude seats load the vendored plugin's hooks. The same map reaches fresh launch, restore and
+    // handover successors, and a seat's own spec env still wins over it.
+    const corePluginEnv = claudeCorePluginEnv(userPluginsDir);
+    if (corePluginEnv) runtimeSessionEnv["claude-code"] = corePluginEnv;
     for (const skill of ["openrig-skills", "refocusing"]) {
       try {
         vendorService.ensureSkillGlobally("openrig-core", skill, [

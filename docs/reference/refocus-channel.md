@@ -16,6 +16,13 @@ it is the mechanism that makes shipped chain files (see
 | Stop | ✓ | — | catch a long Claude turn crossing the growth threshold |
 | PostCompact | ✓ | ✓ | retain exact compaction due-state; deliver on the next actionable prompt |
 
+**How the hooks reach a seat.** A Claude seat launched by OpenRig starts with `CLAUDE_CODE_PLUGIN_DIRS` set to the
+vendored plugin (`$OPENRIG_HOME/plugins/openrig-core`), so Claude loads `hooks/claude.json` with no setup step, on a fresh
+launch, a restore and a handover successor. The folder a spec's `plugins: [shared:openrig-core]` projects into the seat's
+workspace is not what Claude loads. Codex has no way to load a plugin from a directory; its hooks come from the daemon's
+managed block in `config.toml`, which today carries the activity relay only, so the Codex column above describes
+`hooks/codex.json`'s registration and not a hook a Codex seat currently runs.
+
 Claude's additional firing signal is **transcript growth** — not turns (one turn
 can burn 200k tokens across fifty tool calls) and not wall-clock (the failure is
 sustained work, not elapsed time). Its default threshold is ~2.6MB of JSONL

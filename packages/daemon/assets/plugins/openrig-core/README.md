@@ -13,10 +13,17 @@ off, and never runs at fresh session start.
 
 ## Runtimes
 
-This plugin ships dual-manifest packaging — both `.claude-plugin/` and `.codex-plugin/`. Use it with:
+This plugin ships dual-manifest packaging — both `.claude-plugin/` and `.codex-plugin/`.
 
-- **Claude Code** — install via `/plugin` after the OpenRig daemon vendors `openrig-core/` to `~/.openrig/plugins/openrig-core/` on first run, or install the plugin directly through Claude Code's own plugin commands when remote distribution is available
-- **Codex CLI** — install via `/plugins` after the same vendoring step, or directly through Codex's own plugin commands
+- **Claude Code** — the OpenRig daemon vendors `openrig-core/` to `~/.openrig/plugins/openrig-core/` at startup and starts
+  every Claude seat it launches with `CLAUDE_CODE_PLUGIN_DIRS` pointing at that copy, so the plugin's hooks (refocus,
+  compaction restore) load with no setup step. This applies to fresh launches, restores and handover successors; a seat that
+  was already running picks it up at its next launch. The seat's own `settings.local.json` already reports activity, so the
+  daemon also sets `OPENRIG_ACTIVITY_HOOKS_OWNED_BY_SETTINGS=1` and the plugin's own `activity-relay.cjs` run (the manifest starts it with
+  `--from-plugin`) exits for that seat. Outside OpenRig-launched seats nothing sets that variable, and the relay reports as before. The plugin is not a
+  Claude marketplace entry, so `/plugin` has nothing to install.
+- **Codex CLI** — Codex has no directory option for plugins, so it does not load this plugin. A Codex seat gets only the hooks
+  the daemon writes into Codex's `config.toml` (the activity relay); `hooks/codex.json` is not read.
 
 One skill targets Claude Code's compaction behavior specifically:
 - `claude-compaction-restore` — used to rebuild a Claude Code agent's working mental model after `/compact`, from JSONL transcripts and touched files
@@ -51,8 +58,6 @@ install its content. Fetch failures, including 404 and network errors, leave the
 resolved local copy in place. A successful fetch also leaves it unchanged.
 This describes the fetch implementation, not a claim that a release artifact is
 currently available at the external repository.
-
-You can also install directly via Claude Code or Codex's own plugin commands if you prefer to manage plugins outside OpenRig.
 
 ## License
 
