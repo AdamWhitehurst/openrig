@@ -754,6 +754,15 @@ describe("Claude Code runtime adapter", () => {
       expect(reads).toBe(17);
     });
 
+    it("does not wait for a ready-looking screen whose lineage failed the check: timed out as before", async () => {
+      // Claude's composer and footer are on the pane, but the process under it is a look-alike, not this launch's Claude.
+      const lookAlike = { ...claude, executableName: "printf" };
+      const ready = "Restored conversation\n❯\u00a0\n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+      const { result, reads } = await run({ rows: () => [{ ...pane, tpgid: 11 }, launchScript, lookAlike], screen: () => ready });
+      expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+      expect(reads).toBe(17);
+    });
+
     it("does not wait for a Claude that says it needs a login: timed out as before", async () => {
       const { result, reads } = await run({ screen: () => "Not logged in · Run /login" });
       expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });

@@ -435,9 +435,11 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
   }
 
   /** A resume that is slow shows no Claude under the pane yet (the launch script is starting it) or the very Claude
-   *  this launch started. A Claude naming another conversation, or a look-alike process, is another occupant:
-   *  waiting won't make it this launch's, and its token is not recorded as an attempt. */
-  private async occupantIsOurStart(binding: NodeBinding): Promise<boolean> {
+   *  this launch started, and has not drawn Claude's ready screen. A Claude naming another conversation, or a
+   *  ready screen whose lineage failed the check, is not a start in progress: waiting won't make it this
+   *  launch's, and its token is not recorded as an attempt. */
+  private async occupantIsOurStart(binding: NodeBinding, looksReady: boolean): Promise<boolean> {
+    if (looksReady) return false;
     const launch = this.autoLaunches.get(binding.nodeId);
     if (!binding.tmuxPane || !launch) return true;
     const observation = { target: binding.tmuxPane, tmux: this.tmux, listProcesses: this.listProcesses, selectedExecutable: launch.executable };
@@ -446,7 +448,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
   }
 
   /** One look at a resuming pane: a verdict when the pane shows one, null to keep watching. */
-  private async resumeVerdict(binding: NodeBinding): Promise<{ verdict: HarnessLaunchResult | null; definiteFailure: boolean }> {
+  private async resumeVerdict(binding: NodeBinding): Promise<{ verdict: HarnessLaunchResult | null; definiteFailure: boolean; looksReady: boolean }> {
     const tmuxSession = binding.tmuxSession!;
     const paneCommand = await this.tmux.getPaneCommand(tmuxSession);
     const paneContent = (await this.tmux.capturePaneContent(tmuxSession, 40)) ?? "";
@@ -458,11 +460,11 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         error: "Claude resume failed: no conversation found for the requested session",
         recovery: "retry_fresh",
         missingConversation: true,
-      }, definiteFailure: false };
+      }, definiteFailure: false, looksReady: false };
     }
 
     if (probe.status === "resumed") {
-      return { verdict: { ok: true }, definiteFailure: false };
+      return { verdict: { ok: true }, definiteFailure: false, looksReady: false };
     }
 
     // OPR.0.3.4.5: Claude resume-selection prompt -> attention_required,
@@ -474,18 +476,22 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         error: probe.detail,
         recovery: "attention_required",
         evidence: paneContent.split("\n").slice(-12).join("\n"),
-      }, definiteFailure: false };
+      }, definiteFailure: false, looksReady: false };
     }
 
     if (this.autoDriveProviderPrompts && probe.code === "trust_gate") {
       const enterResult = await this.tmux.sendKeys(tmuxSession, ["Enter"]);
       if (!enterResult.ok) {
-        return { verdict: { ok: false, error: `Claude trust prompt auto-drive failed: ${enterResult.message}` }, definiteFailure: false };
+        return { verdict: { ok: false, error: `Claude trust prompt auto-drive failed: ${enterResult.message}` }, definiteFailure: false, looksReady: false };
       }
     }
     // Claude's own report that it can't continue (login), or that it waits for a person (trust, MCP approval), is
     // no slow start; "returned to shell" is only the pane-command guess.
-    return { verdict: null, definiteFailure: (probe.status === "failed" && probe.code !== "returned_to_shell")
+    // A start still in progress can't have drawn Claude's ready screen. One that has, with its lineage unproven,
+    // is not a slow start, so it keeps the result it had before the watch.
+    const looksReady = assessNativeResumeProbe({ runtime: "claude-code", paneCommand, paneContent,
+      claudeAutoIdentityVerified: true, claudeResumeIdentityVerified: true }).status === "resumed";
+    return { verdict: null, looksReady, definiteFailure: (probe.status === "failed" && probe.code !== "returned_to_shell")
       || probe.code === "trust_gate" || probe.code === "mcp_gate" };
   }
 
@@ -499,7 +505,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     let slowStart = false;
 
     for (let attempt = 0; attempt < attempts; attempt++) {
-      const { verdict, definiteFailure } = await this.resumeVerdict(binding);
+      const { verdict, definiteFailure, looksReady } = await this.resumeVerdict(binding);
       if (verdict) {
         if (budget) budget.remainingMs -= Math.max(0, attempt + 1 - windowAttempts) * pollMs;
         return verdict;
@@ -509,7 +515,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       // occupant that isn't this launch's Claude; anything else is a slow start.
       if (attempt === windowAttempts - 1 && !definiteFailure
         && !(await this.paneReturnedToShell(binding, await this.tmux.getPaneCommand(tmuxSession)))
-        && await this.occupantIsOurStart(binding)) {
+        && await this.occupantIsOurStart(binding, looksReady)) {
         slowStart = true;
         const extraMs = Math.max(0, resolveReadinessTimeoutMs(this.readinessTimeoutMs) - windowAttempts * pollMs);
         attempts = windowAttempts + Math.floor(Math.min(extraMs, budget?.remainingMs ?? extraMs) / pollMs);

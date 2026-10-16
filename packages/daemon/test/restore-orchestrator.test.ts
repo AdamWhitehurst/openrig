@@ -2058,12 +2058,6 @@ describe("RestoreOrchestrator", () => {
         expect(outcome.status).not.toBe("resumed");
         if (mode === "missing-token") expect(tmux.sendText).not.toHaveBeenCalled();
         else if (mode === "chooser") expect(latest.resumeToken).toBe(token); // attempted lineage, not readiness
-        else if (mode === "foreign-process" || mode === "replaced-pane" || mode === "replaced-process") {
-          // A look-alike or swapped occupant can't be told from a launch still coming up, so the slow-start watch
-          // applies: kept for a person as attention_required, the requested token recorded as an attempt, nothing certified.
-          expect({ status: outcome.status, startup: latest.startupStatus, token: latest.resumeToken }).toEqual({ status: "attention_required", startup: "attention_required", token });
-          expect(db.prepare("SELECT resume_provenance, resume_last_verified FROM sessions WHERE id = ?").get(latest.id)).toEqual({ resume_provenance: null, resume_last_verified: null });
-        }
         else expect(latest.resumeToken).toBeNull();
       }
       if (mode === "error") {
