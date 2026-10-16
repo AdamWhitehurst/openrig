@@ -499,7 +499,7 @@ describe.skipIf(process.platform === "win32")("the managed (env -i) Claude launc
   const cleanup: Array<() => void> = [];
   afterEach(() => { for (const f of cleanup.splice(0)) f(); });
 
-  function fixture(opts: { memberEnv?: object; sessionKeys?: string }) {
+  function fixture(opts: { memberEnv?: object; sessionKeys?: string; saved?: unknown[] }) {
     const root = mkdtempSync(join(tmpdir(), "managed-plugin-dirs-"));
     cleanup.push(() => rmSync(root, { recursive: true, force: true }));
     const bin = join(root, "bin"), home = join(root, "home"), cwd = join(root, "work");
@@ -513,18 +513,21 @@ printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s"}' "\${CLAUDE_CODE_PLUGIN_DIRS-absent}"
     db.exec(`CREATE TABLE rigs(id TEXT, env_json TEXT);
       CREATE TABLE nodes(id TEXT, rig_id TEXT, runtime TEXT, cwd TEXT, env_json TEXT);
       CREATE TABLE bindings(id TEXT, node_id TEXT, tmux_session TEXT, tmux_pane TEXT);
-      CREATE TABLE occupant_tenures(node_id TEXT, generation_uuid TEXT, generation_ordinal INTEGER);`);
+      CREATE TABLE occupant_tenures(node_id TEXT, generation_uuid TEXT, generation_ordinal INTEGER);
+      CREATE TABLE node_startup_context(node_id TEXT, projection_entries_json TEXT);`);
+    const { pluginsDir, vendored } = vendoredPlugins(root);
+    if (opts.saved) db.prepare("INSERT INTO node_startup_context VALUES ('node', ?)").run(JSON.stringify(opts.saved.map((p) => p === "vendored" ? { category: "plugin", absolutePath: vendored } : p)));
     db.prepare("INSERT INTO rigs VALUES ('rig', NULL)").run();
     db.prepare("INSERT INTO nodes VALUES ('node', 'rig', 'claude-code', ?, ?)").run(cwd, opts.memberEnv ? JSON.stringify(opts.memberEnv) : null);
     db.exec("INSERT INTO bindings VALUES ('b', 'node', 'seat@rig', '%1'); INSERT INTO occupant_tenures VALUES ('node', 'gen', 1)");
     // The tmux session variable the launch records: the names the seat's declared environment holds.
     const managed = new RealManagedLaunch(db, { PATH: `${bin}:/usr/bin:/bin`, HOME: home }, {},
-      async (_session, key) => key === SEAT_ENV_KEYS_VAR ? opts.sessionKeys : undefined);
+      async (_session, key) => key === SEAT_ENV_KEYS_VAR ? opts.sessionKeys : undefined, pluginsDir);
     const run = async (command: string, paneEnv: Record<string, string>) => {
       const { stdout } = await exec("/bin/sh", ["-c", command], { env: { PATH: "/usr/bin:/bin", ...paneEnv }, timeout: 5000 });
       return JSON.parse(stdout) as Record<string, string>;
     };
-    return { managed, run };
+    return { managed, run, vendored };
   }
   const target = { nodeId: "node", session: "seat@rig", pane: "%1" };
   const launch = async (f: ReturnType<typeof fixture>) => (await f.managed.prepare(target, "auto")).command(["--permission-mode", "auto"]);
@@ -542,6 +545,21 @@ printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s"}' "\${CLAUDE_CODE_PLUGIN_DIRS-absent}"
     const f = fixture({ memberEnv: { [PLUGIN_ENV]: OWN_LIST }, sessionKeys: PLUGIN_ENV });
     const seen = await f.run(await launch(f), { [PLUGIN_ENV]: `${OWN_LIST}:/v/openrig-core` });
     expect(seen.PLUGIN_DIRS).toBe(`${OWN_LIST}:/v/openrig-core`);
+  });
+
+  it("gives a handover successor the plugin even when its tmux session's name list predates the plugin variable", async () => {
+    // The session was created before the daemon was upgraded: its OPENRIG_SEAT_ENV_KEYS lacks the name (or is absent), while the
+    // respawned pane's shell has the variable. The seat's saved plugin selection is what says to forward it.
+    for (const sessionKeys of [undefined, "FOO"]) {
+      const f = fixture({ sessionKeys, saved: ["vendored"] });
+      const seen = await f.run(await launch(f), { [PLUGIN_ENV]: f.vendored, LEAKED: "should-not-pass" });
+      expect(seen, String(sessionKeys)).toEqual({ PLUGIN_DIRS: f.vendored, LEAKED: "absent" });
+    }
+  });
+
+  it("does not forward the variable for a seat whose saved selection lacks the plugin, even from an old session list", async () => {
+    const f = fixture({ sessionKeys: undefined, saved: [{ category: "plugin", absolutePath: "/elsewhere" }] });
+    expect((await f.run(await launch(f), { [PLUGIN_ENV]: "/from/the/shell" })).PLUGIN_DIRS).toBe("absent");
   });
 
   it("changes nothing for a seat that didn't select the plugin, whatever its pane shell happens to hold", async () => {
