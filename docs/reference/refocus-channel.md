@@ -16,10 +16,17 @@ it is the mechanism that makes shipped chain files (see
 | Stop | ✓ | — | catch a long Claude turn crossing the growth threshold |
 | PostCompact | ✓ | ✓ | retain exact compaction due-state; deliver on the next actionable prompt |
 
-**How the hooks reach a seat.** A Claude seat launched by OpenRig starts with `CLAUDE_CODE_PLUGIN_DIRS` set to the
-vendored plugin (`$OPENRIG_HOME/plugins/openrig-core`), so Claude loads `hooks/claude.json` with no setup step, on a fresh
-launch, a restore and a handover successor. The folder a spec's `plugins: [shared:openrig-core]` projects into the seat's
-workspace is not what Claude loads. Codex has no way to load a plugin from a directory; its hooks come from the daemon's
+**How the hooks reach a seat.** A Claude seat whose resolved plugin selection includes the shipped `openrig-core` plugin
+(for example `plugins: [shared:openrig-core]`, or the same plugin under another name) starts with `CLAUDE_CODE_PLUGIN_DIRS`
+set to the vendored plugin (`$OPENRIG_HOME/plugins/openrig-core`), so Claude loads `hooks/claude.json` with no setup step, on a
+fresh launch, a restore, a handover successor and a launch with a permission mode. A seat that didn't select the plugin is
+launched as before and doesn't load these hooks. The folder a spec's plugin selection projects into the seat's workspace is
+not what Claude loads. A list the seat declares itself in `CLAUDE_CODE_PLUGIN_DIRS` keeps working, with the vendored plugin
+added after it.
+Claude Code reads this variable from v2.1.280. OpenRig doesn't check the Claude version at launch: an older Claude ignores the
+variable, starts normally, and doesn't load these hooks. The behaviour was checked on Claude Code 2.1.296 and not on
+earlier versions.
+Codex has no way to load a plugin from a directory; its hooks come from the daemon's
 managed block in `config.toml`, which today carries the activity relay only, so the Codex column above describes
 `hooks/codex.json`'s registration and not a hook a Codex seat currently runs.
 

@@ -1,39 +1,84 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
+import type Database from "better-sqlite3";
+import { getDefaultOpenRigPath } from "../openrig-compat.js";
+import type { SeatEnv } from "./seat-env.js";
 
-// The env a Claude seat starts with so it loads the vendored openrig-core plugin (its refocus, compaction-restore
-// and activity hooks). Claude reads CLAUDE_CODE_PLUGIN_DIRS, a colon-separated list, so this has to be the vendored
-// copy under the OpenRig home: the copy projected into a seat's folder is named `shared:openrig-core`, and the
-// colon splits it in two. It is an env var, not a launch argument, so the seat's process identity is unchanged.
+// What a Claude seat needs so it loads the vendored openrig-core plugin (its refocus, compaction-restore and
+// activity hooks). Claude reads CLAUDE_CODE_PLUGIN_DIRS, a colon-separated list, so this has to be the vendored copy
+// under the OpenRig home: the copy projected into a seat's folder is named `shared:openrig-core`, and the colon splits
+// it in two. It is an env var, not a launch argument, so the seat's process identity is unchanged. Claude Code reads it
+// from v2.1.280; an older Claude ignores it and the hooks stay unloaded there.
 //
-// A seat may declare its own CLAUDE_CODE_PLUGIN_DIRS (its spec's env, or a one-off `rig up --env`), applied after the
-// per-runtime map. Its list keeps working and the vendored plugin is added to it, so nothing a seat set on main stops
-// reaching Claude.
+// Only a seat whose resolved plugin selection includes the shipped plugin gets it. That is the plugin's resolved
+// location, which is what the profile resolver gives for every way of selecting it (`openrig-core`, `shared:openrig-core`,
+// a resource of another name that points at the vendored copy); a seat that selected nothing is launched as before.
+//
+// The value is added to the seat's declared environment (its spec's `env:` and a one-off `rig up --env`), so every path
+// that already carries that environment carries this: fresh launch, restore, handover successor and the managed `env -i`
+// launch, which forwards the declared names from the pane. A list the seat declares itself keeps working and the
+// vendored plugin is added after it.
 //
 // The plugin also carries an activity relay, and a seat's settings.local.json may carry OpenRig's own copy of it. The
 // plugin's relay run decides for itself, from that file, whether to stay quiet (see hooks/scripts/activity-relay.cjs).
 
 export const CLAUDE_PLUGIN_DIRS_ENV = "CLAUDE_CODE_PLUGIN_DIRS";
 
-/** The Claude session env for the vendored plugin under `pluginsDir`, or undefined when it is not vendored. */
-export function claudeCorePluginEnv(pluginsDir: string): Record<string, string> | undefined {
+/** The vendored openrig-core plugin directory under `pluginsDir`, or undefined when it is not vendored. */
+export function vendoredCorePluginDir(pluginsDir: string = getDefaultOpenRigPath("plugins")): string | undefined {
   const dir = join(pluginsDir, "openrig-core");
-  if (!existsSync(join(dir, ".claude-plugin", "plugin.json"))) return undefined;
-  return { [CLAUDE_PLUGIN_DIRS_ENV]: dir };
+  return existsSync(join(dir, ".claude-plugin", "plugin.json")) ? dir : undefined;
+}
+
+function canonical(path: string): string {
+  const absolute = resolve(path);
+  try { return realpathSync(absolute); } catch { return absolute; }
+}
+
+/** The resolved plugin locations in a node's persisted startup context (what the profile resolver selected for it). */
+export function pluginPathsOf(entries: ReadonlyArray<{ category: string; absolutePath: string }>): string[] {
+  return entries.filter((entry) => entry.category === "plugin").map((entry) => entry.absolutePath);
+}
+
+/** The plugin locations the node's last launch resolved, or undefined when none were saved (or they can't be read). */
+export function persistedPluginPaths(db: Database.Database, nodeId: string): string[] | undefined {
+  try {
+    const row = db.prepare("SELECT projection_entries_json FROM node_startup_context WHERE node_id = ?")
+      .get(nodeId) as { projection_entries_json: string } | undefined;
+    if (!row) return undefined;
+    const entries = JSON.parse(row.projection_entries_json) as unknown;
+    return Array.isArray(entries) ? pluginPathsOf(entries.filter((e): e is { category: string; absolutePath: string } =>
+      typeof e === "object" && e !== null && typeof (e as { category?: unknown }).category === "string"
+      && typeof (e as { absolutePath?: unknown }).absolutePath === "string")) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
- * `env` is a seat's finished launch env and `runtimeEnv` the per-runtime map it was built from. When the seat's own
- * layers replaced the vendored plugin path, put it back after the seat's own list; otherwise `env` is returned as is.
+ * The directory to load into this node's Claude process, or undefined: not a Claude seat, the plugin is not vendored,
+ * or the seat's resolved plugin selection doesn't include it. `selectedPaths` is the selection a launch has just
+ * resolved or a snapshot saved; without it the node's persisted startup context is read.
  */
-export function keepVendoredPluginDir(
-  env: Record<string, string>,
-  runtimeEnv: Record<string, string | undefined> | undefined,
-): Record<string, string> {
-  const vendored = runtimeEnv?.[CLAUDE_PLUGIN_DIRS_ENV];
-  const own = env[CLAUDE_PLUGIN_DIRS_ENV];
-  if (!vendored || own === vendored) return env;
-  if (own === undefined) return { ...env, [CLAUDE_PLUGIN_DIRS_ENV]: vendored }; // a seat's empty value is dropped by the launch
-  if (own.split(":").includes(vendored)) return env;
-  return { ...env, [CLAUDE_PLUGIN_DIRS_ENV]: `${own}:${vendored}` };
+export function seatCorePluginDir(
+  node: { id: string; runtime: string | null },
+  db: Database.Database,
+  selectedPaths?: readonly string[],
+  pluginsDir?: string,
+): string | undefined {
+  if (node.runtime !== "claude-code") return undefined;
+  const dir = vendoredCorePluginDir(pluginsDir);
+  if (!dir) return undefined;
+  const paths = selectedPaths ?? persistedPluginPaths(db, node.id) ?? [];
+  const want = canonical(dir);
+  return paths.some((path) => canonical(path) === want) ? dir : undefined;
+}
+
+/** The seat's declared env with the vendored plugin added after any list the seat declared itself. */
+export function withCorePlugin(seatEnv: SeatEnv, dir: string | undefined): SeatEnv {
+  if (!dir) return seatEnv;
+  const own = seatEnv[CLAUDE_PLUGIN_DIRS_ENV];
+  if (!own) return { ...seatEnv, [CLAUDE_PLUGIN_DIRS_ENV]: dir };
+  if (own.split(":").includes(dir)) return seatEnv;
+  return { ...seatEnv, [CLAUDE_PLUGIN_DIRS_ENV]: `${own}:${dir}` };
 }

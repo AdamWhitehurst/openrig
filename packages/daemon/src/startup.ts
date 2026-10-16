@@ -37,7 +37,6 @@ import { CheckpointStore } from "./domain/checkpoint-store.js";
 import { SnapshotCapture } from "./domain/snapshot-capture.js";
 import { RestoreOrchestrator } from "./domain/restore-orchestrator.js";
 import { ClaudeManagedLaunch } from "./domain/claude-managed-launch.js";
-import { claudeCorePluginEnv } from "./domain/claude-core-plugin-env.js";
 import { ClaudeResumeAdapter } from "./adapters/claude-resume.js";
 import { CodexResumeAdapter } from "./adapters/codex-resume.js";
 import { codexDaemonSupportProbe } from "./domain/codex-daemon-support.js";
@@ -640,7 +639,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const snapshotCapture = new SnapshotCapture({ db, rigRepo, sessionRegistry, eventBus, snapshotRepo, checkpointStore });
   const claudeManagedLaunch = new ClaudeManagedLaunch(db, { ...launchSessionEnv, CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR }, {
     OPENRIG_CLAUDE_DISABLE_ALTERNATE_SCREEN: process.env.OPENRIG_CLAUDE_DISABLE_ALTERNATE_SCREEN,
-  }, (session, key) => tmuxAdapter.getSessionEnv(session, key), runtimeSessionEnv);
+  }, (session, key) => tmuxAdapter.getSessionEnv(session, key));
   const claudeResume = new ClaudeResumeAdapter(tmuxAdapter, { claudeManagedLaunch, seatLaunchEnvironment });
   // #275: one reader for both Codex launch adapters, with the PATH, HOME and CODEX_HOME a seat session gets.
   const readCodexNetworkDefault = codexNetworkDefaultReader({ launchPath: process.env.PATH, home: daemonHome, codexHome });
@@ -907,10 +906,6 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       logger: (...args) => console.log("[openrig]", ...args),
     });
     await vendorService.ensureLatest("openrig-core");
-    // Claude seats load the vendored plugin's hooks. The same map reaches fresh launch, restore and
-    // handover successors; a CLAUDE_CODE_PLUGIN_DIRS a seat declares keeps working and this is added to it.
-    const corePluginEnv = claudeCorePluginEnv(userPluginsDir);
-    if (corePluginEnv) runtimeSessionEnv["claude-code"] = corePluginEnv;
     for (const skill of ["openrig-skills", "refocusing"]) {
       try {
         vendorService.ensureSkillGlobally("openrig-core", skill, [

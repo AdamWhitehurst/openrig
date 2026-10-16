@@ -16,10 +16,13 @@ off, and never runs at fresh session start.
 This plugin ships dual-manifest packaging — both `.claude-plugin/` and `.codex-plugin/`.
 
 - **Claude Code** — the OpenRig daemon vendors `openrig-core/` to `~/.openrig/plugins/openrig-core/` at startup and starts
-  every Claude seat it launches with `CLAUDE_CODE_PLUGIN_DIRS` pointing at that copy, so the plugin's hooks (refocus,
-  compaction restore) load with no setup step. This applies to fresh launches, restores and handover successors; a seat that
-  was already running picks it up at its next launch. A `CLAUDE_CODE_PLUGIN_DIRS` list a seat declares itself (its spec's
-  `env:` or a one-off `rig up --env`) keeps working: the vendored plugin is added after it.
+  each Claude seat whose resolved plugin selection includes it (for example `plugins: [shared:openrig-core]`) with
+  `CLAUDE_CODE_PLUGIN_DIRS` pointing at that copy, so the plugin's hooks (refocus, compaction restore) load with no setup
+  step. A seat that didn't select the plugin is launched as before. This applies to fresh launches, restores, handover
+  successors and launches with a permission mode; a seat that was already running picks it up at its next launch. A
+  `CLAUDE_CODE_PLUGIN_DIRS` list a seat declares itself (its spec's `env:` or a one-off `rig up --env`) keeps working: the
+  vendored plugin is added after it. Claude Code reads the variable from v2.1.280; an older Claude ignores it, starts
+  normally, and doesn't load the hooks (OpenRig doesn't check the version or refuse the launch).
   A seat that has OpenRig's activity relay in its own `settings.local.json` (the `claude-activity-hooks` runtime resource)
   already reports activity from there, so the plugin's `activity-relay.cjs` (which the manifest starts with `--from-plugin`)
   exits for an event the seat's settings register it for. A seat without that resource, and a plugin installed outside

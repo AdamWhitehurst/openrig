@@ -14,8 +14,8 @@ import type { TmuxOptionDefaultsApplier } from "./tmux-option-defaults.js";
 import { observeSolePane, paneObservationVerdict } from "./pane-binding-observation.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import type { OccupantKind } from "./session-registry.js";
-import { keepVendoredPluginDir } from "./claude-core-plugin-env.js";
 import { mergeSeatEnv, seatEnvLaunchVars, type SeatEnv } from "./seat-env.js";
+import { seatCorePluginDir, withCorePlugin } from "./claude-core-plugin-env.js";
 
 import type { Session, Binding } from "./types.js";
 
@@ -37,6 +37,10 @@ interface LaunchOpts {
   occupantKind?: OccupantKind;
   /** One-off env for this launch only (`rig up --env`); wins over the spec's env and is not saved. */
   env?: SeatEnv;
+  /** The seat's resolved plugin locations (what the profile resolver selected for it, or a snapshot saved). A Claude
+   *  seat whose selection includes the vendored openrig-core plugin loads it. Without this the node's saved startup
+   *  context is read. */
+  pluginPaths?: readonly string[];
 }
 
 interface NodeLauncherDeps {
@@ -50,6 +54,8 @@ interface NodeLauncherDeps {
   /** Extra launch env for one runtime only (OMP's provider keys), merged over
    *  sessionEnv so other runtimes' seats never receive it. */
   runtimeSessionEnv?: Record<string, Record<string, string | undefined>>;
+  /** Where the daemon vendors its plugins; default is `plugins` under the OpenRig home (tests). */
+  pluginsDir?: string;
   /** Default silence window (seconds). Currently used only as the
    *  SeatActivityService global default (3s). Per-seat override via
    *  LaunchOpts is currently inert. */
@@ -74,6 +80,7 @@ export class NodeLauncher {
   private transcriptStore: TranscriptStore | null;
   private sessionEnv: Record<string, string>;
   private runtimeSessionEnv: Record<string, Record<string, string | undefined>>;
+  private pluginsDir: string | undefined;
   private defaultSilenceWindowSeconds: number;
   private tmuxOptionDefaults: TmuxOptionDefaultsApplier | null;
 
@@ -98,6 +105,7 @@ export class NodeLauncher {
     this.transcriptStore = deps.transcriptStore ?? null;
     this.sessionEnv = compactEnv(deps.sessionEnv ?? {});
     this.runtimeSessionEnv = deps.runtimeSessionEnv ?? {};
+    this.pluginsDir = deps.pluginsDir;
     this.defaultSilenceWindowSeconds = deps.defaultSilenceWindowSeconds ?? 3;
     this.tmuxOptionDefaults = deps.tmuxOptionDefaults ?? null;
   }
@@ -144,16 +152,16 @@ export class NodeLauncher {
     // Create tmux session with OpenRig identity env vars. A duplicate is a
     // collision, never authority to kill an unmanaged same-name session.
     const specEnv = this.rigRepo.getEffectiveSeatEnv(node.id);
-    const runtimeEnv = node.runtime ? this.runtimeSessionEnv[node.runtime] : undefined;
-    const launchEnv = (oneOff?: SeatEnv) => keepVendoredPluginDir(compactEnv({
+    const corePluginDir = seatCorePluginDir(node, this.db, opts?.pluginPaths, this.pluginsDir);
+    const launchEnv = (oneOff?: SeatEnv) => compactEnv({
       OPENRIG_NODE_ID: node.id,
       OPENRIG_SESSION_NAME: sessionName,
       OPENRIG_RUNTIME: node.runtime ?? undefined,
       ...this.sessionEnv,
-      ...runtimeEnv,
-      ...seatEnvLaunchVars(mergeSeatEnv(specEnv, oneOff)),
+      ...(node.runtime ? this.runtimeSessionEnv[node.runtime] : undefined),
+      ...seatEnvLaunchVars(withCorePlugin(mergeSeatEnv(specEnv, oneOff), corePluginDir)),
       OPENRIG_OCCUPANT_GENERATION: occupantGeneration ?? undefined,
-    }), runtimeEnv);
+    });
     const openRigEnv = launchEnv(opts?.env);
     const sessionCwd = opts?.cwd ?? node.cwd ?? undefined;
     const tmuxResult = await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv);
