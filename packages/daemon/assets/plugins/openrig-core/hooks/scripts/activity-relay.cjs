@@ -214,6 +214,16 @@ function uid() {
 // each event once either way. Anything unreadable counts as "not registered".
 const SETTINGS_RELAY_TAIL = "state/claude-activity-hooks/activity-relay.cjs";
 
+// The adapter's own test for the entry it writes (isOwnedRelayCommand): `node` and one single-quoted token, in the form
+// shellQuote produces, naming the relay copy. A wrapper that only mentions the path is not that entry.
+function isSettingsRelayCommand(command) {
+  const m = /^node\s+(.+)$/.exec(command.trim());
+  const arg = m && m[1];
+  if (!arg || arg.length < 2 || !arg.startsWith("'") || !arg.endsWith("'")) return false;
+  const decoded = arg.slice(1, -1).split(`'"'"'`).join("'");
+  return "'" + decoded.replace(/'/g, `'"'"'`) + "'" === arg && decoded.endsWith(`/${SETTINGS_RELAY_TAIL}`);
+}
+
 function settingsRelayReports(hookEvent, providerPayload, env = process.env) {
   const projectDir = firstString(env.CLAUDE_PROJECT_DIR, providerPayload && providerPayload.cwd);
   if (!projectDir || !hookEvent) return false;
@@ -224,7 +234,7 @@ function settingsRelayReports(hookEvent, providerPayload, env = process.env) {
     // OpenRig writes its group without one. Anything else reports, at worst twice, never not at all.
     const unrestricted = (group) => group.matcher === undefined || group.matcher === "" || group.matcher === "*";
     return Array.isArray(groups) && groups.some((group) => group && unrestricted(group) && Array.isArray(group.hooks)
-      && group.hooks.some((hook) => hook && typeof hook.command === "string" && hook.command.includes(SETTINGS_RELAY_TAIL)));
+      && group.hooks.some((hook) => hook && typeof hook.command === "string" && isSettingsRelayCommand(hook.command)));
   } catch {
     return false;
   }

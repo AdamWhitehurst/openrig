@@ -652,6 +652,15 @@ describe("the plugin's activity relay", () => {
     expect(posts).toEqual([]);
   });
 
+  it("reports when a settings command only mentions the relay path, since it may not be OpenRig's relay", async () => {
+    for (const command of [`node wrapper.cjs '${SETTINGS_RELAY}'`, `node 'x' '${SETTINGS_RELAY}'`, `bash -c 'node ${SETTINGS_RELAY}'`]) {
+      writeFileSync(join(project, ".claude", "settings.local.json"),
+        JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command }] }] } }));
+      await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
+    }
+    expect(posts).toHaveLength(3);
+  });
+
   it("reports when the settings file can't be read, so an unreadable file never leaves a seat silent", async () => {
     writeFileSync(join(project, ".claude", "settings.local.json"), "{ not json");
     await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
