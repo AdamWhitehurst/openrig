@@ -97,6 +97,8 @@ describe("stub-runner compaction behavior (real-spawn wiring, R1)", () => {
     expect(marker.sessionName).toBe(SEAT);
     expect(marker.createdAt).toBe(INJECTED_ISO);
     expect(existsSync(marker.outputDir)).toBe(true);
+    // ...under this test's own packets root, not the production default.
+    expect(dirname(marker.outputDir)).toBe(join(dir!, "packets"));
     // The seam compacted the stub's OWN authored transcript — NOT a foreign one
     // discovered under ~/.claude/projects (findLatestJsonl's real-HOME fallback).
     // On the discovery path input.transcript_path is unset and the marker records

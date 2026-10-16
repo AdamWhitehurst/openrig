@@ -69,5 +69,7 @@ describe("stub-runner restore (real-spawn observable)", () => {
     const marker = JSON.parse(readFileSync(markerPath, "utf8"));
     expect(marker.deliveredAt).toBe(CLOCK);
     expect(marker.deliveryCount).toBe(1);
+    // The packet was written under this test's own packets root, not the production default.
+    expect(dirname(marker.outputDir)).toBe(join(dir!, "packets"));
   }, 30_000);
 });

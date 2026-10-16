@@ -83,6 +83,8 @@ describe("stub-runner FULL determinism pin (PRD §5, R3)", () => {
     await waitFor(() => sink.filter((c) => c.run === run).some((c) => c.body.hookEvent === "Stop"));
 
     const marker = JSON.parse(readFileSync(markerPath, "utf8"));
+    // The packet landed under this run's own packets root, not the production default.
+    expect(dirname(marker.outputDir)).toBe(join(dir, "packets"));
     // Normalize the per-run temp path so the clock-derived content compares byte-equal.
     const paneNorm = pane.split(dir).join("<DIR>");
     return {
