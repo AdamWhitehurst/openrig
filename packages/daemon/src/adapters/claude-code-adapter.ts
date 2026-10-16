@@ -13,7 +13,7 @@ import type {
 import { resolveConcreteHint } from "../domain/runtime-adapter.js";
 import type { ProjectionPlan, ProjectionEntry } from "../domain/projection-planner.js";
 import { assessNativeResumeProbe } from "../domain/native-resume-probe.js";
-import { observeClaudePaneProcess, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
+import { observeClaudeDelivery, observeClaudePaneProcess, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
 import { mergeManagedBlock, DEFAULT_CLAUDE_MANAGED_BLOCK_FILE, type ClaudeManagedBlockFile } from "../domain/managed-blocks.js";
 import { claudeResumeLaunchEnv, claudeResumeLaunchPrefix } from "./claude-resume-launch.js";
 import { shellQuote } from "./shell-quote.js";
@@ -418,6 +418,17 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     } catch { return probe; }
   }
 
+  /** tmux names a shell for every OpenRig launch (the launch script is `sh`), so its word alone can't say
+   *  Claude is gone. With a bound pane, the process tree must show the pane's shell holding the terminal with
+   *  nothing under it; Claude, or a launch script about to start it, is a slow resume. */
+  private async paneReturnedToShell(binding: NodeBinding, paneCommand: string | null): Promise<boolean> {
+    if (!paneCommand || !SHELL_COMMANDS.has(paneCommand)) return false;
+    if (!binding.tmuxPane) return true;
+    const observed = await observeClaudeDelivery({ target: binding.tmuxPane, tmux: this.tmux, listProcesses: this.listProcesses },
+      { unknownKeepsIdle: false });
+    return observed.state === "idle_shell";
+  }
+
   private async verifyResumeLaunch(binding: NodeBinding): Promise<HarnessLaunchResult> {
     const tmuxSession = binding.tmuxSession!;
     const attempts = 16;
@@ -493,7 +504,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       };
     }
 
-    if (finalCommand && SHELL_COMMANDS.has(finalCommand)) {
+    if (await this.paneReturnedToShell(binding, finalCommand)) {
       return {
         ok: false,
         error: "Claude resume failed: pane returned to shell instead of entering Claude",

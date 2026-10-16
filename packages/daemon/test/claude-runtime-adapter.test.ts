@@ -646,6 +646,44 @@ describe("Claude Code runtime adapter", () => {
     });
   });
 
+  describe("a resume still starting is not a return to the shell (pane command is sh for every OpenRig launch)", () => {
+    const startedAt = "Fri Oct 16 15:00:00 2026";
+    const pane = { pid: 10, ppid: 1, pgid: 10, tpgid: 10, command: "-zsh", executableName: "zsh", startedAt };
+    const launchScript = { pid: 11, ppid: 10, pgid: 11, tpgid: 11, command: "/bin/sh /tmp/openrig-tmux-send.txt", executableName: "sh", startedAt };
+    const claude = { pid: 12, ppid: 11, pgid: 11, tpgid: 11, executableName: "claude", startedAt,
+      command: "claude --permission-mode acceptEdits --resume abc-123 --name dev-impl@test-rig" };
+    const run = async (rows: Array<typeof pane>) => {
+      const tmux = mockTmux();
+      (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue("sh");
+      (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockResolvedValue("");
+      (tmux as unknown as { getPanePid: unknown }).getPanePid = vi.fn(async () => 10);
+      const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, listProcesses: () => rows });
+      return adapter.launchHarness({ ...makeBinding(), tmuxPane: "%1" }, { name: "dev-impl@test-rig", resumeToken: "abc-123" });
+    };
+
+    it("reports the timeout, not a return to the shell, while Claude runs under the pane", async () => {
+      expect(await run([{ ...pane, tpgid: 11 }, launchScript, claude])).toEqual({
+        ok: false,
+        error: "Claude resume failed: timed out waiting for Claude to become active",
+      });
+    });
+
+    it("reports the timeout while the launch script still holds the foreground before Claude starts", async () => {
+      expect(await run([{ ...pane, tpgid: 11 }, launchScript])).toEqual({
+        ok: false,
+        error: "Claude resume failed: timed out waiting for Claude to become active",
+      });
+    });
+
+    it("still reports a pane whose shell owns the terminal with nothing under it", async () => {
+      expect(await run([pane])).toEqual({
+        ok: false,
+        error: "Claude resume failed: pane returned to shell instead of entering Claude",
+        recovery: "retry_fresh",
+      });
+    });
+  });
+
   it("launchHarness auto-accepts Claude workspace trust prompt only when explicitly configured", async () => {
     const tmux = mockTmux();
     (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue("claude");
