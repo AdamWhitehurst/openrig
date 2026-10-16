@@ -79,6 +79,7 @@ export function withCorePlugin(seatEnv: SeatEnv, dir: string | undefined): SeatE
   if (!dir) return seatEnv;
   const own = seatEnv[CLAUDE_PLUGIN_DIRS_ENV];
   if (!own) return { ...seatEnv, [CLAUDE_PLUGIN_DIRS_ENV]: dir };
-  if (own.split(":").includes(dir)) return seatEnv;
+  const want = canonical(dir);
+  if (own.split(":").some((entry) => entry && canonical(entry) === want)) return seatEnv;
   return { ...seatEnv, [CLAUDE_PLUGIN_DIRS_ENV]: `${own}:${dir}` };
 }

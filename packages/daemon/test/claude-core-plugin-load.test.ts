@@ -115,6 +115,15 @@ describe("which Claude seats load the vendored plugin", () => {
     expect(withCorePlugin(untouched, undefined)).toBe(untouched);
   });
 
+  it("counts a declared entry as the plugin when it names the same folder another way (trailing slash, symlink)", () => {
+    const { vendored } = vendoredPlugins(root);
+    const link = join(root, "core-link");
+    symlinkSync(vendored, link);
+    expect(withCorePlugin({ [PLUGIN_ENV]: `/a:${vendored}/` }, vendored)).toEqual({ [PLUGIN_ENV]: `/a:${vendored}/` });
+    expect(withCorePlugin({ [PLUGIN_ENV]: `${link}:/a` }, vendored)).toEqual({ [PLUGIN_ENV]: `${link}:/a` });
+    expect(withCorePlugin({ [PLUGIN_ENV]: "/a::/b" }, vendored)).toEqual({ [PLUGIN_ENV]: `/a::/b:${vendored}` });
+  });
+
   it("picks the seat's plugin by where its selection resolved, whichever way it was spelled", () => {
     const { pluginsDir, vendored } = vendoredPlugins(root);
     const db = createFullTestDb();
