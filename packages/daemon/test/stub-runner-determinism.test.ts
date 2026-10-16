@@ -72,6 +72,8 @@ describe("stub-runner FULL determinism pin (PRD §5, R3)", () => {
         OPENRIG_ACTIVITY_HOOK_TOKEN: "det-token",
         OPENRIG_NODE_ID: "det-node",
         OPENRIG_TEST_CLOCK_NOW: INJECTED_ISO,
+        // Keep the packet out of the production default (/tmp/claude-compaction-restore).
+        OPENRIG_COMPACTION_OUT_ROOT: join(dir, "packets"),
       } as NodeJS.ProcessEnv });
     children.push(child);
     child.stdout?.on("data", (d) => { pane += String(d); });

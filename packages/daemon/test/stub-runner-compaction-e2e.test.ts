@@ -83,7 +83,11 @@ describe("stub-runner compaction behavior (real-spawn wiring, R1)", () => {
 
     child = execFile("node", ["--import", "tsx", RUNNER,
       "--session-name", SEAT, "--cwd", dir, "--launch-id", "cmp-1", "--posture", "floor"],
-      { env: { ...process.env, OPENRIG_HOME: home, OPENRIG_TEST_CLOCK_NOW: INJECTED_ISO } as NodeJS.ProcessEnv });
+      { env: {
+        ...process.env, OPENRIG_HOME: home, OPENRIG_TEST_CLOCK_NOW: INJECTED_ISO,
+        // Keep the packet out of the production default (/tmp/claude-compaction-restore).
+        OPENRIG_COMPACTION_OUT_ROOT: join(dir, "packets"),
+      } as NodeJS.ProcessEnv });
 
     const markerPath = join(home, "compaction", "restore-pending", `${SANITIZED}.json`);
     await waitForFile(markerPath);
