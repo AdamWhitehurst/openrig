@@ -90,6 +90,12 @@ End every turn by passing the ball — a `rig queue handoff` to the next agent. 
 
 Never go idle holding a baton.
 
+## Records
+
+- **`rig proof add <slice> --artifact-type … --verdict … --candidate-sha <sha> --money-evidence "…" --file <artifact>`** writes the proof artifact into the slice's `proof/` with its header. `rig proof show <slice>` reads it against the selected proof policy.
+- **`candidate:<sha>` tag** on the handoff row that delivers a build, with a `slice:` tag on the same row. `rig view show execution` reads the newest one as the slice's built commit, and joins reviews and tests to that commit.
+- **`merged:<pr-number>` tag** on a row bound to the slice when its PR merges. It is a recorded report, not a verified merge: the execution view shows it on the merged rung, and it turns the answer only when the same row's `candidate:<sha>` resolves to the built commit and ancestry says not merged (a squash or rebase merge).
+
 ## Verify (deterministic backstop)
 
 Run `rig scope audit` at slice-close. Every convention check is **advisory / fail-open** — it records and advises, never blocks a write. Fix what's real, skip what isn't, keep moving. **A clean audit score is not required to proceed.**
