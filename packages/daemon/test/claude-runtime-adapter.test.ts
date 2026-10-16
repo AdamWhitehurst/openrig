@@ -646,41 +646,149 @@ describe("Claude Code runtime adapter", () => {
     });
   });
 
-  describe("a resume still starting is not a return to the shell (pane command is sh for every OpenRig launch)", () => {
+  describe("a resume still starting is watched, not failed (pane command is sh for every OpenRig launch)", () => {
     const startedAt = "Fri Oct 16 15:00:00 2026";
     const pane = { pid: 10, ppid: 1, pgid: 10, tpgid: 10, command: "-zsh", executableName: "zsh", startedAt };
     const launchScript = { pid: 11, ppid: 10, pgid: 11, tpgid: 11, command: "/bin/sh /tmp/openrig-tmux-send.txt", executableName: "sh", startedAt };
     const claude = { pid: 12, ppid: 11, pgid: 11, tpgid: 11, executableName: "claude", startedAt,
       command: "claude --permission-mode acceptEdits --resume abc-123 --name dev-impl@test-rig" };
-    const run = async (rows: Array<typeof pane>) => {
+    const occupied = [{ ...pane, tpgid: 11 }, launchScript, claude];
+    const tui = ["Claude Code v2.1.89", "❯ Ready", "  ? for shortcuts"].join("\n");
+    // 30 polls of 200 ms: the bound this test gives the wait (the daemon passes runtime.readiness_timeout_seconds).
+    const WAIT_MS = 6_000;
+
+    // `screen(read)` is the pane text on the nth capture; `rows(read)` the process list at that point.
+    const run = async (opts: { screen?: (read: number) => string; rows?: (read: number) => typeof occupied; paneCommand?: string; readinessTimeoutMs?: number; budget?: { remainingMs: number } } = {}) => {
+      let reads = 0;
       const tmux = mockTmux();
-      (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue("sh");
-      (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockResolvedValue("");
+      (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue(opts.paneCommand ?? "sh");
+      (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockImplementation(async () => (opts.screen ?? (() => ""))(reads++));
       (tmux as unknown as { getPanePid: unknown }).getPanePid = vi.fn(async () => 10);
-      const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, listProcesses: () => rows });
-      return adapter.launchHarness({ ...makeBinding(), tmuxPane: "%1" }, { name: "dev-impl@test-rig", resumeToken: "abc-123" });
+      const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, readinessTimeoutMs: opts.readinessTimeoutMs ?? WAIT_MS,
+        listProcesses: () => (opts.rows ?? (() => occupied))(reads) });
+      const result = await adapter.launchHarness({ ...makeBinding(), tmuxPane: "%1" }, { name: "dev-impl@test-rig", resumeToken: "abc-123", ...(opts.budget ? { slowStartBudget: opts.budget } : {}) });
+      return { result, reads, tmux };
     };
 
-    it("reports the timeout, not a return to the shell, while Claude runs under the pane", async () => {
-      expect(await run([{ ...pane, tpgid: 11 }, launchScript, claude])).toEqual({
+    it("marks the seat resumed when Claude draws its screen after the first window", async () => {
+      const { result, reads } = await run({ screen: (read) => (read < 24 ? "" : tui) });
+      expect(result).toMatchObject({ ok: true, resumeToken: "abc-123" });
+      expect(reads).toBeGreaterThan(17);
+      expect(reads).toBeLessThan(30);
+    });
+
+    it("marks the seat resumed when the launch script is still running Claude's start when the first window ends", async () => {
+      const { result } = await run({ rows: () => [{ ...pane, tpgid: 11 }, launchScript], screen: (read) => (read < 20 ? "" : tui) });
+      expect(result).toMatchObject({ ok: true });
+    });
+
+    it("ends attention_required, session kept, when Claude runs but its screen is never recognised", async () => {
+      const { result, reads } = await run({ screen: () => "something Claude draws that no probe knows" });
+      expect(result).toEqual({
         ok: false,
-        error: "Claude resume failed: timed out waiting for Claude to become active",
+        error: "Claude resume did not finish within 6s; Claude may still be starting, so the launch was kept",
+        recovery: "attention_required",
+        evidence: "something Claude draws that no probe knows",
+      });
+      // The bound: the 30 polls plus the one read after them, not an open-ended wait.
+      expect(reads).toBe(31);
+    });
+
+    it("ends attention_required when the launch script never starts Claude", async () => {
+      const { result } = await run({ rows: () => [{ ...pane, tpgid: 11 }, launchScript] });
+      expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+    });
+
+    it("waits, then ends attention_required, when the process list can't be read", async () => {
+      const tmux = mockTmux();
+      (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue("sh");
+      (tmux as unknown as { getPanePid: unknown }).getPanePid = vi.fn(async () => 10);
+      const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, readinessTimeoutMs: WAIT_MS,
+        listProcesses: () => { throw new Error("ps unavailable"); } });
+      const result = await adapter.launchHarness({ ...makeBinding(), tmuxPane: "%1" }, { name: "dev-impl@test-rig", resumeToken: "abc-123" });
+      expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+      expect(tmux.capturePaneContent).toHaveBeenCalledTimes(31);
+    });
+
+    it("keeps the bound the setting gives: a longer setting waits for more polls", async () => {
+      const { result, reads } = await run({ readinessTimeoutMs: 10_000 });
+      expect(result).toMatchObject({ recovery: "attention_required" });
+      expect(reads).toBe(51);
+    });
+
+    it("still ends in the missing-conversation result when Claude reports it during the extra wait", async () => {
+      const { result } = await run({ screen: (read) => (read < 22 ? "" : "No conversation found with session ID: abc-123") });
+      expect(result).toEqual({
+        ok: false,
+        error: "Claude resume failed: no conversation found for the requested session",
+        recovery: "retry_fresh",
+        missingConversation: true,
       });
     });
 
-    it("reports the timeout while the launch script still holds the foreground before Claude starts", async () => {
-      expect(await run([{ ...pane, tpgid: 11 }, launchScript])).toEqual({
-        ok: false,
-        error: "Claude resume failed: timed out waiting for Claude to become active",
-      });
+    it("still stops at a resume-selection prompt during the extra wait", async () => {
+      const prompt = ["Resume Session", "❯ 1. First conversation", "  2. Second conversation", "Enter to select · Esc to cancel"].join("\n");
+      const { result } = await run({ screen: (read) => (read < 22 ? "" : prompt) });
+      expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
     });
 
-    it("still reports a pane whose shell owns the terminal with nothing under it", async () => {
-      expect(await run([pane])).toEqual({
+    it("reports a return to the shell when the pane is back at its shell by the end of the wait", async () => {
+      const { result } = await run({ rows: (read) => (read < 25 ? occupied : [pane]) });
+      expect(result).toEqual({
         ok: false,
         error: "Claude resume failed: pane returned to shell instead of entering Claude",
         recovery: "retry_fresh",
       });
+    });
+
+    it("does not wait at all for a pane that is provably back at its shell when the first window ends", async () => {
+      const { result, reads } = await run({ rows: () => [pane] });
+      expect(result).toMatchObject({ ok: false, recovery: "retry_fresh" });
+      expect(reads).toBe(17);
+    });
+
+    it("does not wait for a Claude that names another conversation: another occupant, timed out as before", async () => {
+      const other = { ...claude, command: "claude --permission-mode acceptEdits --resume some-other-session --name other" };
+      const { result, reads } = await run({ rows: () => [{ ...pane, tpgid: 11 }, launchScript, other] });
+      expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+      expect(reads).toBe(17);
+    });
+
+    it("does not wait for a Claude that says it needs a login: timed out as before", async () => {
+      const { result, reads } = await run({ screen: () => "Not logged in · Run /login" });
+      expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+      expect(reads).toBe(17);
+    });
+
+    it("several slow seats in one restore share one allowance, so their waits do not stack", async () => {
+      // 6s setting: 3.2s first window + 2.8s of extra wait for the whole restore.
+      const budget = { remainingMs: WAIT_MS - 3_200 };
+      const first = await run({ budget });
+      const second = await run({ budget });
+      const third = await run({ budget });
+      expect(first.reads).toBe(31);
+      expect(budget.remainingMs).toBe(0);
+      // The seats after the first get only their first window; they still end attention_required, token kept.
+      expect([second.reads, third.reads]).toEqual([17, 17]);
+      for (const seat of [first, second, third]) expect(seat.result).toMatchObject({ ok: false, recovery: "attention_required" });
+      expect(second.result).toMatchObject({ error: "Claude resume did not finish within 3s; Claude may still be starting, so the launch was kept" });
+      // Unshared, three stuck seats would have read 31 + 31 + 31 times.
+      expect(first.reads + second.reads + third.reads).toBe(65);
+    });
+
+    it("a seat that comes up early spends only the wait it used, leaving the rest for the next", async () => {
+      const budget = { remainingMs: WAIT_MS - 3_200 };
+      const early = await run({ budget, screen: (read) => (read < 20 ? "" : tui) });
+      expect(early.result).toMatchObject({ ok: true });
+      // Polls 17 to 21 were the extra wait: five polls of 200 ms.
+      expect(budget.remainingMs).toBe(2_800 - 5 * 200);
+      const next = await run({ budget });
+      expect(next.reads).toBe(1 + 16 + 14 - 5);
+    });
+
+    it("waits and ends attention_required when tmux names Claude's version string and the screen is never recognised (#86)", async () => {
+      const { result } = await run({ paneCommand: "2.1.301", screen: () => "" });
+      expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
     });
   });
 

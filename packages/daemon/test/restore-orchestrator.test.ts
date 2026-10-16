@@ -2058,6 +2058,12 @@ describe("RestoreOrchestrator", () => {
         expect(outcome.status).not.toBe("resumed");
         if (mode === "missing-token") expect(tmux.sendText).not.toHaveBeenCalled();
         else if (mode === "chooser") expect(latest.resumeToken).toBe(token); // attempted lineage, not readiness
+        else if (mode === "foreign-process" || mode === "replaced-pane" || mode === "replaced-process") {
+          // A look-alike or swapped occupant can't be told from a launch still coming up, so the slow-start watch
+          // applies: kept for a person as attention_required, the requested token recorded as an attempt, nothing certified.
+          expect({ status: outcome.status, startup: latest.startupStatus, token: latest.resumeToken }).toEqual({ status: "attention_required", startup: "attention_required", token });
+          expect(db.prepare("SELECT resume_provenance, resume_last_verified FROM sessions WHERE id = ?").get(latest.id)).toEqual({ resume_provenance: null, resume_last_verified: null });
+        }
         else expect(latest.resumeToken).toBeNull();
       }
       if (mode === "error") {
@@ -2122,6 +2128,50 @@ describe("RestoreOrchestrator", () => {
       // Node should be "resumed"
       expect(result.result.nodes[0]!.status).toBe("resumed");
     }
+  });
+
+  it("restore hands one slow-start allowance to every seat, so several slow resumes do not stack their waits", async () => {
+    const rig = rigRepo.createRig("test-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-slow", rig.id, "Dev");
+    const sessions: string[] = [];
+    for (const name of ["a", "b", "c"]) {
+      const node = rigRepo.addNode(rig.id, `dev.${name}`, { runtime: "claude-code", podId: "pod-slow" });
+      const session = sessionRegistry.registerSession(node.id, `dev-${name}@test-rig`);
+      sessionRegistry.updateStatus(session.id, "running");
+      sessionRegistry.updateResumeToken(session.id, "claude_id", `slow-token-${name}`);
+      db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)").run(node.id, "[]", "[]", "[]", "claude-code");
+      sessions.push(session.id);
+    }
+    const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+    for (const id of sessions) sessionRegistry.updateStatus(id, "exited");
+    db.prepare("DELETE FROM bindings WHERE node_id IN (SELECT id FROM nodes WHERE rig_id = ?)").run(rig.id);
+
+    // Each launch spends what it is allowed, as a stuck Claude would: the first takes all of it.
+    const seen: Array<{ budget: unknown; remainingOnEntry: number | undefined }> = [];
+    const launchSpy = vi.fn(async (_binding: unknown, opts: { slowStartBudget?: { remainingMs: number } }) => {
+      seen.push({ budget: opts.slowStartBudget, remainingOnEntry: opts.slowStartBudget?.remainingMs });
+      if (opts.slowStartBudget) opts.slowStartBudget.remainingMs = 0;
+      return { ok: false as const, error: "Claude resume did not finish; the launch was kept", recovery: "attention_required" as const, evidence: "still starting" };
+    });
+    const mockAdapter = {
+      runtime: "claude-code",
+      listInstalled: vi.fn(async () => []),
+      project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+      deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+      checkReady: vi.fn(async () => ({ ready: true })),
+      launchHarness: launchSpy,
+    };
+
+    const orch = createOrchestrator({ claude: mockClaudeResume(), listProcesses: nativeLineage("claude-code", "slow-token-a") });
+    const result = await orch.restore(snap.id, { adapters: { "claude-code": mockAdapter } });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.result.nodes.map((node) => node.status)).toEqual(["attention_required", "attention_required", "attention_required"]);
+    expect(seen).toHaveLength(3);
+    // One object for the whole restore, starting at the readiness setting (30 s by default), already spent for the later seats.
+    expect(seen[1]!.budget).toBe(seen[0]!.budget);
+    expect(seen[2]!.budget).toBe(seen[0]!.budget);
+    expect(seen.map((entry) => entry.remainingOnEntry)).toEqual([30_000, 0, 0]);
   });
 
   it("pod-aware chooser attention preserves the attempted native token for no-input reconciliation", async () => {

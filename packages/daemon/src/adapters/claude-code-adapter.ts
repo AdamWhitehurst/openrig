@@ -10,10 +10,11 @@ import type {
   InstalledResource, ProjectionResult, StartupDeliveryResult, ReadinessResult,
   HarnessLaunchResult,
 } from "../domain/runtime-adapter.js";
-import { resolveConcreteHint } from "../domain/runtime-adapter.js";
+import { resolveConcreteHint, type SlowStartBudget } from "../domain/runtime-adapter.js";
+import { resolveReadinessTimeoutMs } from "../domain/readiness-timeout.js";
 import type { ProjectionPlan, ProjectionEntry } from "../domain/projection-planner.js";
 import { assessNativeResumeProbe } from "../domain/native-resume-probe.js";
-import { observeClaudeDelivery, observeClaudePaneProcess, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
+import { observeClaudeDelivery, observeClaudePaneProcess, observeClaudePaneRuntime, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
 import { mergeManagedBlock, DEFAULT_CLAUDE_MANAGED_BLOCK_FILE, type ClaudeManagedBlockFile } from "../domain/managed-blocks.js";
 import { claudeResumeLaunchEnv, claudeResumeLaunchPrefix } from "./claude-resume-launch.js";
 import { shellQuote } from "./shell-quote.js";
@@ -58,6 +59,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
   private collectorAssetPath: string | null;
   private autoDriveProviderPrompts: boolean;
   private listProcesses?: NativeProcessLister;
+  private readinessTimeoutMs?: number;
   private autoLaunches = new Map<string, { binding: NodeBinding; token: string; executable?: string; fingerprint?: string; process?: ClaudeLaunchedProcess }>();
   readonly claudeManagedLaunch?: ClaudeManagedLaunch;
   private activityRelayPath: string | null;
@@ -76,6 +78,8 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     collectorAssetPath?: string;
     autoDriveProviderPrompts?: boolean;
     listProcesses?: NativeProcessLister;
+    /** Bound on a slow resume's wait, from the launch (default: runtime.readiness_timeout_seconds). */
+    readinessTimeoutMs?: number;
     claudeManagedLaunch?: ClaudeManagedLaunch;
     /** DI source of the activity-relay.cjs asset (parity with the Codex adapter). */
     activityRelayPath?: string;
@@ -95,6 +99,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     this.collectorAssetPath = deps.collectorAssetPath ?? null;
     this.autoDriveProviderPrompts = deps.autoDriveProviderPrompts ?? false;
     this.listProcesses = deps.listProcesses;
+    this.readinessTimeoutMs = deps.readinessTimeoutMs;
     this.claudeManagedLaunch = deps.claudeManagedLaunch;
     this.activityRelayPath = deps.activityRelayPath ?? null;
     this.claudeHooksManifestPath = deps.claudeHooksManifestPath ?? null;
@@ -234,7 +239,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
 
   async launchHarness(
     binding: NodeBinding,
-    opts: { name: string; resumeToken?: string; forkSource?: import("../domain/runtime-adapter.js").ForkSource },
+    opts: { name: string; resumeToken?: string; forkSource?: import("../domain/runtime-adapter.js").ForkSource; slowStartBudget?: SlowStartBudget },
   ): Promise<HarnessLaunchResult> {
     binding = { ...binding };
     this.autoLaunches.delete(binding.nodeId);
@@ -338,7 +343,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       { binding: NodeBinding; token: string; executable?: string; fingerprint?: string; process?: ClaudeLaunchedProcess };
     this.autoLaunches.set(binding.nodeId, launch);
     if (opts.resumeToken) {
-      const verification = await this.verifyResumeLaunch(binding);
+      const verification = await this.verifyResumeLaunch(binding, opts.slowStartBudget);
       // The process readiness pinned first, if it observed one: the caller records it, not a later read.
       const launchedProcess = launch.process ? { launchedProcess: { ...launch.process } } : {};
       if (!verification.ok) return { ...verification, ...launchedProcess };
@@ -429,53 +434,91 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     return observed.state === "idle_shell";
   }
 
-  private async verifyResumeLaunch(binding: NodeBinding): Promise<HarnessLaunchResult> {
+  /** A resume that is slow shows no Claude under the pane yet (the launch script is starting it) or the very Claude
+   *  this launch started. A Claude naming another conversation, or a look-alike process, is another occupant:
+   *  waiting won't make it this launch's, and its token is not recorded as an attempt. */
+  private async occupantIsOurStart(binding: NodeBinding): Promise<boolean> {
+    const launch = this.autoLaunches.get(binding.nodeId);
+    if (!binding.tmuxPane || !launch) return true;
+    const observation = { target: binding.tmuxPane, tmux: this.tmux, listProcesses: this.listProcesses, selectedExecutable: launch.executable };
+    if (await observeClaudePaneProcess({ ...observation, expectedToken: launch.token })) return true;
+    return !(await observeClaudePaneRuntime(observation));
+  }
+
+  /** One look at a resuming pane: a verdict when the pane shows one, null to keep watching. */
+  private async resumeVerdict(binding: NodeBinding): Promise<{ verdict: HarnessLaunchResult | null; definiteFailure: boolean }> {
     const tmuxSession = binding.tmuxSession!;
-    const attempts = 16;
+    const paneCommand = await this.tmux.getPaneCommand(tmuxSession);
+    const paneContent = (await this.tmux.capturePaneContent(tmuxSession, 40)) ?? "";
+    const probe = await this.assessManagedProbe(binding, paneCommand, paneContent);
 
-    for (let attempt = 0; attempt < attempts; attempt++) {
-      const paneCommand = await this.tmux.getPaneCommand(tmuxSession);
-      const paneContent = (await this.tmux.capturePaneContent(tmuxSession, 40)) ?? "";
-      const probe = await this.assessManagedProbe(binding, paneCommand, paneContent);
+    if (probe.code === "no_conversation_found") {
+      return { verdict: {
+        ok: false,
+        error: "Claude resume failed: no conversation found for the requested session",
+        recovery: "retry_fresh",
+        missingConversation: true,
+      }, definiteFailure: false };
+    }
 
-      if (probe.code === "no_conversation_found") {
-        return {
-          ok: false,
-          error: "Claude resume failed: no conversation found for the requested session",
-          recovery: "retry_fresh",
-          missingConversation: true,
-        };
-      }
+    if (probe.status === "resumed") {
+      return { verdict: { ok: true }, definiteFailure: false };
+    }
 
-      if (probe.status === "resumed") {
-        return { ok: true };
-      }
+    // OPR.0.3.4.5: Claude resume-selection prompt -> attention_required,
+    // never timed-out. The menu is alive and recoverable; auto-selecting
+    // is governance BLOCKING. Surface evidence and exit immediately.
+    if (probe.status === "attention_required") {
+      return { verdict: {
+        ok: false,
+        error: probe.detail,
+        recovery: "attention_required",
+        evidence: paneContent.split("\n").slice(-12).join("\n"),
+      }, definiteFailure: false };
+    }
 
-      // OPR.0.3.4.5: Claude resume-selection prompt -> attention_required,
-      // never timed-out. The menu is alive and recoverable; auto-selecting
-      // is governance BLOCKING. Surface evidence and exit immediately.
-      if (probe.status === "attention_required") {
-        return {
-          ok: false,
-          error: probe.detail,
-          recovery: "attention_required",
-          evidence: paneContent.split("\n").slice(-12).join("\n"),
-        };
-      }
-
-      if (this.autoDriveProviderPrompts && probe.code === "trust_gate") {
-        const enterResult = await this.tmux.sendKeys(tmuxSession, ["Enter"]);
-        if (!enterResult.ok) {
-          return { ok: false, error: `Claude trust prompt auto-drive failed: ${enterResult.message}` };
-        }
-        await this.sleep(200);
-        continue;
-      }
-
-      if (attempt < attempts - 1) {
-        await this.sleep(200);
+    if (this.autoDriveProviderPrompts && probe.code === "trust_gate") {
+      const enterResult = await this.tmux.sendKeys(tmuxSession, ["Enter"]);
+      if (!enterResult.ok) {
+        return { verdict: { ok: false, error: `Claude trust prompt auto-drive failed: ${enterResult.message}` }, definiteFailure: false };
       }
     }
+    // Claude's own report that it can't continue (login), or that it waits for a person (trust, MCP approval), is
+    // no slow start; "returned to shell" is only the pane-command guess.
+    return { verdict: null, definiteFailure: (probe.status === "failed" && probe.code !== "returned_to_shell")
+      || probe.code === "trust_gate" || probe.code === "mcp_gate" };
+  }
+
+  private async verifyResumeLaunch(binding: NodeBinding, budget?: SlowStartBudget): Promise<HarnessLaunchResult> {
+    const tmuxSession = binding.tmuxSession!;
+    const pollMs = 200;
+    const windowAttempts = 16;
+    // A resume that is slow, not failed, gets the time a fresh launch gets before its readiness timeout, counted
+    // from the launch and in polls. A restore shares one allowance across its seats (they start one after another).
+    let attempts = windowAttempts;
+    let slowStart = false;
+
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      const { verdict, definiteFailure } = await this.resumeVerdict(binding);
+      if (verdict) {
+        if (budget) budget.remainingMs -= Math.max(0, attempt + 1 - windowAttempts) * pollMs;
+        return verdict;
+      }
+
+      // The first window is over. A pane provably back at its shell ends here, as does a definite failure or an
+      // occupant that isn't this launch's Claude; anything else is a slow start.
+      if (attempt === windowAttempts - 1 && !definiteFailure
+        && !(await this.paneReturnedToShell(binding, await this.tmux.getPaneCommand(tmuxSession)))
+        && await this.occupantIsOurStart(binding)) {
+        slowStart = true;
+        const extraMs = Math.max(0, resolveReadinessTimeoutMs(this.readinessTimeoutMs) - windowAttempts * pollMs);
+        attempts = windowAttempts + Math.floor(Math.min(extraMs, budget?.remainingMs ?? extraMs) / pollMs);
+      }
+      if (attempt < attempts - 1) {
+        await this.sleep(pollMs);
+      }
+    }
+    if (budget) budget.remainingMs -= (attempts - windowAttempts) * pollMs;
 
     const finalCommand = await this.tmux.getPaneCommand(tmuxSession);
     const finalContent = (await this.tmux.capturePaneContent(tmuxSession, 40)) ?? "";
@@ -512,6 +555,16 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       };
     }
 
+    if (slowStart) {
+      // Claude, or the script about to start it, may still be coming up. Keep the launch and its resume token for
+      // a person (or the reconciler) rather than failing a seat that may be running.
+      return {
+        ok: false,
+        error: `Claude resume did not finish within ${Math.round(attempts * pollMs / 1000)}s; Claude may still be starting, so the launch was kept`,
+        recovery: "attention_required",
+        evidence: finalContent.split("\n").slice(-12).join("\n"),
+      };
+    }
     return { ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" };
   }
 

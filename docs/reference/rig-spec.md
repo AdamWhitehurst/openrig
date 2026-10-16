@@ -630,8 +630,13 @@ The harness readiness window defaults to 30 seconds. On a loaded machine, set
 `rig config set runtime.readiness_timeout_seconds 60` to give new seats and
 handover successors longer to become interactive. The setting accepts 1–600
 seconds, applies to the next launch without a daemon restart, and can also be
-set with `OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS`. It does not change the
-time spent by the runtime adapter before readiness polling starts.
+set with `OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS`. It also bounds how long a
+restore keeps watching a Claude seat whose resume is still starting, counted
+from its launch and shared by all the seats of one restore (they start one
+after another). A seat that is still not interactive then ends
+`attention_required` with its launch and resume token kept. Otherwise it does
+not change the time spent by the runtime adapter before readiness polling
+starts.
 
 ---
 

@@ -96,6 +96,11 @@ export type HarnessLaunchRecovery = "retry_fresh" | "attention_required";
 
 // `launchedProcess` (Claude resume launches): the first process the launch's own readiness check
 // pinned as the one it started, kept even when a later sample saw it replaced (#1077).
+/** Time a restore lets resumes that are slow to start keep waiting, shared by every seat in that restore.
+ *  Restore starts seats one after another, so each wait adds to the next seat's start; an adapter draws
+ *  down `remainingMs` by what it actually waited. Absent (a single launch): the adapter's own bound. */
+export interface SlowStartBudget { remainingMs: number }
+
 export type HarnessLaunchResult =
   | { ok: true; resumeToken?: string; resumeType?: string; appliedLaunch?: import("./permission-drift.js").AppliedLaunchObservation;
     launchedProcess?: import("./native-process-lineage.js").ClaudeLaunchedProcess }
@@ -180,7 +185,7 @@ export interface RuntimeAdapter {
    */
   launchHarness(
     binding: NodeBinding,
-    opts: { name: string; resumeToken?: string; forkSource?: ForkSource },
+    opts: { name: string; resumeToken?: string; forkSource?: ForkSource; slowStartBudget?: SlowStartBudget },
   ): Promise<HarnessLaunchResult>;
 
   /** Check if the runtime harness is responsive and ready. */
