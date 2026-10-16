@@ -99,7 +99,7 @@ export function wrapSendBody(
     header.push(`Sent: ${renderShortStamp(meta.stampISO)}${genSuffix}`);
   }
   const reply = senderLabel.endsWith("@external")
-    ? `↩ Reply if needed: rig queue create --destination ${senderLabel} --body "..." --verify`
+    ? `↩ Reply if needed: rig queue create --destination ${senderLabel} --summary "<one line>" --body "..." --verify`
     : `↩ Reply: rig send ${senderLabel} "..."`;
   return [...header, "---", body, "---", reply].join("\n");
 }
