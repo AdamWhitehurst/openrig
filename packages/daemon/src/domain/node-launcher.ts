@@ -14,6 +14,7 @@ import type { TmuxOptionDefaultsApplier } from "./tmux-option-defaults.js";
 import { observeSolePane, paneObservationVerdict } from "./pane-binding-observation.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import type { OccupantKind } from "./session-registry.js";
+import { keepVendoredPluginDir } from "./claude-core-plugin-env.js";
 import { mergeSeatEnv, seatEnvLaunchVars, type SeatEnv } from "./seat-env.js";
 
 import type { Session, Binding } from "./types.js";
@@ -143,15 +144,16 @@ export class NodeLauncher {
     // Create tmux session with OpenRig identity env vars. A duplicate is a
     // collision, never authority to kill an unmanaged same-name session.
     const specEnv = this.rigRepo.getEffectiveSeatEnv(node.id);
-    const launchEnv = (oneOff?: SeatEnv) => compactEnv({
+    const runtimeEnv = node.runtime ? this.runtimeSessionEnv[node.runtime] : undefined;
+    const launchEnv = (oneOff?: SeatEnv) => keepVendoredPluginDir(compactEnv({
       OPENRIG_NODE_ID: node.id,
       OPENRIG_SESSION_NAME: sessionName,
       OPENRIG_RUNTIME: node.runtime ?? undefined,
       ...this.sessionEnv,
-      ...(node.runtime ? this.runtimeSessionEnv[node.runtime] : undefined),
+      ...runtimeEnv,
       ...seatEnvLaunchVars(mergeSeatEnv(specEnv, oneOff)),
       OPENRIG_OCCUPANT_GENERATION: occupantGeneration ?? undefined,
-    });
+    }), runtimeEnv);
     const openRigEnv = launchEnv(opts?.env);
     const sessionCwd = opts?.cwd ?? node.cwd ?? undefined;
     const tmuxResult = await this.tmuxAdapter.createSession(sessionName, sessionCwd, openRigEnv);

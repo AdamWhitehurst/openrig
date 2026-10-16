@@ -1,4 +1,5 @@
 import { ulid } from "ulid";
+import { keepVendoredPluginDir } from "./claude-core-plugin-env.js";
 import { seatEnvLaunchVars, type SeatEnv } from "./seat-env.js";
 import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { DiscoveryRepository } from "./discovery-repository.js";
@@ -179,15 +180,16 @@ export class SuccessorSessionLauncher {
 
     // OpenRig identity env mirrors NodeLauncher.launchNode's pattern so the successor self-identifies +
     // reports activity like a launched seat. OPENRIG_SESSION_NAME is the PRESERVED canonical name.
-    const env = compactEnv({
+    const runtimeEnv = input.node.runtime ? this.runtimeSessionEnv[input.node.runtime] : undefined;
+    const env = keepVendoredPluginDir(compactEnv({
       OPENRIG_NODE_ID: input.node.id,
       OPENRIG_SESSION_NAME: departingSession,
       OPENRIG_RUNTIME: input.node.runtime ?? undefined,
       ...this.sessionEnv,
-      ...(input.node.runtime ? this.runtimeSessionEnv[input.node.runtime] : undefined),
+      ...runtimeEnv,
       ...seatEnvLaunchVars(input.node.seatEnv ?? {}),
       OPENRIG_OCCUPANT_GENERATION: input.occupantGeneration ?? undefined,
-    });
+    }), runtimeEnv);
     const cwd = input.node.cwd ?? undefined;
 
     // 1. Resolve the DEPARTING session's active pane — the retiree's pane we take over. A probe throw or

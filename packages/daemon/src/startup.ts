@@ -908,7 +908,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     });
     await vendorService.ensureLatest("openrig-core");
     // Claude seats load the vendored plugin's hooks. The same map reaches fresh launch, restore and
-    // handover successors, and a seat's own spec env still wins over it.
+    // handover successors; a CLAUDE_CODE_PLUGIN_DIRS a seat declares keeps working and this is added to it.
     const corePluginEnv = claudeCorePluginEnv(userPluginsDir);
     if (corePluginEnv) runtimeSessionEnv["claude-code"] = corePluginEnv;
     for (const skill of ["openrig-skills", "refocusing"]) {

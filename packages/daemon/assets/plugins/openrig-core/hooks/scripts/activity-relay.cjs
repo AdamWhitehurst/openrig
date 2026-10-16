@@ -206,18 +206,36 @@ function uid() {
   try { return typeof process.getuid === "function" ? String(process.getuid()) : "user"; } catch { return "user"; }
 }
 
-// OpenRig also copies this script into a seat's own settings.local.json hooks, so a seat that loads this plugin
-// as well would post every event twice. The plugin's manifest starts it with --from-plugin; when the daemon has
-// said the settings copy reports activity for the seat, the plugin's run exits. The settings copy is started
-// without that argument and always reports, and so does a seat that has no such variable (the plugin installed
-// on its own).
-function pluginRunIsRedundant(argv = process.argv, env = process.env) {
-  return argv.includes("--from-plugin") && firstString(env.OPENRIG_ACTIVITY_HOOKS_OWNED_BY_SETTINGS) === "1";
+// OpenRig also copies this script into a seat's own settings.local.json hooks (the claude_activity_hooks resource), so a
+// seat that loads this plugin as well would post every event twice. The plugin's manifest starts the plugin's run with
+// --from-plugin; that run looks at the seat's project settings.local.json and exits only when the OpenRig copy is
+// registered there for this very event. The settings copy is started without that argument and always reports, and so does
+// a seat whose settings have no such entry (the resource is optional) or a plugin installed on its own, so a seat reports
+// each event once either way. Anything unreadable counts as "not registered".
+const SETTINGS_RELAY_TAIL = "state/claude-activity-hooks/activity-relay.cjs";
+
+function settingsRelayReports(hookEvent, providerPayload, env = process.env) {
+  const projectDir = firstString(env.CLAUDE_PROJECT_DIR, providerPayload && providerPayload.cwd);
+  if (!projectDir || !hookEvent) return false;
+  try {
+    const settings = JSON.parse(fs.readFileSync(path.join(projectDir, ".claude", "settings.local.json"), "utf8"));
+    const groups = settings && settings.hooks && settings.hooks[hookEvent];
+    return Array.isArray(groups) && groups.some((group) => group && Array.isArray(group.hooks)
+      && group.hooks.some((hook) => hook && typeof hook.command === "string" && hook.command.includes(SETTINGS_RELAY_TAIL)));
+  } catch {
+    return false;
+  }
+}
+
+function pluginRunIsRedundant(providerPayload, argv = process.argv, env = process.env) {
+  if (!argv.includes("--from-plugin")) return false;
+  const hookEvent = firstString(providerPayload.hookEvent, providerPayload.hookEventName, providerPayload.hook_event_name, providerPayload.event, providerPayload.eventName);
+  return settingsRelayReports(hookEvent, providerPayload, env);
 }
 
 async function main() {
-  if (pluginRunIsRedundant()) return;
   const providerPayload = parseJson(await readStdin());
+  if (pluginRunIsRedundant(providerPayload)) return;
   const payload = buildOpenRigPayload(providerPayload);
   const identityPayload = buildSessionIdentityPayload(providerPayload, process.env);
   if (identityPayload && identityPayload.resumeLaunch) {
@@ -241,4 +259,5 @@ module.exports = {
   postHookPayload,
   resolveEndpoint,
   pluginRunIsRedundant,
+  settingsRelayReports,
 };

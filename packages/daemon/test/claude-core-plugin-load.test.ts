@@ -28,12 +28,15 @@ import type { TmuxAdapter } from "../src/adapters/tmux.js";
 // only from a plugin it was told about, and nothing told it: the plugin sat in OpenRig's state, so a
 // seat's PreCompact hook never wrote the restore-pending marker the managed post-compact prompt reads.
 // The daemon now tells every Claude seat where the vendored plugin is (CLAUDE_CODE_PLUGIN_DIRS, no launch
-// argument, so the seat's process identity is unchanged) and says the settings-based relay already
-// reports activity, so the plugin's own relay stays quiet instead of posting every event a second time.
+// argument, so the seat's process identity is unchanged). A seat's own CLAUDE_CODE_PLUGIN_DIRS keeps working and the
+// vendored plugin is added to it. The plugin's own activity relay stays quiet for an event only when the seat's
+// settings.local.json carries OpenRig's copy of the relay for that event, so each event is reported once either way.
 
 const require = createRequire(import.meta.url);
 const PLUGIN_ENV = "CLAUDE_CODE_PLUGIN_DIRS";
-const SETTINGS_OWN_RELAY = "OPENRIG_ACTIVITY_HOOKS_OWNED_BY_SETTINGS";
+const OWN_LIST = "/own/plugins:/more/plugins";
+const VENDORED = "/state/plugins/openrig-core";
+const SETTINGS_RELAY = "/state/state/claude-activity-hooks/activity-relay.cjs";
 
 describe("the daemon's Claude plugin env", () => {
   let root: string;
@@ -52,7 +55,7 @@ describe("the daemon's Claude plugin env", () => {
       const claude = deps.runtimeSessionEnv?.["claude-code"];
       expect(claude?.[PLUGIN_ENV]).toBe(join(root, "openrig", "plugins", "openrig-core"));
       expect(claude?.[PLUGIN_ENV]).not.toContain(":");
-      expect(claude?.[SETTINGS_OWN_RELAY]).toBe("1");
+      expect(Object.keys(claude ?? {})).toEqual([PLUGIN_ENV]);
       // Only Claude gets it: Codex has no such variable, and its seats' env stays as it was.
       expect(deps.runtimeSessionEnv?.codex).toBeUndefined();
     } finally {
@@ -67,17 +70,14 @@ describe("the daemon's Claude plugin env", () => {
     expect(claudeCorePluginEnv(join(root, "plugins"))).toBeUndefined();
     mkdirSync(join(root, "plugins", "openrig-core", ".claude-plugin"));
     writeFileSync(join(root, "plugins", "openrig-core", ".claude-plugin", "plugin.json"), "{}");
-    expect(claudeCorePluginEnv(join(root, "plugins"))).toEqual({
-      [PLUGIN_ENV]: join(root, "plugins", "openrig-core"),
-      [SETTINGS_OWN_RELAY]: "1",
-    });
+    expect(claudeCorePluginEnv(join(root, "plugins"))).toEqual({ [PLUGIN_ENV]: join(root, "plugins", "openrig-core") });
   });
 });
 
 describe("a Claude seat's launch env carries the plugin on every path", () => {
   const dbs: ReturnType<typeof createFullTestDb>[] = [];
   afterEach(() => { for (const db of dbs.splice(0)) db.close(); });
-  const claudeEnv = { "claude-code": { [PLUGIN_ENV]: "/state/plugins/openrig-core", [SETTINGS_OWN_RELAY]: "1" } };
+  const claudeEnv = { "claude-code": { [PLUGIN_ENV]: VENDORED } };
 
   it("fresh launch: the first pane's session env has it for Claude and not for Codex", async () => {
     const db = createFullTestDb(); dbs.push(db);
@@ -95,9 +95,37 @@ describe("a Claude seat's launch env carries the plugin on every path", () => {
       tmuxAdapter: tmux, sessionEnv: { OPENRIG_HOME: "/state" }, runtimeSessionEnv: claudeEnv });
     expect((await launcher.launchNode(rig.id, "dev.claude")).ok).toBe(true);
     expect((await launcher.launchNode(rig.id, "dev.codex")).ok).toBe(true);
-    expect(created[0]).toMatchObject({ [PLUGIN_ENV]: "/state/plugins/openrig-core", [SETTINGS_OWN_RELAY]: "1" });
+    expect(created[0]).toMatchObject({ [PLUGIN_ENV]: VENDORED });
     expect(created[1]).not.toHaveProperty(PLUGIN_ENV);
-    expect(created[1]).not.toHaveProperty(SETTINGS_OWN_RELAY);
+  });
+
+  it("fresh launch: a seat's own list keeps working and the vendored plugin is added to it", async () => {
+    const db = createFullTestDb(); dbs.push(db);
+    const rigRepo = new RigRepository(db);
+    const rig = rigRepo.createRig("plugin-env-own");
+    rigRepo.addNode(rig.id, "own", { runtime: "claude-code", env: { [PLUGIN_ENV]: OWN_LIST } });
+    rigRepo.addNode(rig.id, "has-it", { runtime: "claude-code", env: { [PLUGIN_ENV]: `/own/plugins:${VENDORED}` } });
+    rigRepo.addNode(rig.id, "plain", { runtime: "claude-code" });
+    rigRepo.addNode(rig.id, "oneoff", { runtime: "claude-code" });
+    const created: Array<Record<string, string> | undefined> = [];
+    const sessionEnvCalls: string[] = [];
+    const tmux = {
+      createSession: async (_n: string, _c?: string, env?: Record<string, string>) => { created.push(env); return { ok: true as const }; },
+      setSessionEnv: async (_s: string, key: string, value: string) => { sessionEnvCalls.push(`set ${key}=${value}`); },
+      unsetSessionEnv: async (_s: string, key: string) => { sessionEnvCalls.push(`unset ${key}`); },
+      killSession: async () => ({ ok: true as const }), listPanes: async () => [], listSessions: async () => [], hasSession: async () => false,
+    } as unknown as TmuxAdapter;
+    const launcher = new NodeLauncher({ db, rigRepo, sessionRegistry: new SessionRegistry(db), eventBus: new EventBus(db),
+      tmuxAdapter: tmux, sessionEnv: { OPENRIG_HOME: "/state" }, runtimeSessionEnv: claudeEnv });
+    for (const id of ["own", "has-it", "plain"]) expect((await launcher.launchNode(rig.id, id)).ok).toBe(true);
+    expect(created[0]![PLUGIN_ENV]).toBe(`${OWN_LIST}:${VENDORED}`);
+    expect(created[1]![PLUGIN_ENV]).toBe(`/own/plugins:${VENDORED}`);
+    expect(created[2]![PLUGIN_ENV]).toBe(VENDORED);
+    // A one-off `rig up --env` list is composed too, and once the first pane has it the session goes back to the vendored plugin.
+    const oneOff = await launcher.launchNode(rig.id, "oneoff", { env: { [PLUGIN_ENV]: "/one/off" } });
+    expect(oneOff.ok, JSON.stringify(oneOff)).toBe(true);
+    expect(created[3]![PLUGIN_ENV]).toBe(`/one/off:${VENDORED}`);
+    expect(sessionEnvCalls).toContain(`set ${PLUGIN_ENV}=${VENDORED}`);
   });
 
   it("handover successor: the respawned pane has it", async () => {
@@ -118,7 +146,28 @@ describe("a Claude seat's launch env carries the plugin on every path", () => {
     });
     const res = await launcher.createSuccessor({ node: { id: "node-1", runtime: "claude-code", cwd: "/w" }, departingSessionName: "dev-claude@rig" });
     expect(res.ok).toBe(true);
-    expect((respawnPane.mock.calls[0] as unknown[])[2]).toMatchObject({ env: { [PLUGIN_ENV]: "/state/plugins/openrig-core", [SETTINGS_OWN_RELAY]: "1" } });
+    expect((respawnPane.mock.calls[0] as unknown[])[2]).toMatchObject({ env: { [PLUGIN_ENV]: VENDORED } });
+  });
+
+  it("handover successor: a seat's own list keeps working and the vendored plugin is added to it", async () => {
+    const db = createFullTestDb(); dbs.push(db);
+    const respawnPane = vi.fn(async () => ({ ok: true }));
+    const tmux = {
+      createSession: vi.fn(async () => ({ ok: true })),
+      listPanes: vi.fn(async () => [{ id: "%7", index: 0, cwd: "/w", width: 80, height: 24, active: true }]),
+      killSession: vi.fn(async () => ({ ok: true })), respawnPane, setRemainOnExit: vi.fn(async () => ({ ok: true })),
+      signalPaneProcess: vi.fn(async () => ({ ok: true })), isPaneDead: vi.fn(async () => true),
+      getDefaultShell: vi.fn(async () => "/bin/zsh"), getPaneCommand: vi.fn(async () => "zsh"),
+    } as unknown as TmuxAdapter;
+    const adapter = { runtime: "claude-code", launchHarness: vi.fn(async () => ({ ok: true, resumeToken: "t", resumeType: "claude_id" })),
+      checkReady: vi.fn(async () => ({ ready: true })) } as unknown as RuntimeAdapter;
+    const launcher = new SuccessorSessionLauncher(tmux, new DiscoveryRepository(db), {
+      sessionEnv: { OPENRIG_HOME: "/state" }, runtimeSessionEnv: claudeEnv, newId: () => "01ABCDEFG",
+      runtimeAdapters: { "claude-code": adapter }, readinessTimeoutMs: 50, sleep: async () => {}, exitPollMs: 1, exitTimeoutMs: 5,
+    });
+    const res = await launcher.createSuccessor({ node: { id: "node-1", runtime: "claude-code", cwd: "/w", seatEnv: { [PLUGIN_ENV]: OWN_LIST } }, departingSessionName: "dev-claude@rig" });
+    expect(res.ok).toBe(true);
+    expect((respawnPane.mock.calls[0] as unknown[])[2]).toMatchObject({ env: { [PLUGIN_ENV]: `${OWN_LIST}:${VENDORED}` } });
   });
 
   it("restore: the relaunched session is created through the same env", async () => {
@@ -131,7 +180,7 @@ describe("a Claude seat's launch env carries the plugin on every path", () => {
     const snapshotCapture = new SnapshotCapture({ db, rigRepo, sessionRegistry, eventBus, snapshotRepo, checkpointStore });
     const rig = rigRepo.createRig("restore-test");
     db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("restore-pod", rig.id, "Test");
-    const node = rigRepo.addNode(rig.id, "test.c", { runtime: "claude-code", podId: "restore-pod" });
+    const node = rigRepo.addNode(rig.id, "test.c", { runtime: "claude-code", podId: "restore-pod", env: { [PLUGIN_ENV]: OWN_LIST } });
     const name = "test-c@restore-test";
     const token = "00000000-0000-4000-8000-000000000006";
     const old = sessionRegistry.registerSession(node.id, name);
@@ -164,7 +213,8 @@ describe("a Claude seat's launch env carries the plugin on every path", () => {
       codexResume: new CodexResumeAdapter(tmux), listProcesses });
     await restore.restore(down.snapshotId!, { adapters: { "claude-code": adapter } });
     expect(created).toHaveLength(1);
-    expect(created[0]).toMatchObject({ [PLUGIN_ENV]: "/state/plugins/openrig-core", [SETTINGS_OWN_RELAY]: "1" });
+    // The seat declared its own list; restore keeps it and adds the vendored plugin, through the same launch env.
+    expect(created[0]).toMatchObject({ [PLUGIN_ENV]: `${OWN_LIST}:${VENDORED}` });
   });
 });
 
@@ -173,9 +223,12 @@ describe("the plugin's activity relay", () => {
   let server: Server;
   let posts: Array<{ url: string; body: string }>;
   let port: number;
+  let project: string;
 
   beforeEach(async () => {
     posts = [];
+    project = mkdtempSync(join(tmpdir(), "claude-core-relay-"));
+    mkdirSync(join(project, ".claude"), { recursive: true });
     server = createServer((req, res) => {
       let body = "";
       req.on("data", (c) => { body += c; });
@@ -184,13 +237,17 @@ describe("the plugin's activity relay", () => {
     await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
     port = (server.address() as { port: number }).port;
   });
-  afterEach(async () => { await new Promise<void>((ok) => server.close(() => ok())); });
+  afterEach(async () => { await new Promise<void>((ok) => server.close(() => ok())); rmSync(project, { recursive: true, force: true }); });
 
-  function run(extraEnv: Record<string, string>, payload: Record<string, unknown>, args: string[] = []): Promise<void> {
+  const settingsWithRelay = (events: string[]) => JSON.stringify({
+    hooks: Object.fromEntries(events.map((e) => [e, [{ hooks: [{ type: "command", command: `node '${SETTINGS_RELAY}'` }] }]])),
+  });
+
+  function run(payload: Record<string, unknown>, args: string[] = []): Promise<void> {
     return new Promise((done, fail) => {
       const child = spawn(process.execPath, [relayPath, ...args], {
         env: { PATH: process.env.PATH ?? "", OPENRIG_SESSION_NAME: "dev-claude@rig", OPENRIG_NODE_ID: "node-1", OPENRIG_RUNTIME: "claude-code",
-          OPENRIG_URL: `http://127.0.0.1:${port}`, OPENRIG_ACTIVITY_HOOK_TOKEN: "tok", ...extraEnv },
+          OPENRIG_URL: `http://127.0.0.1:${port}`, OPENRIG_ACTIVITY_HOOK_TOKEN: "tok", CLAUDE_PROJECT_DIR: project },
         stdio: ["pipe", "ignore", "ignore"],
       });
       child.on("error", fail);
@@ -199,19 +256,37 @@ describe("the plugin's activity relay", () => {
     });
   }
 
-  it("posts a hook event and a session start when nothing says the settings relay has it", async () => {
-    await run({}, { hook_event_name: "SessionStart", session_id: "s-1", source: "startup" }, ["--from-plugin"]);
+  it("reports as the plugin's copy when the seat has no settings relay (the resource is optional)", async () => {
+    await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
+    expect(posts.map((p) => p.url)).toEqual(["/api/activity/hooks"]);
+    writeFileSync(join(project, ".claude", "settings.local.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo mine" }] }] } }));
+    await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
+    expect(posts).toHaveLength(2);
+  });
+
+  it("reports a session start and its identity as the plugin's copy when nothing registers the settings relay", async () => {
+    await run({ hook_event_name: "SessionStart", session_id: "s-1", source: "startup" }, ["--from-plugin"]);
     expect(posts.map((p) => p.url)).toEqual(["/api/activity/hooks", "/api/activity/hooks"]);
   });
 
-  it("posts nothing, as the plugin's copy, when the daemon says the settings relay reports activity", async () => {
-    await run({ [SETTINGS_OWN_RELAY]: "1" }, { hook_event_name: "SessionStart", session_id: "s-1", source: "startup" }, ["--from-plugin"]);
-    await run({ [SETTINGS_OWN_RELAY]: "1" }, { hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
+  it("stays quiet as the plugin's copy for exactly the events the settings relay is registered for", async () => {
+    writeFileSync(join(project, ".claude", "settings.local.json"), settingsWithRelay(["SessionStart", "UserPromptSubmit"]));
+    await run({ hook_event_name: "SessionStart", session_id: "s-1", source: "startup" }, ["--from-plugin"]);
+    await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
     expect(posts).toEqual([]);
+    await run({ hook_event_name: "Stop", session_id: "s-1" }, ["--from-plugin"]);
+    expect(posts.map((p) => p.url)).toEqual(["/api/activity/hooks"]);
   });
 
-  it("still reports as the settings copy, which is the same script started without --from-plugin", async () => {
-    await run({ [SETTINGS_OWN_RELAY]: "1" }, { hook_event_name: "UserPromptSubmit", session_id: "s-1" });
+  it("reports when the settings file can't be read, so an unreadable file never leaves a seat silent", async () => {
+    writeFileSync(join(project, ".claude", "settings.local.json"), "{ not json");
+    await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
+    expect(posts).toHaveLength(1);
+  });
+
+  it("always reports as the settings copy, the same script started without --from-plugin", async () => {
+    writeFileSync(join(project, ".claude", "settings.local.json"), settingsWithRelay(["UserPromptSubmit"]));
+    await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" });
     expect(posts.map((p) => p.url)).toEqual(["/api/activity/hooks"]);
   });
 
