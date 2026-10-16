@@ -220,7 +220,10 @@ function settingsRelayReports(hookEvent, providerPayload, env = process.env) {
   try {
     const settings = JSON.parse(fs.readFileSync(path.join(projectDir, ".claude", "settings.local.json"), "utf8"));
     const groups = settings && settings.hooks && settings.hooks[hookEvent];
-    return Array.isArray(groups) && groups.some((group) => group && Array.isArray(group.hooks)
+    // A group with a matcher may not run for this event, so only an unrestricted group (no matcher, "" or "*") counts;
+    // OpenRig writes its group without one. Anything else reports, at worst twice, never not at all.
+    const unrestricted = (group) => group.matcher === undefined || group.matcher === "" || group.matcher === "*";
+    return Array.isArray(groups) && groups.some((group) => group && unrestricted(group) && Array.isArray(group.hooks)
       && group.hooks.some((hook) => hook && typeof hook.command === "string" && hook.command.includes(SETTINGS_RELAY_TAIL)));
   } catch {
     return false;

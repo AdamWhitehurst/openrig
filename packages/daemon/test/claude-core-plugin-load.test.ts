@@ -347,6 +347,19 @@ describe("the plugin's activity relay", () => {
     expect(posts.map((p) => p.url)).toEqual(["/api/activity/hooks"]);
   });
 
+  it("reports when the settings relay's group has a matcher, since that group may not run for this event", async () => {
+    const withMatcher = (matcher: string) => JSON.stringify({ hooks: { SessionStart: [{ matcher, hooks: [{ type: "command", command: `node '${SETTINGS_RELAY}'` }] }] } });
+    writeFileSync(join(project, ".claude", "settings.local.json"), withMatcher("resume"));
+    await run({ hook_event_name: "SessionStart", session_id: "s-1", source: "startup" }, ["--from-plugin"]);
+    expect(posts.length).toBeGreaterThan(0);
+    posts = [];
+    for (const unrestricted of ["", "*"]) {
+      writeFileSync(join(project, ".claude", "settings.local.json"), withMatcher(unrestricted));
+      await run({ hook_event_name: "SessionStart", session_id: "s-1", source: "startup" }, ["--from-plugin"]);
+    }
+    expect(posts).toEqual([]);
+  });
+
   it("reports when the settings file can't be read, so an unreadable file never leaves a seat silent", async () => {
     writeFileSync(join(project, ".claude", "settings.local.json"), "{ not json");
     await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
