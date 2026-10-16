@@ -464,7 +464,8 @@ codex_config_profile: seat-compaction
 
 OpenRig passes `-p seat-compaction` on that seat's fresh, fork and resume launches. Codex layers the profile file on
 top of the base user config, so only seats that name the profile see the lower limit. A Codex session started without
-that profile keeps the base `~/.codex/config.toml`. The `150000` is an example, not a recommendation.
+that profile keeps the base `config.toml` in the same Codex home (`$CODEX_HOME/config.toml`, or `~/.codex/config.toml`
+when `CODEX_HOME` is unset). The `150000` is an example, not a recommendation.
 
 With the normal launch mode, `codex_config_profile` replaces OpenRig's explicit workspace-write sandbox flag, so the
 profile must set the sandbox and approvals you want. See
