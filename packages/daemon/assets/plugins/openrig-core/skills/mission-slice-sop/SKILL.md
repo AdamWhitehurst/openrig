@@ -66,7 +66,7 @@ These three are a division of labour, not a chain of gates. One agent may hold a
 ### PROGRESS.md
 - **WHO:** the orchestrator owns the current state; every agent logs its own outcomes.
 - **WHEN:** on material delivery-state changes and at acceptance.
-- **HOW:** keep current delivery state in `## Current state`; append material outcomes with links to proof under `## Outcomes`. Retain historical entries and existing checkboxes without treating them as current acceptance authority. For a selected proof policy, use `rig proof show <slice>` for current readiness; keep frontmatter `stage`/`verified` honest.
+- **HOW:** keep current delivery state in `## Current state`, naming who the next move waits on, and check that against the source (the PR on GitHub, the queue) before you rely on it; append material outcomes with links to proof under `## Outcomes`. Retain historical entries and existing checkboxes without treating them as current acceptance authority. For a selected proof policy, use `rig proof show <slice>` for current readiness; keep frontmatter `stage`/`verified` honest.
 
 ### PROOF.md + proof/
 - **WHO:** the impl/QA pair that worked the slice.
@@ -92,9 +92,14 @@ Never go idle holding a baton.
 
 ## Records
 
-- **`rig proof add <slice> --artifact-type … --verdict … --candidate-sha <sha> --money-evidence "…" --file <artifact>`** writes the proof artifact into the slice's `proof/` with its header. `rig proof show <slice>` reads it against the selected proof policy.
+- **Lifecycle stamps:** plan-lock with `rig scope slice approve <slice> --scope spec` before the build; `rig proof judge` per contract item when the scope's proof policy selects judges; `--scope delivery` (the default) as the terminal sign-off once the proof is in. `stage:` moves wip → provisional → established by hand, and `established` without a current `verified:` reads as provisional.
+- **`rig proof add <slice> --artifact-type … --verdict … --candidate-sha <sha> --money-evidence "…" --file <artifact>`** writes the proof artifact into the slice's `proof/` with its header. `--candidate-sha` is the commit you checked (the slice's built candidate), never an installed build or a local integration commit: a review counts only when it resolves to the built commit. `rig proof show <slice>` reads it against the selected proof policy.
+- **Editing judged evidence resets the judgment.** An accepted `rig proof judge` records the sha256 of the evidence it cites; edit that artifact, or the contract item's text, and the item reads `unknown` until you judge it again.
 - **`candidate:<sha>` tag** on the handoff row that delivers a build, with a `slice:` tag on the same row. `rig view show execution` reads the newest one as the slice's built commit, and joins reviews and tests to that commit.
 - **`merged:<pr-number>` tag** on a row bound to the slice when its PR merges. It is a recorded report, not a verified merge: the execution view shows it on the merged rung, and it turns the answer only when the same row's `candidate:<sha>` resolves to the built commit and ancestry says not merged (a squash or rebase merge).
+
+- **`arrangement.source.integration_ref`** in `mission.yaml` is the ref the execution view tests a candidate's ancestry against (`main` when unset), so a mission that integrates somewhere else reads as not merged until you set it.
+- **`worktree_path=<absolute path>`** alone on a line in the body of the rows you dispatch, review, verify and build on: the execution view reads the lane's branch and head from it, and runs the merge test in the first reachable one on the mission's rows. With none, merged reads indeterminate.
 
 ## Verify (deterministic backstop)
 
