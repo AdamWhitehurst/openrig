@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { createServer, type Server } from "node:http";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import Database from "better-sqlite3";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFullTestDb } from "./helpers/test-app.js";
@@ -20,6 +23,7 @@ import { SuccessorSessionLauncher } from "../src/domain/successor-session-launch
 import { ClaudeCodeAdapter } from "../src/adapters/claude-code-adapter.js";
 import { ClaudeResumeAdapter } from "../src/adapters/claude-resume.js";
 import { CodexResumeAdapter } from "../src/adapters/codex-resume.js";
+import { ClaudeManagedLaunch as RealManagedLaunch } from "../src/domain/claude-managed-launch.js";
 import type { ClaudeManagedLaunch } from "../src/domain/claude-managed-launch.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
@@ -215,6 +219,71 @@ describe("a Claude seat's launch env carries the plugin on every path", () => {
     expect(created).toHaveLength(1);
     // The seat declared its own list; restore keeps it and adds the vendored plugin, through the same launch env.
     expect(created[0]).toMatchObject({ [PLUGIN_ENV]: `${OWN_LIST}:${VENDORED}` });
+  });
+});
+
+// A Claude seat with a permission mode starts through ClaudeManagedLaunch, whose command is `/usr/bin/env -i`: it keeps only
+// the keys it lists, so the variable the session env holds never reached such a seat. These run the command it builds in a
+// real shell and read back what a fake claude process was left with.
+describe.skipIf(process.platform === "win32")("the managed (env -i) Claude launch carries the plugin list", () => {
+  const exec = promisify(execFile);
+  const cleanup: Array<() => void> = [];
+  afterEach(() => { for (const f of cleanup.splice(0)) f(); });
+
+  function fixture(opts: { memberEnv?: object; runtimeEnv?: Record<string, Record<string, string>> }) {
+    const root = mkdtempSync(join(tmpdir(), "managed-plugin-dirs-"));
+    cleanup.push(() => rmSync(root, { recursive: true, force: true }));
+    const bin = join(root, "bin"), home = join(root, "home"), cwd = join(root, "work");
+    for (const dir of [bin, home, cwd]) mkdirSync(dir);
+    writeFileSync(join(bin, "claude"), `#!/bin/sh
+if [ "$1" = --help ]; then printf '%s\\n' '--permission-mode <mode> (choices: "auto", "default")'; exit 0; fi
+printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s"}' "\${CLAUDE_CODE_PLUGIN_DIRS-absent}" "\${LEAKED-absent}"
+`);
+    chmodSync(join(bin, "claude"), 0o700);
+    const db = new Database(":memory:"); cleanup.push(() => { db.close(); });
+    db.exec(`CREATE TABLE rigs(id TEXT, env_json TEXT);
+      CREATE TABLE nodes(id TEXT, rig_id TEXT, runtime TEXT, cwd TEXT, env_json TEXT);
+      CREATE TABLE bindings(id TEXT, node_id TEXT, tmux_session TEXT, tmux_pane TEXT);
+      CREATE TABLE occupant_tenures(node_id TEXT, generation_uuid TEXT, generation_ordinal INTEGER);`);
+    db.prepare("INSERT INTO rigs VALUES ('rig', NULL)").run();
+    db.prepare("INSERT INTO nodes VALUES ('node', 'rig', 'claude-code', ?, ?)").run(cwd, opts.memberEnv ? JSON.stringify(opts.memberEnv) : null);
+    db.exec("INSERT INTO bindings VALUES ('b', 'node', 'seat@rig', '%1'); INSERT INTO occupant_tenures VALUES ('node', 'gen', 1)");
+    const managed = new RealManagedLaunch(db, { PATH: `${bin}:/usr/bin:/bin`, HOME: home }, {}, async () => undefined, opts.runtimeEnv);
+    const run = async (command: string, paneEnv: Record<string, string>) => {
+      const { stdout } = await exec("/bin/sh", ["-c", command], { env: { PATH: "/usr/bin:/bin", ...paneEnv }, timeout: 5000 });
+      return JSON.parse(stdout) as Record<string, string>;
+    };
+    return { managed, run };
+  }
+  const target = { nodeId: "node", session: "seat@rig", pane: "%1" };
+  const runtimeEnv = { "claude-code": { [PLUGIN_ENV]: VENDORED } };
+  const launch = async (f: ReturnType<typeof fixture>) => (await f.managed.prepare(target, "auto")).command(["--permission-mode", "auto"]);
+
+  it("gives a plain managed seat the vendored plugin, and still nothing else from the pane", async () => {
+    const f = fixture({ runtimeEnv });
+    const seen = await f.run(await launch(f), { LEAKED: "should-not-pass" });
+    expect(seen).toEqual({ PLUGIN_DIRS: VENDORED, LEAKED: "absent" });
+  });
+
+  it("gives a seat that declared its own list the composed list from its pane, once", async () => {
+    const f = fixture({ runtimeEnv, memberEnv: { [PLUGIN_ENV]: OWN_LIST } });
+    const seen = await f.run(await launch(f), { [PLUGIN_ENV]: `${OWN_LIST}:${VENDORED}` });
+    expect(seen.PLUGIN_DIRS).toBe(`${OWN_LIST}:${VENDORED}`);
+  });
+
+  it("is read at each launch, so a plugin vendored after the launcher was built still reaches the seat", async () => {
+    const late: Record<string, Record<string, string>> = {};
+    const f = fixture({ runtimeEnv: late });
+    expect((await f.run(await launch(f), {})).PLUGIN_DIRS).toBe("absent");
+    late["claude-code"] = { [PLUGIN_ENV]: VENDORED };
+    expect((await f.run(await launch(f), {})).PLUGIN_DIRS).toBe(VENDORED);
+  });
+
+  it("changes nothing for a seat when no plugin is vendored", async () => {
+    const f = fixture({});
+    const command = await launch(f);
+    expect(command).not.toContain(PLUGIN_ENV);
+    expect((await f.run(command, {})).PLUGIN_DIRS).toBe("absent");
   });
 });
 

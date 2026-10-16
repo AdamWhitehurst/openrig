@@ -3,6 +3,7 @@ import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import { publicSeatEnvironment } from "./seat-launch-environment.js";
+import { CLAUDE_PLUGIN_DIRS_ENV } from "./claude-core-plugin-env.js";
 import { SEAT_ENV_KEYS_VAR, parseStoredSeatEnv, validateSeatEnvName } from "./seat-env.js";
 import { shellQuote } from "../adapters/shell-quote.js";
 import { claudeClassicRendererEnvPrefix } from "../adapters/yolo-mode.js";
@@ -35,7 +36,11 @@ export class ClaudeManagedLaunch {
     private readonly sessionEnv: Readonly<Record<string, string | undefined>>,
     private readonly rendererEnv: Readonly<NodeJS.ProcessEnv>,
     /** Reads one variable from a seat's tmux session environment (the daemon's tmux adapter). */
-    private readonly readSessionEnv?: (session: string, key: string) => Promise<string | undefined>) {}
+    private readonly readSessionEnv?: (session: string, key: string) => Promise<string | undefined>,
+    /** The daemon's per-runtime session env, read at each launch (it is filled in once startup has vendored the
+     *  openrig-core plugin). `env -i` drops everything the pane shell has, so the plugin list a Claude seat
+     *  needs is written into the command: it is a directory path, not a secret. */
+    private readonly runtimeSessionEnv?: Readonly<Record<string, Readonly<Record<string, string | undefined>> | undefined>>) {}
 
   /** Names the seat's rig and member declare in `env:`, plus any one-off `rig up --env` names the
    *  launch recorded on the tmux session. Their values are already in the pane shell, which is
@@ -162,6 +167,10 @@ export class ClaudeManagedLaunch {
     const seatKeys = await this.seatEnvKeys(target.nodeId, before.session ?? undefined);
     const publicEnv = publicSeatEnvironment(this.sessionEnv);
     const assignments = Object.entries({ ...context.env, ...publicEnv, ...identity }).map(([key, value]) => shellQuote(`${key}=${value}`));
+    // The vendored plugin the daemon loads into every Claude seat. A seat that declares its own list gets the
+    // composed one from its pane below (a later assignment wins), so this is only the plain-seat value.
+    const pluginDirs = this.runtimeSessionEnv?.["claude-code"]?.[CLAUDE_PLUGIN_DIRS_ENV];
+    const pluginAssignments = pluginDirs ? [shellQuote(`${CLAUDE_PLUGIN_DIRS_ENV}=${pluginDirs}`)] : [];
     const forwarded = inherited.filter(key => !(key in identity) && !(key in publicEnv)).map(key => `"${key}=\${${key}-}"`);
     // A declared name is forwarded only when the pane shell has it set, so a one-off name recorded on
     // the session never reaches a successor pane that was not given it. Set-but-empty stays empty.
@@ -175,7 +184,7 @@ export class ClaudeManagedLaunch {
     return Object.freeze({ assertCurrent, configDir: context.configDir, executable: context.executable, command: (args: readonly string[], launchEnv: Readonly<Record<string, string>> = {}) => {
       assertCurrent();
       const launch = Object.entries(launchEnv).map(([key, value]) => shellQuote(`${key}=${value}`));
-      return `cd ${shellQuote(cwd)} && /usr/bin/env -i ${[...assignments, ...forwarded, ...seatForwarded, ...terminal, ...launch, shellQuote(context.executable), ...args.map(shellQuote)].join(" ")}`;
+      return `cd ${shellQuote(cwd)} && /usr/bin/env -i ${[...assignments, ...pluginAssignments, ...forwarded, ...seatForwarded, ...terminal, ...launch, shellQuote(context.executable), ...args.map(shellQuote)].join(" ")}`;
     } });
   }
 }
