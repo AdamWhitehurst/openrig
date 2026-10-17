@@ -231,14 +231,13 @@ same view and plan, or creates one if none matches, preserving its config and ex
 caller's Herdr endpoint must match the daemon's endpoint; a mismatch is reported
 without opening a window or putting the view in another session.
 
-A caller that runs in a tmux pane, such as the shared TUI (`rig tui --shared`), is not itself in
-the person's Herdr: its process lives in the daemon's tmux server, and the Herdr markers are on
-the tmux client attached to it. On Linux the command reads them from the client that was active
-last, normally the one whose keypress started the open, and treats the caller as running in that
-Herdr. With no client attached, or a last client that isn't in Herdr or can't be read, the result is
-what it was before; an older client is never used in its place. If clients active at the same moment are in different Herdr sessions, the result
-says so; press a key in the one you are viewing and open again. Other platforms don't read the
-client and keep the previous result.
+The shared TUI (`rig tui --shared`) runs in the daemon's tmux server, so its own environment never
+carries the Herdr you are looking at; the markers are on the tmux client attached to it. When you
+open a terminal view from it on Linux, the TUI passes the markers of the client that pressed the key
+to the command, which then opens the view in that Herdr. With no client attached, more than one client
+active in the same second, or a client that isn't in Herdr or can't be read, nothing is passed and the
+result is what it was before. Other platforms, and every other way of running `rig terminal open`,
+keep the previous result too.
 
 On Linux, a local graphical display and a supported hosting terminal are required
 (Ghostty, GNOME Terminal, Konsole or xterm). Linux reports a window request; verify
