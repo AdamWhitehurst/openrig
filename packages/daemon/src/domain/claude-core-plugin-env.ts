@@ -1,5 +1,5 @@
 import { existsSync, realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import type Database from "better-sqlite3";
 import { getDefaultOpenRigPath } from "../openrig-compat.js";
 import type { SeatEnv } from "./seat-env.js";
@@ -23,6 +23,8 @@ import type { SeatEnv } from "./seat-env.js";
 // plugin's relay run decides for itself, from that file, whether to stay quiet (see hooks/scripts/activity-relay.cjs).
 
 export const CLAUDE_PLUGIN_DIRS_ENV = "CLAUDE_CODE_PLUGIN_DIRS";
+/** The seat's launch project, set for a seat that loads the plugin, so a Claude started elsewhere inside the seat can be told from the seat. */
+export const SEAT_PROJECT_DIR_ENV = "OPENRIG_SEAT_PROJECT_DIR";
 
 /** The vendored openrig-core plugin directory under `pluginsDir`, or undefined when it is not vendored. */
 export function vendoredCorePluginDir(pluginsDir: string = getDefaultOpenRigPath("plugins")): string | undefined {
@@ -79,7 +81,9 @@ export function withCorePlugin(seatEnv: SeatEnv, dir: string | undefined): SeatE
   if (!dir) return seatEnv;
   const own = seatEnv[CLAUDE_PLUGIN_DIRS_ENV];
   if (!own) return { ...seatEnv, [CLAUDE_PLUGIN_DIRS_ENV]: dir };
+  // Claude skips a relative entry in the list, so only an absolute one can already be the vendored plugin. The seat's
+  // entries stay as written and the vendored plugin's absolute path goes after them.
   const want = canonical(dir);
-  if (own.split(":").some((entry) => entry && canonical(entry) === want)) return seatEnv;
+  if (own.split(":").some((entry) => isAbsolute(entry) && canonical(entry) === want)) return seatEnv;
   return { ...seatEnv, [CLAUDE_PLUGIN_DIRS_ENV]: `${own}:${dir}` };
 }

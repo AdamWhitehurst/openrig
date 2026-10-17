@@ -26,6 +26,16 @@ added after it.
 Claude Code reads this variable from v2.1.280. OpenRig doesn't check the Claude version at launch: an older Claude ignores the
 variable, starts normally, and doesn't load these hooks. The behaviour was checked on Claude Code 2.1.296 and not on
 earlier versions.
+A Claude started from inside a seat (its shell or Bash tool) inherits the seat's environment and so loads the plugin as well.
+A seat that loads the plugin is also given `OPENRIG_SEAT_PROJECT_DIR`, its launch project, and the plugin's seat effects (the
+activity and session-identity posts, the compaction hooks, refocus, and the first-launch marker) run only when that Claude's
+`CLAUDE_PROJECT_DIR` names the same folder (compared by real path, so a trailing slash or symlink doesn't matter). A nested
+Claude in another project, or in a subfolder of the seat's project, therefore changes nothing for the seat, and a `cd` inside
+the seat's own session keeps working because `CLAUDE_PROJECT_DIR` is fixed when Claude starts. A nested Claude in the seat's
+own project folder is the same project and still acts as the seat, as before this change. Without either variable (a seat
+launched before this change, a manual run) the hooks do what they always did. The plugin's activity relay stays quiet next to
+the seat's own `settings.local.json` copy only when that entry is exactly OpenRig's and the script it names is the same
+script; an entry from an older install doesn't match, so both report until the seat's next launch refreshes it.
 Codex has no way to load a plugin from a directory; its hooks come from the daemon's
 managed block in `config.toml`, which today carries the activity relay only, so the Codex column above describes
 `hooks/codex.json`'s registration and not a hook a Codex seat currently runs.

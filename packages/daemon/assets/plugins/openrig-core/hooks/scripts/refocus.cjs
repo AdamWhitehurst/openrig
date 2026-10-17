@@ -268,8 +268,29 @@ function renderTrace() {
   };
 }
 
+// --- seat project boundary: keep this block identical in every script that has it ---
+// A Claude started from inside a seat (its shell, its Bash tool) inherits the seat's environment, so it loads this plugin
+// and its hooks would act as the seat. OpenRig tells the plugin the seat's launch project in OPENRIG_SEAT_PROJECT_DIR;
+// Claude's own CLAUDE_PROJECT_DIR is fixed for the life of a Claude and names the project it was started in (unlike the
+// hook payload's cwd, which follows a `cd`). The seat's effects run only when the two name the same folder. Spellings of
+// one folder (a symlink, a trailing slash) count as the same, and a missing variable (an older or manual launch, a runtime
+// without CLAUDE_PROJECT_DIR) leaves the hook doing what it always did.
+function runsForThisSeatsProject(env = process.env) {
+  const launch = env.OPENRIG_SEAT_PROJECT_DIR;
+  const project = env.CLAUDE_PROJECT_DIR;
+  if (!launch || !project) return true;
+  const canonical = (dir) => {
+    const absolute = path.resolve(dir);
+    try { return fs.realpathSync(absolute); } catch { return absolute; }
+  };
+  return canonical(launch) === canonical(project);
+}
+// --- end seat project boundary ---
+
 (async () => {
   if (!enabled(process.env.OPENRIG_REFOCUS_ENABLED)) process.exit(0);
+  // A Claude started elsewhere inside this seat is not the seat: no state, no refocus.
+  if (!runsForThisSeatsProject()) process.exit(0);
 
   let input = {};
   try { input = JSON.parse((await readStdin()) || "{}") || {}; } catch {}

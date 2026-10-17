@@ -15,7 +15,7 @@ off, and never runs at fresh session start.
 
 This plugin ships dual-manifest packaging — both `.claude-plugin/` and `.codex-plugin/`.
 
-- **Claude Code** — the OpenRig daemon vendors `openrig-core/` to `~/.openrig/plugins/openrig-core/` at startup and starts
+- **Claude Code** — the OpenRig daemon vendors `openrig-core/` to `$OPENRIG_HOME/plugins/openrig-core/` at startup and starts
   each Claude seat whose resolved plugin selection includes it (for example `plugins: [shared:openrig-core]`) with
   `CLAUDE_CODE_PLUGIN_DIRS` pointing at that copy, so the plugin's hooks (refocus, compaction restore) load with no setup
   step. A seat that didn't select the plugin is launched as before. This applies to fresh launches, restores, handover
@@ -25,9 +25,21 @@ This plugin ships dual-manifest packaging — both `.claude-plugin/` and `.codex
   normally, and doesn't load the hooks (OpenRig doesn't check the version or refuse the launch).
   A seat that has OpenRig's activity relay in its own `settings.local.json` (the `claude-activity-hooks` runtime resource)
   already reports activity from there, so the plugin's `activity-relay.cjs` (which the manifest starts with `--from-plugin`)
-  exits for an event the seat's settings register it for. A seat without that resource, and a plugin installed outside
-  OpenRig, report through the plugin's relay, so each event is reported once. The plugin is not a Claude marketplace entry,
-  so `/plugin` has nothing to install.
+  exits for an event the seat's settings register it for. It does so only when the entry is exactly the one OpenRig writes
+  (`node` and one quoted path to `state/claude-activity-hooks/activity-relay.cjs`) and the script at that path is this same
+  script, so a missing script, a different one at that path, or a wrapper around it never silences the plugin. A seat without
+  that resource, and a plugin installed outside OpenRig, report through the plugin's relay, so each event is reported once.
+  A relay entry written by an older install (a different path or quoting) doesn't match, so until the seat is relaunched and
+  its entry refreshed, both relays report and its events come twice. The plugin is not a Claude marketplace entry, so
+  `/plugin` has nothing to install.
+  **A Claude started inside a seat** (from its shell or its Bash tool) inherits the seat's environment, so it loads the
+  plugin too. OpenRig gives such a seat `OPENRIG_SEAT_PROJECT_DIR`, its launch project, and the plugin's seat effects (the
+  activity and session-identity posts, the compaction hooks, refocus, and the first-launch marker) run only when the Claude's
+  own `CLAUDE_PROJECT_DIR` is that folder (compared by real path). So a Claude in another project, or in a subfolder of the
+  seat's project, doesn't act as the seat, and a `cd` inside the seat's own session doesn't switch it off, because
+  `CLAUDE_PROJECT_DIR` doesn't follow a `cd`. A Claude started in the seat's own project folder is the same project and
+  still acts as the seat. A seat launched before this change has no `OPENRIG_SEAT_PROJECT_DIR` until its next launch, restore
+  or handover, and behaves as before until then.
 - **Codex CLI** — Codex has no directory option for plugins, so it does not load this plugin. A Codex seat gets only the hooks
   the daemon writes into Codex's `config.toml` (the activity relay); `hooks/codex.json` is not read.
 
@@ -43,7 +55,7 @@ All other skills are cross-runtime by design.
 The npm package includes an offline baseline under the daemon's
 `assets/plugins/openrig-core/`. The daemon resolves local plugin authority before
 attempting a network fetch, using the configured OpenRig home (normally
-`~/.openrig/plugins/openrig-core/` for the installed copy):
+`$OPENRIG_HOME/plugins/openrig-core/` for the installed copy):
 
 | Installed state | Local vendoring behavior |
 | --- | --- |

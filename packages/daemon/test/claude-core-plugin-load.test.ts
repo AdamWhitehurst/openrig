@@ -1,12 +1,12 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRequire } from "node:module";
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
 import { createServer, type Server } from "node:http";
 import Database from "better-sqlite3";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
 import { PodRepository } from "../src/domain/pod-repository.js";
@@ -30,6 +30,7 @@ import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { ClaudeManagedLaunch as RealManagedLaunch } from "../src/domain/claude-managed-launch.js";
 import type { ClaudeManagedLaunch } from "../src/domain/claude-managed-launch.js";
 import { SEAT_ENV_KEYS_VAR } from "../src/domain/seat-env.js";
+import { SEAT_PROJECT_DIR_ENV } from "../src/domain/claude-core-plugin-env.js";
 import {
   persistedPluginPaths, seatCorePluginDir, vendoredCorePluginDir, withCorePlugin,
 } from "../src/domain/claude-core-plugin-env.js";
@@ -53,7 +54,6 @@ import type { TmuxAdapter as TmuxAdapterType } from "../src/adapters/tmux.js";
 const require = createRequire(import.meta.url);
 const PLUGIN_ENV = "CLAUDE_CODE_PLUGIN_DIRS";
 const OWN_LIST = "/own/plugins:/more/plugins";
-const SETTINGS_RELAY = "/state/state/claude-activity-hooks/activity-relay.cjs";
 
 /** A scratch plugins folder with the openrig-core manifest in it, as the daemon's vendoring leaves it. */
 function vendoredPlugins(root: string): { pluginsDir: string; vendored: string } {
@@ -122,6 +122,15 @@ describe("which Claude seats load the vendored plugin", () => {
     expect(withCorePlugin({ [PLUGIN_ENV]: `/a:${vendored}/` }, vendored)).toEqual({ [PLUGIN_ENV]: `/a:${vendored}/` });
     expect(withCorePlugin({ [PLUGIN_ENV]: `${link}:/a` }, vendored)).toEqual({ [PLUGIN_ENV]: `${link}:/a` });
     expect(withCorePlugin({ [PLUGIN_ENV]: "/a::/b" }, vendored)).toEqual({ [PLUGIN_ENV]: `/a::/b:${vendored}` });
+  });
+
+  it("does not count a relative entry as the plugin, since Claude skips relative entries: it stays as written and the absolute path is added", () => {
+    const { vendored } = vendoredPlugins(root);
+    const rel = relative(process.cwd(), vendored); // resolves to the vendored folder from here, but Claude would skip it
+    expect(isAbsolute(rel)).toBe(false);
+    expect(withCorePlugin({ [PLUGIN_ENV]: rel }, vendored)).toEqual({ [PLUGIN_ENV]: `${rel}:${vendored}` });
+    expect(withCorePlugin({ [PLUGIN_ENV]: `./x:${rel}:/a` }, vendored)).toEqual({ [PLUGIN_ENV]: `./x:${rel}:/a:${vendored}` });
+    expect(withCorePlugin({ [PLUGIN_ENV]: `${rel}:${vendored}` }, vendored)).toEqual({ [PLUGIN_ENV]: `${rel}:${vendored}` });
   });
 
   it("picks the seat's plugin by where its selection resolved, whichever way it was spelled", () => {
@@ -280,6 +289,25 @@ describe("a Claude seat's launch env, on the launch paths that don't re-resolve 
     for (const c of created.slice(1)) expect(c.env).not.toHaveProperty(PLUGIN_ENV);
   });
 
+  it("fresh launch: a seat that loads the plugin is told its launch project, and one that doesn't is not", async () => {
+    const { pluginsDir, vendored } = vendoredPlugins(root);
+    const db = createFullTestDb(); dbs.push(db);
+    const rigRepo = new RigRepository(db);
+    const rig = rigRepo.createRig("plugin-project");
+    rigRepo.addNode(rig.id, "selects", { runtime: "claude-code", cwd: "/work/seat" });
+    rigRepo.addNode(rig.id, "elsewhere", { runtime: "claude-code", cwd: "/work/other" });
+    rigRepo.addNode(rig.id, "nothing", { runtime: "claude-code", cwd: "/work/none" });
+    const created: Array<{ name: string; env: Record<string, string> | undefined }> = [];
+    const launcher = new NodeLauncher({ db, rigRepo, sessionRegistry: new SessionRegistry(db), eventBus: new EventBus(db),
+      tmuxAdapter: fakeTmux(created), pluginsDir });
+    expect((await launcher.launchNode(rig.id, "selects", { pluginPaths: [vendored] })).ok).toBe(true);
+    expect((await launcher.launchNode(rig.id, "elsewhere", { pluginPaths: [vendored], cwd: "/work/moved" })).ok).toBe(true);
+    expect((await launcher.launchNode(rig.id, "nothing", { pluginPaths: [] })).ok).toBe(true);
+    expect(created[0]!.env![SEAT_PROJECT_DIR_ENV]).toBe("/work/seat");
+    expect(created[1]!.env![SEAT_PROJECT_DIR_ENV]).toBe("/work/moved"); // the folder the session actually starts in
+    expect(created[2]!.env).not.toHaveProperty(SEAT_PROJECT_DIR_ENV);
+  });
+
   it("fresh launch: nothing is added when the plugin isn't vendored", async () => {
     const db = createFullTestDb(); dbs.push(db);
     const rigRepo = new RigRepository(db);
@@ -418,6 +446,9 @@ describe("handover successor, on a real tmux server", () => {
   const SOCK = `openrig-coreplug-${process.pid}`;
   const cleanEnv: NodeJS.ProcessEnv = { ...process.env };
   delete cleanEnv.TMUX;
+  // A test run from inside a seat that loads the plugin must not hand its own plugin variables to the tmux server under test.
+  delete cleanEnv.CLAUDE_CODE_PLUGIN_DIRS;
+  delete cleanEnv.OPENRIG_SEAT_PROJECT_DIR;
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
   const exec = async (cmd: string): Promise<string> => {
     const safe = cmd.startsWith("tmux ") ? `tmux -L ${SOCK} ${cmd.slice(5)}` : cmd;
@@ -493,8 +524,10 @@ describe("handover successor, on a real tmux server", () => {
     const { vendored } = vendoredPlugins(scratch);
     const selecting = await successorEnviron("coreplug-yes", ["vendored"]);
     expect(selecting[PLUGIN_ENV]).toBe(vendored);
+    expect(selecting[SEAT_PROJECT_DIR_ENV]).toBe(scratch); // the seat's launch project, for the plugin's hooks
     const other = await successorEnviron("coreplug-no", [{ category: "plugin", absolutePath: "/elsewhere" }]);
     expect(other).not.toHaveProperty(PLUGIN_ENV);
+    expect(other).not.toHaveProperty(SEAT_PROJECT_DIR_ENV);
   }, 90_000);
 });
 
@@ -515,7 +548,7 @@ describe.skipIf(process.platform === "win32")("the managed (env -i) Claude launc
     for (const dir of [bin, home, cwd]) mkdirSync(dir);
     writeFileSync(join(bin, "claude"), `#!/bin/sh
 if [ "$1" = --help ]; then printf '%s\\n' '--permission-mode <mode> (choices: "auto", "default")'; exit 0; fi
-printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s"}' "\${CLAUDE_CODE_PLUGIN_DIRS-absent}" "\${LEAKED-absent}"
+printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s","PROJECT":"%s"}' "\${CLAUDE_CODE_PLUGIN_DIRS-absent}" "\${LEAKED-absent}" "\${OPENRIG_SEAT_PROJECT_DIR-absent}"
 `);
     chmodSync(join(bin, "claude"), 0o700);
     const db = new Database(":memory:"); cleanup.push(() => { db.close(); });
@@ -547,7 +580,7 @@ printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s"}' "\${CLAUDE_CODE_PLUGIN_DIRS-absent}"
     const vars = withCorePlugin({}, vendored);
     const f = fixture({ sessionKeys: PLUGIN_ENV });
     const seen = await f.run(await launch(f), { ...vars, LEAKED: "should-not-pass" });
-    expect(seen).toEqual({ PLUGIN_DIRS: vendored, LEAKED: "absent" });
+    expect(seen).toEqual({ PLUGIN_DIRS: vendored, LEAKED: "absent", PROJECT: "absent" });
   });
 
   it("gives a seat that declared its own list the composed list, once", async () => {
@@ -561,8 +594,8 @@ printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s"}' "\${CLAUDE_CODE_PLUGIN_DIRS-absent}"
     // respawned pane's shell has the variable. The seat's saved plugin selection is what says to forward it.
     for (const sessionKeys of [undefined, "FOO"]) {
       const f = fixture({ sessionKeys, saved: ["vendored"] });
-      const seen = await f.run(await launch(f), { [PLUGIN_ENV]: f.vendored, LEAKED: "should-not-pass" });
-      expect(seen, String(sessionKeys)).toEqual({ PLUGIN_DIRS: f.vendored, LEAKED: "absent" });
+      const seen = await f.run(await launch(f), { [PLUGIN_ENV]: f.vendored, [SEAT_PROJECT_DIR_ENV]: "/seat/project", LEAKED: "should-not-pass" });
+      expect(seen, String(sessionKeys)).toEqual({ PLUGIN_DIRS: f.vendored, LEAKED: "absent", PROJECT: "/seat/project" });
     }
   });
 
@@ -575,7 +608,9 @@ printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s"}' "\${CLAUDE_CODE_PLUGIN_DIRS-absent}"
     const f = fixture({});
     const command = await launch(f);
     expect(command).not.toContain(PLUGIN_ENV);
-    expect((await f.run(command, { [PLUGIN_ENV]: "/from/the/shell" })).PLUGIN_DIRS).toBe("absent");
+    const seen = await f.run(command, { [PLUGIN_ENV]: "/from/the/shell", [SEAT_PROJECT_DIR_ENV]: "/from/the/shell" });
+    expect(seen.PLUGIN_DIRS).toBe("absent");
+    expect(seen.PROJECT).toBe("absent");
   });
 });
 
@@ -585,11 +620,15 @@ describe("the plugin's activity relay", () => {
   let posts: Array<{ url: string; body: string }>;
   let port: number;
   let project: string;
+  let settingsRelay: string; // the copy of the relay OpenRig puts in a seat's state, as settings.local.json names it
 
   beforeEach(async () => {
     posts = [];
     project = mkdtempSync(join(tmpdir(), "claude-core-relay-"));
     mkdirSync(join(project, ".claude"), { recursive: true });
+    settingsRelay = join(project, "state", "claude-activity-hooks", "activity-relay.cjs");
+    mkdirSync(join(settingsRelay, ".."), { recursive: true });
+    copyFileSync(relayPath, settingsRelay);
     server = createServer((req, res) => {
       let body = "";
       req.on("data", (c) => { body += c; });
@@ -601,14 +640,14 @@ describe("the plugin's activity relay", () => {
   afterEach(async () => { await new Promise<void>((ok) => server.close(() => ok())); rmSync(project, { recursive: true, force: true }); });
 
   const settingsWithRelay = (events: string[]) => JSON.stringify({
-    hooks: Object.fromEntries(events.map((e) => [e, [{ hooks: [{ type: "command", command: `node '${SETTINGS_RELAY}'` }] }]])),
+    hooks: Object.fromEntries(events.map((e) => [e, [{ hooks: [{ type: "command", command: `node '${settingsRelay}'` }] }]])),
   });
 
-  function run(payload: Record<string, unknown>, args: string[] = []): Promise<void> {
+  function run(payload: Record<string, unknown>, args: string[] = [], extraEnv: Record<string, string> = {}): Promise<void> {
     return new Promise((done, fail) => {
       const child = spawn(process.execPath, [relayPath, ...args], {
         env: { PATH: process.env.PATH ?? "", OPENRIG_SESSION_NAME: "dev-claude@rig", OPENRIG_NODE_ID: "node-1", OPENRIG_RUNTIME: "claude-code",
-          OPENRIG_URL: `http://127.0.0.1:${port}`, OPENRIG_ACTIVITY_HOOK_TOKEN: "tok", CLAUDE_PROJECT_DIR: project },
+          OPENRIG_URL: `http://127.0.0.1:${port}`, OPENRIG_ACTIVITY_HOOK_TOKEN: "tok", CLAUDE_PROJECT_DIR: project, ...extraEnv },
         stdio: ["pipe", "ignore", "ignore"],
       });
       child.on("error", fail);
@@ -640,7 +679,7 @@ describe("the plugin's activity relay", () => {
   });
 
   it("reports when the settings relay's group has a matcher, since that group may not run for this event", async () => {
-    const withMatcher = (matcher: string) => JSON.stringify({ hooks: { SessionStart: [{ matcher, hooks: [{ type: "command", command: `node '${SETTINGS_RELAY}'` }] }] } });
+    const withMatcher = (matcher: string) => JSON.stringify({ hooks: { SessionStart: [{ matcher, hooks: [{ type: "command", command: `node '${settingsRelay}'` }] }] } });
     writeFileSync(join(project, ".claude", "settings.local.json"), withMatcher("resume"));
     await run({ hook_event_name: "SessionStart", session_id: "s-1", source: "startup" }, ["--from-plugin"]);
     expect(posts.length).toBeGreaterThan(0);
@@ -653,9 +692,26 @@ describe("the plugin's activity relay", () => {
   });
 
   it("reports when a settings command only mentions the relay path, since it may not be OpenRig's relay", async () => {
-    for (const command of [`node wrapper.cjs '${SETTINGS_RELAY}'`, `node 'x' '${SETTINGS_RELAY}'`, `bash -c 'node ${SETTINGS_RELAY}'`]) {
+    for (const command of [`node wrapper.cjs '${settingsRelay}'`, `node 'x' '${settingsRelay}'`, `bash -c 'node ${settingsRelay}'`]) {
       writeFileSync(join(project, ".claude", "settings.local.json"),
         JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command }] }] } }));
+      await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
+    }
+    expect(posts).toHaveLength(3);
+  });
+
+  it("reports when the settings entry names a relay script that isn't there or isn't the relay", async () => {
+    writeFileSync(join(project, ".claude", "settings.local.json"), settingsWithRelay(["UserPromptSubmit"]));
+    // As OpenRig wrote it, the entry silences the plugin's run.
+    await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
+    expect(posts).toEqual([]);
+    // The script is gone: that entry reports nothing, so the plugin must.
+    rmSync(settingsRelay);
+    await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
+    expect(posts).toHaveLength(1);
+    // A no-op at the path, and an older copy of the relay, are not this script either.
+    for (const content of ["// does nothing\n", readFileSync(relayPath, "utf8") + "\n// an older copy\n"]) {
+      writeFileSync(settingsRelay, content);
       await run({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }, ["--from-plugin"]);
     }
     expect(posts).toHaveLength(3);
@@ -682,5 +738,126 @@ describe("the plugin's activity relay", () => {
     expect(commands("claude.json").length).toBeGreaterThan(0);
     expect(commands("claude.json").every((c) => c.endsWith(" --from-plugin"))).toBe(true);
     expect(commands("codex.json").some((c) => c.includes("--from-plugin"))).toBe(false);
+  });
+});
+
+// A Claude started from inside a seat (its shell, its Bash tool) inherits the seat's environment and so loads the plugin.
+// The plugin's seat effects act only when Claude's fixed CLAUDE_PROJECT_DIR is the seat's launch project
+// (OPENRIG_SEAT_PROJECT_DIR); the hook's moving cwd is never compared. These run each hook script as Claude would.
+describe("the plugin's seat effects stay inside the seat's project", () => {
+  const scripts = join(import.meta.dirname, "../assets/plugins/openrig-core");
+  const roots: string[] = [];
+  afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
+
+  function world() {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "seat-boundary-")));
+    roots.push(root);
+    const seat = join(root, "seat"), nested = join(root, "nested"), sub = join(seat, "sub");
+    for (const d of [seat, nested, sub]) mkdirSync(d, { recursive: true });
+    symlinkSync(seat, join(root, "seat-link"));
+    // The CLAUDE_PROJECT_DIR / OPENRIG_SEAT_PROJECT_DIR pairs, and whether the seat's effects should run.
+    const cases: Array<{ label: string; claude: string | undefined; launch: string | undefined; acts: boolean }> = [
+      { label: "the same folder", claude: seat, launch: seat, acts: true },
+      { label: "a trailing slash", claude: `${seat}/`, launch: seat, acts: true },
+      { label: "a symlink to the folder", claude: join(root, "seat-link"), launch: seat, acts: true },
+      { label: "a path with a dot segment", claude: `${seat}/./`, launch: seat, acts: true },
+      { label: "a nested Claude in another project", claude: nested, launch: seat, acts: false },
+      { label: "a nested Claude in a folder under the seat's", claude: sub, launch: seat, acts: false },
+      { label: "no launch project (an older or manual launch)", claude: nested, launch: undefined, acts: true },
+      { label: "no CLAUDE_PROJECT_DIR", claude: undefined, launch: seat, acts: true },
+    ];
+    return { root, seat, nested, sub, cases };
+  }
+  const envFor = (c: { claude?: string; launch?: string }, base: Record<string, string>) => {
+    const env: Record<string, string> = { PATH: process.env.PATH ?? "", ...base };
+    if (c.claude !== undefined) env.CLAUDE_PROJECT_DIR = c.claude;
+    if (c.launch !== undefined) env.OPENRIG_SEAT_PROJECT_DIR = c.launch;
+    return env;
+  };
+
+  it("the activity relay posts and records the first-launch marker only inside the seat's project, whatever the hook's cwd", async () => {
+    const w = world();
+    const posts: string[] = [];
+    const server = createServer((req, res) => { req.on("data", () => {}); req.on("end", () => { posts.push(req.url ?? ""); res.end("{}"); }); });
+    await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
+    const port = (server.address() as { port: number }).port;
+    try {
+      for (const c of w.cases) {
+        posts.length = 0;
+        const tmp = join(w.root, `tmp-${c.label.replace(/\W+/g, "-")}`);
+        mkdirSync(tmp);
+        const out = await new Promise<void>((done, fail) => {
+          const child = spawn(process.execPath, [join(scripts, "hooks/scripts/activity-relay.cjs")], {
+            env: envFor(c, { TMPDIR: tmp, OPENRIG_SESSION_NAME: "dev-claude@rig", OPENRIG_NODE_ID: "n1", OPENRIG_RUNTIME: "claude-code",
+              OPENRIG_OCCUPANT_GENERATION: "gen-1", OPENRIG_RESUME_LAUNCH: "resume-1",
+              OPENRIG_URL: `http://127.0.0.1:${port}`, OPENRIG_ACTIVITY_HOOK_TOKEN: "tok" }),
+            stdio: ["pipe", "ignore", "ignore"],
+          });
+          child.on("error", fail); child.on("close", () => done());
+          // The hook's cwd has moved into a subfolder; that must not matter either way.
+          child.stdin.end(JSON.stringify({ hook_event_name: "SessionStart", session_id: "s-1", source: "startup", cwd: w.sub }));
+        });
+        void out;
+        const markers = readdirSync(tmp).filter((n) => n.startsWith("openrig-resume-launch-"));
+        expect(posts.length > 0, c.label).toBe(c.acts);
+        expect(markers.length > 0, `${c.label}: marker`).toBe(c.acts);
+      }
+    } finally {
+      await new Promise<void>((ok) => server.close(() => ok()));
+    }
+  });
+
+  it("the compaction hooks (PreCompact, the restore bridge) and refocus write nothing outside the seat's project", () => {
+    const w = world();
+    for (const c of w.cases) {
+      const home = join(w.root, `home-${c.label.replace(/\W+/g, "-")}`);
+      const out = join(home, "out");
+      mkdirSync(out, { recursive: true });
+      const transcript = join(home, "transcript.jsonl");
+      writeFileSync(transcript, `${JSON.stringify({ sessionId: "s-1", cwd: w.seat, message: { role: "user", content: "x" } })}\n`);
+      const base = { OPENRIG_HOME: home, HOME: home, OPENRIG_SESSION_NAME: "seat@rig", OPENRIG_COMPACTION_OUT_ROOT: out, OPENRIG_REFOCUS_ENABLED: "1" };
+      const markers = join(home, "compaction", "restore-pending");
+
+      // PreCompact writes the restore-pending marker.
+      spawnSync(process.execPath, [join(scripts, "skills/claude-compaction-restore/scripts/precompact-hook.mjs")], {
+        input: JSON.stringify({ hook_event_name: "PreCompact", session_id: "s-1", cwd: w.sub, transcript_path: transcript }),
+        encoding: "utf8", env: envFor(c, base), timeout: 20_000,
+      });
+      expect(existsSync(join(markers, "seat@rig.json")), `${c.label}: PreCompact marker`).toBe(c.acts);
+
+      // The bridge delivers a marker once. Give it one to deliver.
+      mkdirSync(markers, { recursive: true });
+      const markerFile = join(markers, "seat@rig.json");
+      const planted = { sessionName: "seat@rig", outputDir: "/packet" };
+      writeFileSync(markerFile, JSON.stringify(planted));
+      const bridge = spawnSync(process.execPath, [join(scripts, "hooks/scripts/compaction-restore-bridge.cjs")], {
+        input: JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "s-1", cwd: w.sub }),
+        encoding: "utf8", env: envFor(c, base), timeout: 10_000,
+      });
+      expect(bridge.stdout.includes("/packet"), `${c.label}: bridge delivery`).toBe(c.acts);
+      expect(JSON.parse(readFileSync(markerFile, "utf8")).deliveryCount !== undefined, `${c.label}: bridge marker`).toBe(c.acts);
+
+      // Refocus keeps due-state per seat and session.
+      spawnSync(process.execPath, [join(scripts, "hooks/scripts/refocus.cjs"), "--runtime", "claude"], {
+        input: JSON.stringify({ hook_event_name: "PostCompact", session_id: "s-1", cwd: w.sub, transcript_path: transcript }),
+        encoding: "utf8", env: envFor(c, base), timeout: 10_000,
+      });
+      expect(existsSync(join(home, "refocus")), `${c.label}: refocus state`).toBe(c.acts);
+    }
+  });
+
+  it("keeps one copy of the boundary check in the four scripts that have it", () => {
+    const files = ["hooks/scripts/activity-relay.cjs", "hooks/scripts/compaction-restore-bridge.cjs", "hooks/scripts/refocus.cjs",
+      "skills/claude-compaction-restore/scripts/precompact-hook.mjs"];
+    const block = (file: string) => {
+      const text = readFileSync(join(scripts, file), "utf8");
+      const start = text.indexOf("// --- seat project boundary");
+      const end = text.indexOf("// --- end seat project boundary ---");
+      expect(start, file).toBeGreaterThanOrEqual(0);
+      expect(end, file).toBeGreaterThan(start);
+      return text.slice(start, end);
+    };
+    const first = block(files[0]!);
+    for (const file of files.slice(1)) expect(block(file), file).toBe(first);
   });
 });

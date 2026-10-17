@@ -4,7 +4,7 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import { publicSeatEnvironment } from "./seat-launch-environment.js";
 import { SEAT_ENV_KEYS_VAR, parseStoredSeatEnv, validateSeatEnvName } from "./seat-env.js";
-import { CLAUDE_PLUGIN_DIRS_ENV, seatCorePluginDir } from "./claude-core-plugin-env.js";
+import { CLAUDE_PLUGIN_DIRS_ENV, SEAT_PROJECT_DIR_ENV, seatCorePluginDir } from "./claude-core-plugin-env.js";
 import { shellQuote } from "../adapters/shell-quote.js";
 import { claudeClassicRendererEnvPrefix } from "../adapters/yolo-mode.js";
 import { parseClaudePermissionModes } from "./permission-drift.js";
@@ -173,6 +173,10 @@ export class ClaudeManagedLaunch {
     // the session never reaches a successor pane that was not given it. Set-but-empty stays empty.
     const seatForwarded = seatKeys.filter(key => !inherited.includes(key) && !(key in identity) && !(key in publicEnv))
       .map(key => `\${${key}+"${key}=$${key}"}`);
+    // A seat that loads the openrig-core plugin has its launch project in its pane (OPENRIG_SEAT_PROJECT_DIR): the plugin's
+    // hooks use it to tell the seat from a Claude started elsewhere inside it. Forwarded by name; the pane supplies the value.
+    const loadsCorePlugin = seatCorePluginDir({ id: target.nodeId, runtime: "claude-code" }, this.db, undefined, this.pluginsDir) !== undefined;
+    const projectForwarded = loadsCorePlugin ? [`\${${SEAT_PROJECT_DIR_ENV}+"${SEAT_PROJECT_DIR_ENV}=$${SEAT_PROJECT_DIR_ENV}"}`] : [];
     // Expand in the target pane shell, whose terminal can differ from the daemon.
     // Empty and absent values remain absent after env -i.
     const terminal = ["TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
@@ -181,7 +185,7 @@ export class ClaudeManagedLaunch {
     return Object.freeze({ assertCurrent, configDir: context.configDir, executable: context.executable, command: (args: readonly string[], launchEnv: Readonly<Record<string, string>> = {}) => {
       assertCurrent();
       const launch = Object.entries(launchEnv).map(([key, value]) => shellQuote(`${key}=${value}`));
-      return `cd ${shellQuote(cwd)} && /usr/bin/env -i ${[...assignments, ...forwarded, ...seatForwarded, ...terminal, ...launch, shellQuote(context.executable), ...args.map(shellQuote)].join(" ")}`;
+      return `cd ${shellQuote(cwd)} && /usr/bin/env -i ${[...assignments, ...forwarded, ...seatForwarded, ...projectForwarded, ...terminal, ...launch, shellQuote(context.executable), ...args.map(shellQuote)].join(" ")}`;
     } });
   }
 }

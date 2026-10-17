@@ -211,17 +211,24 @@ function uid() {
 // --from-plugin; that run looks at the seat's project settings.local.json and exits only when the OpenRig copy is
 // registered there for this very event. The settings copy is started without that argument and always reports, and so does
 // a seat whose settings have no such entry (the resource is optional) or a plugin installed on its own, so a seat reports
-// each event once either way. Anything unreadable counts as "not registered".
+// each event once either way. Anything unreadable, missing or different counts as "not registered": a seat is never silent.
 const SETTINGS_RELAY_TAIL = "state/claude-activity-hooks/activity-relay.cjs";
 
 // The adapter's own test for the entry it writes (isOwnedRelayCommand): `node` and one single-quoted token, in the form
-// shellQuote produces, naming the relay copy. A wrapper that only mentions the path is not that entry.
-function isSettingsRelayCommand(command) {
+// shellQuote produces, naming the relay copy. A wrapper that only mentions the path is not that entry. Returns the path.
+function settingsRelayPath(command) {
   const m = /^node\s+(.+)$/.exec(command.trim());
   const arg = m && m[1];
-  if (!arg || arg.length < 2 || !arg.startsWith("'") || !arg.endsWith("'")) return false;
+  if (!arg || arg.length < 2 || !arg.startsWith("'") || !arg.endsWith("'")) return null;
   const decoded = arg.slice(1, -1).split(`'"'"'`).join("'");
-  return "'" + decoded.replace(/'/g, `'"'"'`) + "'" === arg && decoded.endsWith(`/${SETTINGS_RELAY_TAIL}`);
+  if ("'" + decoded.replace(/'/g, `'"'"'`) + "'" !== arg) return null;
+  return path.isAbsolute(decoded) && decoded.endsWith(`/${SETTINGS_RELAY_TAIL}`) ? decoded : null;
+}
+
+// A settings entry only silences this run if it would really report: the file it names is there and is this very script.
+// A missing script, or a different one at that path (a no-op, a stale copy from an older install), reports from the plugin.
+function isThisScript(file) {
+  try { return Buffer.compare(fs.readFileSync(file), fs.readFileSync(__filename)) === 0; } catch { return false; }
 }
 
 function settingsRelayReports(hookEvent, providerPayload, env = process.env) {
@@ -234,7 +241,10 @@ function settingsRelayReports(hookEvent, providerPayload, env = process.env) {
     // OpenRig writes its group without one. Anything else reports, at worst twice, never not at all.
     const unrestricted = (group) => group.matcher === undefined || group.matcher === "" || group.matcher === "*";
     return Array.isArray(groups) && groups.some((group) => group && unrestricted(group) && Array.isArray(group.hooks)
-      && group.hooks.some((hook) => hook && typeof hook.command === "string" && isSettingsRelayCommand(hook.command)));
+      && group.hooks.some((hook) => {
+        const relay = hook && typeof hook.command === "string" ? settingsRelayPath(hook.command) : null;
+        return relay !== null && isThisScript(relay);
+      }));
   } catch {
     return false;
   }
@@ -246,7 +256,28 @@ function pluginRunIsRedundant(providerPayload, argv = process.argv, env = proces
   return settingsRelayReports(hookEvent, providerPayload, env);
 }
 
+// --- seat project boundary: keep this block identical in every script that has it ---
+// A Claude started from inside a seat (its shell, its Bash tool) inherits the seat's environment, so it loads this plugin
+// and its hooks would act as the seat. OpenRig tells the plugin the seat's launch project in OPENRIG_SEAT_PROJECT_DIR;
+// Claude's own CLAUDE_PROJECT_DIR is fixed for the life of a Claude and names the project it was started in (unlike the
+// hook payload's cwd, which follows a `cd`). The seat's effects run only when the two name the same folder. Spellings of
+// one folder (a symlink, a trailing slash) count as the same, and a missing variable (an older or manual launch, a runtime
+// without CLAUDE_PROJECT_DIR) leaves the hook doing what it always did.
+function runsForThisSeatsProject(env = process.env) {
+  const launch = env.OPENRIG_SEAT_PROJECT_DIR;
+  const project = env.CLAUDE_PROJECT_DIR;
+  if (!launch || !project) return true;
+  const canonical = (dir) => {
+    const absolute = path.resolve(dir);
+    try { return fs.realpathSync(absolute); } catch { return absolute; }
+  };
+  return canonical(launch) === canonical(project);
+}
+// --- end seat project boundary ---
+
 async function main() {
+  // Before anything is read, posted or recorded: a Claude started elsewhere inside this seat is not the seat.
+  if (!runsForThisSeatsProject()) return;
   const providerPayload = parseJson(await readStdin());
   if (pluginRunIsRedundant(providerPayload)) return;
   const payload = buildOpenRigPayload(providerPayload);
