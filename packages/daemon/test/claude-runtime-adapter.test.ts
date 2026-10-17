@@ -707,13 +707,13 @@ describe("Claude Code runtime adapter", () => {
     const WAIT_MS = 6_000;
 
     // `screen(read)` is the pane text on the nth capture; `rows(read)` the process list at that point.
-    const run = async (opts: { screen?: (read: number) => string; rows?: (read: number) => typeof occupied; paneCommand?: string; readinessTimeoutMs?: number } = {}) => {
+    const run = async (opts: { screen?: (read: number) => string; rows?: (read: number) => typeof occupied; paneCommand?: string; readinessTimeoutMs?: number; autoDrive?: boolean } = {}) => {
       let reads = 0;
       const tmux = mockTmux();
       (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue(opts.paneCommand ?? "sh");
       (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockImplementation(async () => (opts.screen ?? (() => ""))(reads++));
       (tmux as unknown as { getPanePid: unknown }).getPanePid = vi.fn(async () => 10);
-      const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, readinessTimeoutMs: "readinessTimeoutMs" in opts ? opts.readinessTimeoutMs : WAIT_MS,
+      const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, autoDriveProviderPrompts: opts.autoDrive, readinessTimeoutMs: "readinessTimeoutMs" in opts ? opts.readinessTimeoutMs : WAIT_MS,
         listProcesses: () => (opts.rows ?? (() => occupied))(reads) });
       const result = await adapter.launchHarness({ ...makeBinding(), tmuxPane: "%1" }, { name: "dev-impl@test-rig", resumeToken: "abc-123" });
       return { result, reads, tmux };
@@ -879,6 +879,68 @@ describe("Claude Code runtime adapter", () => {
           expect(result).toEqual(timedOut);
           expect(reads).toBeLessThan(25);
         });
+
+      // The periodic check ends at attempt 145 of 150 (default) and never fits in 4 s (20 attempts): the occupant changes after it.
+      it.each([
+        ["4 s setting", 4_000, 18],
+        ["default setting", undefined, 148],
+      ] as const)("%s: a different occupant arriving after the last periodic check still keeps main's result", async (_label, readinessTimeoutMs, arriveAt) => {
+        for (const arrival of [otherClaude, codex]) {
+          const { result } = await run({ readinessTimeoutMs, rows: (read) => (read < arriveAt ? booting : [...booting, arrival]) });
+          expect(result).toEqual(timedOut);
+        }
+      });
+
+      describe("with provider-prompt auto-driving on, a trust prompt in the longer wait", () => {
+        const trust = "Accessing workspace:\n/fixture\n1. Yes, I trust this folder\n2. No, exit";
+
+        it.each([["a Codex", codex], ["another conversation's Claude", otherClaude]])(
+          "from %s that took the pane is not answered: main's result, no Enter", async (_label, arrival) => {
+            const { result, tmux } = await run({ autoDrive: true, rows: (read) => (read < 19 ? booting : [...booting, arrival]),
+              screen: (read) => (read < 20 ? "" : trust) });
+            expect(result).toEqual(timedOut);
+            expect(tmux.sendKeys).toHaveBeenCalledTimes(1); // the launch command's own Enter, none for the prompt
+          });
+
+        it("with nothing seen under the pane (an occupant the wait hasn't checked) is not answered either", async () => {
+          const { result, tmux } = await run({ autoDrive: true, rows: () => booting, screen: (read) => (read < 20 ? "" : trust) });
+          expect(result).toEqual(timedOut);
+          expect(tmux.sendKeys).toHaveBeenCalledTimes(1);
+        });
+
+        it("from this launch's own Claude is answered, and the seat resumes", async () => {
+          const { result, tmux } = await run({ autoDrive: true, screen: (read) => (read < 20 ? "" : read < 23 ? trust : tui) });
+          expect(result).toMatchObject({ ok: true });
+          expect((tmux.sendKeys as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(1);
+        });
+
+        it("in the quick window is answered as before, whoever holds the pane", async () => {
+          const { tmux } = await run({ autoDrive: true, rows: () => [...booting, codex], screen: (read) => (read < 3 ? trust : "") });
+          expect((tmux.sendKeys as ReturnType<typeof vi.fn>).mock.calls.length).toBeGreaterThan(1);
+        });
+      });
+
+      describe("a ready-looking screen with an unreadable process list is unknown, not another occupant", () => {
+        const ready = "Restored conversation\n❯\u00a0\n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        const unreadable = () => { throw new Error("ps unavailable"); };
+
+        it("when the first window ends: attention_required, token kept", async () => {
+          const { result } = await run({ rows: unreadable, screen: () => ready });
+          expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+        });
+
+        it("when it first draws during the longer wait: keeps waiting, then attention_required", async () => {
+          const { result, reads } = await run({ rows: unreadable, screen: (read) => (read < 20 ? "" : ready) });
+          expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+          expect(reads).toBe(31);
+        });
+
+        it("with a list that can be read and shows a look-alike, it is still main's result", async () => {
+          const lookAlike = { ...claude, executableName: "printf" };
+          const { result } = await run({ rows: (read) => (read < 20 ? booting : [...booting, lookAlike]), screen: (read) => (read < 20 ? "" : ready) });
+          expect(result).toEqual(timedOut);
+        });
+      });
 
       it("an unknown occupant (nothing seen, own launch script only) is waited for, then attention_required", async () => {
         const { result, reads } = await run({ rows: () => booting });

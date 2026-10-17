@@ -445,22 +445,22 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     return observed.state === "idle_shell";
   }
 
-  /** Whether the pane is positively held by something other than this launch's own start: a ready screen whose lineage
-   *  failed the check, a Claude naming another conversation, or a stable Codex. Waiting won't make any of them this
-   *  launch's, and its token is not recorded as an attempt. A pane showing no Claude yet (the launch script is starting
-   *  it), this launch's own Claude, or a process list that can't be read is unknown, not another occupant. One process
-   *  listing serves the Claude observations. */
-  private async occupantIsAnother(binding: NodeBinding, looksReady: boolean): Promise<boolean> {
-    if (looksReady) return true;
+  /** Who holds the pane, by the observations already there. "another": positively something other than this launch's own
+   *  start: a ready screen whose lineage failed the check (with a process list that could be read), a Claude naming
+   *  another conversation, or a stable Codex. Waiting won't make any of them this launch's, and its token is not recorded
+   *  as an attempt. "own": this launch's Claude. "unknown": nothing seen yet (the launch script is starting it) or a
+   *  process list that can't be read, whatever the screen shows. One process listing serves the Claude observations. */
+  private async paneOccupant(binding: NodeBinding, looksReady: boolean): Promise<"own" | "another" | "unknown"> {
     const launch = this.autoLaunches.get(binding.nodeId);
-    if (!binding.tmuxPane || !launch) return false;
+    if (!binding.tmuxPane || !launch) return looksReady ? "another" : "unknown";
     let rows: Awaited<ReturnType<NativeProcessLister>>;
-    try { rows = await (this.listProcesses ?? listNativeProcesses)(); } catch { return false; }
+    try { rows = await (this.listProcesses ?? listNativeProcesses)(); } catch { return "unknown"; }
+    if (looksReady) return "another";
     const observation = { target: binding.tmuxPane, tmux: this.tmux, listProcesses: () => rows, selectedExecutable: launch.executable };
-    if (await observeClaudePaneProcess({ ...observation, expectedToken: launch.token })) return false;
-    if (await observeClaudePaneRuntime(observation)) return true;
-    return !!(await observeCodexPaneProcess(observation))
-      && !!(await verifyCodexPaneProcess({ ...observation, listProcesses: this.listProcesses }));
+    if (await observeClaudePaneProcess({ ...observation, expectedToken: launch.token })) return "own";
+    if (await observeClaudePaneRuntime(observation)) return "another";
+    return await observeCodexPaneProcess(observation) && await verifyCodexPaneProcess({ ...observation, listProcesses: this.listProcesses })
+      ? "another" : "unknown";
   }
 
   private async verifyResumeLaunch(binding: NodeBinding): Promise<HarnessLaunchResult> {
@@ -506,6 +506,12 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       }
 
       if (this.autoDriveProviderPrompts && probe.code === "trust_gate") {
+        // In the longer wait the occupant has not been looked at since the window ended: press Enter only for this launch's
+        // own Claude. Anything else keeps main's result, as if the loop had ended.
+        if (slowStart && await this.paneOccupant(binding, false) !== "own") {
+          slowStart = false;
+          break;
+        }
         const enterResult = await this.tmux.sendKeys(tmuxSession, ["Enter"]);
         if (!enterResult.ok) {
           return { ok: false, error: `Claude trust prompt auto-drive failed: ${enterResult.message}` };
@@ -526,7 +532,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       const looksReady = (attempt === windowAttempts - 1 || slowStart) && booting
         && assessNativeResumeProbe({ runtime: "claude-code", paneCommand, paneContent,
           claudeAutoIdentityVerified: true, claudeResumeIdentityVerified: true }).status === "resumed";
-      if (slowStart && looksReady) {
+      if (slowStart && looksReady && await this.paneOccupant(binding, true) === "another") {
         slowStart = false;
         break;
       }
@@ -538,7 +544,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         if (await this.paneReturnedToShell(binding, await this.tmux.getPaneCommand(tmuxSession))) {
           // Provably back at its shell: the final check reports it. If it isn't by then, the seat is kept.
           if (slowStart) { attempts = attempt + 1; break; }
-        } else if (await this.occupantIsAnother(binding, looksReady)) {
+        } else if (await this.paneOccupant(binding, looksReady) === "another") {
           // Not this launch's start: keep main's result.
           slowStart = false;
           break;
@@ -589,7 +595,11 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       };
     }
 
-    if (slowStart && (finalProbe.code === "awaiting_runtime" || finalProbe.code === "returned_to_shell")) {
+    // The occupant can change after the last check in the loop, so the end of the wait looks once more, with the screen
+    // judged as in the loop: a different occupant (or a ready-looking screen on a readable list) keeps main's result.
+    if (slowStart && (finalProbe.code === "awaiting_runtime" || finalProbe.code === "returned_to_shell")
+      && await this.paneOccupant(binding, assessNativeResumeProbe({ runtime: "claude-code", paneCommand: finalCommand, paneContent: finalContent,
+        claudeAutoIdentityVerified: true, claudeResumeIdentityVerified: true }).status === "resumed") !== "another") {
       // Claude, or the script about to start it, may still be coming up. Keep the launch and its resume token for
       // a person (or the reconciler) rather than failing a seat that may be running. Never `resumed` from this.
       return {

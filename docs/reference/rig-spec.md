@@ -642,8 +642,8 @@ seat, and a longer setting means a longer wait before a stuck seat is reported.
 A seat that is still not interactive then ends `attention_required` with its
 launch and resume token kept, and the later readiness wait is skipped for it.
 That holds at every setting: at 1–3 seconds there are no extra polls, but an
-unresolved boot is still kept rather than failed. A pane that shows another
-runtime or another conversation's Claude is not waited for. `rig up` and
+unresolved boot is still kept rather than failed. A pane that shows a Codex or
+another conversation's Claude is not waited for. `rig up` and
 `rig launch` wait 120 seconds for the daemon, so a restore of several stuck
 seats can pass that (in one measurement, about 31 seconds a seat at the
 default, 95 for three). A client timeout and exit code 1 do not mean the
