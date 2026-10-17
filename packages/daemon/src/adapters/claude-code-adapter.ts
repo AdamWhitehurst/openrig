@@ -503,11 +503,18 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         slowStart = false;
         break;
       }
+      // A start in progress can't have drawn Claude's ready screen. One that has, with its lineage unproven, keeps
+      // main's result whenever it draws: at the window's end, or at any poll of the longer wait.
+      const looksReady = (attempt === windowAttempts - 1 || slowStart) && booting
+        && assessNativeResumeProbe({ runtime: "claude-code", paneCommand, paneContent,
+          claudeAutoIdentityVerified: true, claudeResumeIdentityVerified: true }).status === "resumed";
+      if (slowStart && looksReady) {
+        slowStart = false;
+        break;
+      }
       // The first window is over. A pane provably back at its shell ends here, as does anything that isn't a boot in
       // progress or isn't this launch's own start (a ready-looking screen, another conversation's Claude).
       if (attempt === windowAttempts - 1 && booting) {
-        const looksReady = assessNativeResumeProbe({ runtime: "claude-code", paneCommand, paneContent,
-          claudeAutoIdentityVerified: true, claudeResumeIdentityVerified: true }).status === "resumed";
         if (!(await this.paneReturnedToShell(binding, await this.tmux.getPaneCommand(tmuxSession)))
           && await this.occupantIsOurStart(binding, looksReady)) {
           const extraMs = Math.max(0, resolveReadinessTimeoutMs(this.readinessTimeoutMs) - windowAttempts * pollMs);

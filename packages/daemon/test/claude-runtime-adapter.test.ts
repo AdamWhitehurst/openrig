@@ -726,10 +726,13 @@ describe("Claude Code runtime adapter", () => {
       });
     });
 
-    it("still stops at a resume-selection prompt during the extra wait", async () => {
-      const prompt = ["Resume Session", "❯ 1. First conversation", "  2. Second conversation", "Enter to select · Esc to cancel"].join("\n");
-      const { result } = await run({ screen: (read) => (read < 22 ? "" : prompt) });
+    it("still stops at a resume-selection prompt that shows up during the extra wait", async () => {
+      const chooser = "Choose a conversation to resume:\n  1. First conversation\n  2. Second conversation";
+      const { result, reads } = await run({ screen: (read) => (read < 22 ? "" : chooser) });
       expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+      expect((result as { error: string }).error).toContain("resume-selection prompt");
+      // Ended at the prompt, not at the bound.
+      expect(reads).toBeLessThan(25);
     });
 
     it("reports a return to the shell when the pane is back at its shell by the end of the wait", async () => {
@@ -761,6 +764,18 @@ describe("Claude Code runtime adapter", () => {
       const { result, reads } = await run({ rows: () => [{ ...pane, tpgid: 11 }, launchScript, lookAlike], screen: () => ready });
       expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
       expect(reads).toBe(17);
+    });
+
+    it("a look-alike that draws a ready-looking screen during the extra wait ends it, as at the window's end", async () => {
+      // Only the launch script under the pane while it boots; at read 20 a look-alike process and Claude's composer appear.
+      const lookAlike = { ...claude, executableName: "printf" };
+      const ready = "Restored conversation\n❯\u00a0\n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+      const { result, reads } = await run({
+        rows: (read) => (read < 20 ? [{ ...pane, tpgid: 11 }, launchScript] : [{ ...pane, tpgid: 11 }, launchScript, lookAlike]),
+        screen: (read) => (read < 20 ? "" : ready),
+      });
+      expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+      expect(reads).toBeLessThan(25);
     });
 
     it("does not wait for a Claude that says it needs a login: timed out as before", async () => {
