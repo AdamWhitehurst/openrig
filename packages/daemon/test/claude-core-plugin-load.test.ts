@@ -859,5 +859,40 @@ describe("the plugin's seat effects stay inside the seat's project", () => {
     };
     const first = block(files[0]!);
     for (const file of files.slice(1)) expect(block(file), file).toBe(first);
+    // The disk's own letter case, not the case a path was typed in (see the macOS test below).
+    expect(first).toContain("fs.realpathSync.native(");
+    expect(first).not.toMatch(/fs\.realpathSync\(/);
+  });
+
+  // macOS volumes are case-insensitive by default, and Claude's CLAUDE_PROJECT_DIR carries the case the disk has while a
+  // seat's folder may be written in another case. fs.realpathSync keeps the typed case; fs.realpathSync.native gives the
+  // disk's. Runs only where that is true (a case-insensitive volume on darwin); skipped everywhere else.
+  it.skipIf(process.platform !== "darwin")("treats a case-variant spelling of the seat's folder as the same project (macOS)", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "seat-case-")));
+    roots.push(root);
+    const seat = join(root, "Seat-Project");
+    mkdirSync(seat);
+    const variant = join(root, "seat-project");
+    if (!existsSync(variant)) return; // a case-sensitive volume: the two names are different folders, nothing to prove
+    const posts: string[] = [];
+    const server = createServer((req, res) => { req.on("data", () => {}); req.on("end", () => { posts.push(req.url ?? ""); res.end("{}"); }); });
+    await new Promise<void>((ok) => server.listen(0, "127.0.0.1", ok));
+    const port = (server.address() as { port: number }).port;
+    const post = (launch: string, claude: string) => new Promise<void>((done, fail) => {
+      const child = spawn(process.execPath, [join(scripts, "hooks/scripts/activity-relay.cjs")], {
+        env: { PATH: process.env.PATH ?? "", OPENRIG_SESSION_NAME: "dev-claude@rig", OPENRIG_NODE_ID: "n1", OPENRIG_RUNTIME: "claude-code",
+          OPENRIG_URL: `http://127.0.0.1:${port}`, OPENRIG_ACTIVITY_HOOK_TOKEN: "tok", OPENRIG_SEAT_PROJECT_DIR: launch, CLAUDE_PROJECT_DIR: claude },
+        stdio: ["pipe", "ignore", "ignore"],
+      });
+      child.on("error", fail); child.on("close", () => done());
+      child.stdin.end(JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "s-1" }));
+    });
+    try {
+      await post(seat, variant); // the launch folder as typed, Claude's value in the disk's (here: the other) case
+      await post(variant, seat);
+      expect(posts).toHaveLength(2);
+    } finally {
+      await new Promise<void>((ok) => server.close(() => ok()));
+    }
   });
 });

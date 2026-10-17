@@ -261,15 +261,17 @@ function pluginRunIsRedundant(providerPayload, argv = process.argv, env = proces
 // and its hooks would act as the seat. OpenRig tells the plugin the seat's launch project in OPENRIG_SEAT_PROJECT_DIR;
 // Claude's own CLAUDE_PROJECT_DIR is fixed for the life of a Claude and names the project it was started in (unlike the
 // hook payload's cwd, which follows a `cd`). The seat's effects run only when the two name the same folder. Spellings of
-// one folder (a symlink, a trailing slash) count as the same, and a missing variable (an older or manual launch, a runtime
-// without CLAUDE_PROJECT_DIR) leaves the hook doing what it always did.
+// one folder (a symlink, a trailing slash, letter case on a case-insensitive disk) count as the same, and a missing
+// variable (an older or manual launch, a runtime without CLAUDE_PROJECT_DIR) leaves the hook doing what it always did.
 function runsForThisSeatsProject(env = process.env) {
   const launch = env.OPENRIG_SEAT_PROJECT_DIR;
   const project = env.CLAUDE_PROJECT_DIR;
   if (!launch || !project) return true;
   const canonical = (dir) => {
     const absolute = path.resolve(dir);
-    try { return fs.realpathSync(absolute); } catch { return absolute; }
+    // .native gives the case the disk has (plain realpathSync keeps the case the path was typed in), which is what Claude's
+    // CLAUDE_PROJECT_DIR carries on a case-insensitive filesystem such as macOS's default.
+    try { return fs.realpathSync.native(absolute); } catch { return absolute; }
   };
   return canonical(launch) === canonical(project);
 }
