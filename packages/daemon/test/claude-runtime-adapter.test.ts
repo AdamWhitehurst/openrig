@@ -20,6 +20,7 @@ function mockTmux(): TmuxAdapter {
     listSessions: vi.fn(async () => []),
     listWindows: vi.fn(async () => []),
     listPanes: vi.fn(async () => []),
+    getPanePid: vi.fn(async () => null),
     sendKeys: vi.fn(async () => ({ ok: true as const })),
   } as unknown as TmuxAdapter;
 }
@@ -237,8 +238,15 @@ describe("Claude Code runtime adapter", () => {
   it("checkReady returns false when the pane has fallen back to a shell prompt", async () => {
     const tmux = mockTmux();
     (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue("zsh");
+    (tmux.getPanePid as ReturnType<typeof vi.fn>).mockResolvedValue(900);
     (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockResolvedValue("user@example.test rigged %");
-    const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs() });
+    const adapter = new ClaudeCodeAdapter({
+      tmux,
+      fsOps: mockFs(),
+      listProcesses: () => [
+        { pid: 900, ppid: 1, command: "/bin/zsh", pgid: 900, tpgid: 900, executableName: "zsh", startedAt: "Sat Jan  1 12:00:00 2000" },
+      ],
+    });
 
     const result = await adapter.checkReady(makeBinding());
 
@@ -247,6 +255,46 @@ describe("Claude Code runtime adapter", () => {
       reason: "The probe pane returned to a shell instead of staying inside the runtime.",
       code: "returned_to_shell",
     });
+  });
+
+  it("checkReady returns awaiting_runtime when the shell label is a launch script still starting Claude", async () => {
+    const tmux = mockTmux();
+    (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue("sh");
+    (tmux.getPanePid as ReturnType<typeof vi.fn>).mockResolvedValue(900);
+    (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockResolvedValue("booting wrapper...");
+    const adapter = new ClaudeCodeAdapter({
+      tmux,
+      fsOps: mockFs(),
+      listProcesses: () => [
+        { pid: 900, ppid: 1, command: "/bin/sh /tmp/launch.sh", pgid: 900, tpgid: 901, executableName: "sh", startedAt: "Sat Jan  1 12:00:00 2000" },
+        { pid: 901, ppid: 900, command: "claude", pgid: 901, tpgid: 901, executableName: "claude", startedAt: "Sat Jan  1 12:00:00 2000" },
+      ],
+    });
+
+    const result = await adapter.checkReady(makeBinding());
+
+    expect(result).toEqual({
+      ready: false,
+      reason: "The pane shows a shell that is not a proven idle shell; a launch script may still be starting Claude.",
+      code: "awaiting_runtime",
+    });
+  });
+
+  it("checkReady does not call the pane a shell when the process listing is unavailable", async () => {
+    const tmux = mockTmux();
+    (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue("sh");
+    (tmux.getPanePid as ReturnType<typeof vi.fn>).mockResolvedValue(900);
+    (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockResolvedValue("");
+    const adapter = new ClaudeCodeAdapter({
+      tmux,
+      fsOps: mockFs(),
+      listProcesses: () => { throw new Error("ps unavailable"); },
+    });
+
+    const result = await adapter.checkReady(makeBinding());
+
+    expect(result.ready).toBe(false);
+    expect(result.code).toBe("awaiting_runtime");
   });
 
   it("checkReady returns false when Claude is blocked on the workspace trust prompt", async () => {
