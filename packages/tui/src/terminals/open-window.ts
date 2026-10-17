@@ -23,7 +23,8 @@ function inHerdr(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
- * The Herdr markers of the tmux client that pressed the key. A shared TUI runs in the daemon's tmux server, so its own
+ * The Herdr markers of the tmux client that was active last, normally the one whose key started this (tmux only counts
+ * keys a client types, so a key sent with `send-keys` or by a control-mode client marks no one). A shared TUI runs in the daemon's tmux server, so its own
  * environment never carries them; they are on the attached client. Linux only (the client's environment is read from
  * /proc). Undefined whenever the viewer isn't certain: no client, more than one active in the same second, a client
  * that can't be read or isn't in Herdr, or any failure. The child then keeps today's detection.
