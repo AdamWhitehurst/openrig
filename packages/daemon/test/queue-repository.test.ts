@@ -447,6 +447,24 @@ describe("QueueRepository", () => {
     expect(captured.filter((e) => e.type === "queue.created")).toHaveLength(2); // create + handoff-create
   });
 
+  // The queue-handoff skill teaches this: a handoff keeps the source row's scope tags unless it
+  // sends tags (--tags, or --gate, which sends gate:<role>), and tags it sends replace them.
+  it.each(["handoff", "handoffAndComplete"] as const)(
+    "%s keeps the source row's tags unless it sends tags, and sent tags replace them",
+    async (verb) => {
+      const scope = ["project:p", "mission:m", "slice:s"];
+      const fresh = async () => repo.create({
+        sourceSession: "alice@rig", destinationSession: "bob@rig", body: "x", tags: scope,
+      });
+      const keep = await repo[verb]({ qitemId: (await fresh()).qitemId, fromSession: "bob@rig", toSession: "carol@rig" });
+      expect(keep.created.tags).toEqual(scope);
+      const gated = await repo[verb]({
+        qitemId: (await fresh()).qitemId, fromSession: "bob@rig", toSession: "carol@rig", tags: ["gate:guard"],
+      });
+      expect(gated.created.tags).toEqual(["gate:guard"]);
+    },
+  );
+
   it("handoff refuses on already-terminal qitem", async () => {
     const item = await repo.create({
       sourceSession: "alice@rig",
