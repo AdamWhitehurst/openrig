@@ -168,8 +168,11 @@ export class ClaudeManagedLaunch {
     const seatForwarded = seatKeys.filter(key => !inherited.includes(key) && !(key in identity) && !(key in publicEnv))
       .map(key => `\${${key}+"${key}=$${key}"}`);
     // Expand in the target pane shell, whose terminal can differ from the daemon.
-    // Empty and absent values remain absent after env -i.
-    const terminal = ["TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+    // Empty and absent values remain absent after env -i. TERM_PROGRAM is how Claude tells it runs
+    // inside tmux; without it Claude never asks tmux for extended keys, and Shift+Enter reaches it
+    // as a plain Enter. TMUX is left out on purpose: a bare `tmux` follows $TMUX ahead of
+    // TMUX_TMPDIR, so tools the seat runs (and any daemon it starts) would follow the seat's own tmux server.
+    const terminal = ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
       "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "LC_MONETARY"]
       .map(key => `\${${key}:+"${key}=$${key}"}`);
     return Object.freeze({ assertCurrent, configDir: context.configDir, executable: context.executable, command: (args: readonly string[], launchEnv: Readonly<Record<string, string>> = {}) => {
