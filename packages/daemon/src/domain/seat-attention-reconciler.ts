@@ -30,11 +30,25 @@ function storedRotation(db: Database.Database, nodeId: string, expectedToken: st
   } catch { return null; }
 }
 
+/** Data from a pane, a process or the seat's record is printed with control characters replaced, so it cannot move the
+ *  cursor, overwrite earlier text or start a line of its own. */
+function printable(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "?");
+}
+
+/** The seat's recorded conversation, by its first eight characters. Only the seat's own record is shown: a value the
+ *  argv readers return is a heuristic (it can be a flag's value, or look like an id), so it is never reproduced. */
+function recordedConversation(token: string): string {
+  const characters = [...printable(token)];
+  return characters.length > 8 ? `${characters.slice(0, 8).join("")}…` : characters.join("");
+}
+
 /** Which process check ran, so the explanation can run the same one on its snapshot. */
 type LineageVariant = "codex" | "claude_conversation" | "claude_runtime" | "claude_exact_resume";
 
 /** Which part of the process check failed, for the message. The pane label only routes the check to the process
- *  tree; it is never the reason the check failed. A conversation id is shown by its first eight characters.
+ *  tree; it is never the reason the check failed. The seat's recorded conversation is shown by its first eight
+ *  characters; a conversation the check read from a launch is described, never printed (the readers are heuristics).
  *  The check is re-run on one snapshot of the process table: if it passes there, the process, pane or pid may have
  *  changed during the check (the snapshot cannot show which). If it fails, `explainNativeRejection` (which mirrors the check's own tests)
  *  says which test rejected. Anything it does not cover is "could not be verified", never a guessed cause.
@@ -51,8 +65,7 @@ async function describeLineageFailure(input: {
   /** The check required a resume (`requireExactResumeLineage`), not just a runtime. */
   exact: boolean;
 }): Promise<string | null> {
-  const short = (token: string) => token.length > 8 ? `${token.slice(0, 8)}…` : token;
-  const records = input.expectedToken ? `the seat records ${short(input.expectedToken)}` : "the seat records no conversation";
+  const records = input.expectedToken ? `the seat records ${recordedConversation(input.expectedToken)}` : "the seat records no conversation";
   const agree = input.expectedToken ? ". Clearing needs the two to agree" : "";
   const runtimeName = input.runtime === "codex" ? "Codex" : "Claude";
   try {
@@ -76,7 +89,7 @@ async function describeLineageFailure(input: {
     // argv, and reads argv its own way, so the single-process rejection tests below do not mirror it. It is worded
     // specifically only when that same recognizer finds no Claude row at all.
     if (input.variant === "claude_exact_resume") {
-      if (subtreeNamesClaudeExecutable(rows, pid)) return "The running Claude could not be verified against the stored conversation";
+      if (subtreeNamesClaudeExecutable(rows, pid)) return "A process in the pane's tree names a Claude executable and could not be verified against the stored conversation";
       return await verifyPaneIdleShell(observation)
         ? "The pane's foreground is an idle shell, and no process in its tree names a Claude executable"
         : "No process in the pane's process tree names a Claude executable";
@@ -97,15 +110,15 @@ async function describeLineageFailure(input: {
       }
       case "no_recorded_conversation": return `The seat records no conversation, so the running ${runtimeName} cannot be matched to one`;
       case "names_no_conversation": return input.runtime === "codex"
-        ? `The running Codex's resume names no conversation (${records})`
+        ? `The check read no conversation after the running Codex's resume (${records})`
         : `The check could not read a conversation from the running Claude's launch, so it cannot be matched to the stored one (${records})`;
       case "not_a_resume": return `The check could not read a resume from the running Codex's launch, so it cannot be matched to a conversation (${records})`;
-      case "conflicting_conversations": return "The Codex launcher chain names different conversations";
+      case "conflicting_conversations": return "The check read different conversations from the Codex launcher chain";
       case "other_conversation": return input.runtime === "codex"
-        ? `The check read conversation ${short(rejection.conversation)} from the running Codex's launch; ${records}${agree}`
-        : `The running Claude was launched with conversation ${short(rejection.conversation)}; ${records}${agree}`;
-      case "rotation_process_mismatch": return `The running Claude names conversation ${short(rejection.conversation)}, which the recorded rotation covers, but it is not the process that rotation recorded`;
-      case "passes": return `The ${runtimeName} process could not be verified against the stored conversation`;
+        ? `The check read a conversation from the running Codex's launch that does not match the seat's record; ${records}${agree}`
+        : `The check read a conversation from the launch of the process it recognised as Claude that does not match the seat's record; ${records}${agree}`;
+      case "rotation_process_mismatch": return "The check read a conversation the recorded rotation covers from the process it recognised as Claude, but it is not the process that rotation recorded";
+      case "passes": return "The pane's process could not be verified against the stored conversation";
     }
   } catch { /* the label text below stands */ }
   return null;
@@ -254,7 +267,7 @@ export async function rebindAndVerifyPaneIdentity(input: {
   identityStore.upsert(verdict);
 
   if (verdict.verdict === "pane_missing") {
-    return { ok: false, detail: `tmux pane '${pane.id}' has no live process` };
+    return { ok: false, detail: `tmux pane '${printable(pane.id)}' has no live process` };
   }
   if (verdict.verdict === "mismatch") {
     if (runtimeAmbiguous) {
@@ -276,13 +289,13 @@ export async function rebindAndVerifyPaneIdentity(input: {
       return {
         ok: false,
         detail: failedCheck
-          ? `tmux pane '${pane.id}' (foreground command '${command ?? "unknown"}') did not pass the process check for runtime '${input.runtime}': ${failedCheck}`
-          : `tmux pane '${pane.id}' foreground command '${command ?? "unknown"}' does not positively identify runtime '${input.runtime}'`,
+          ? `tmux pane '${printable(pane.id)}' (foreground command '${printable(command ?? "unknown")}') did not pass the process check for runtime '${input.runtime}': ${failedCheck}`
+          : `tmux pane '${printable(pane.id)}' foreground command '${printable(command ?? "unknown")}' does not positively identify runtime '${input.runtime}'`,
       };
     }
     return {
       ok: false,
-      detail: `tmux pane '${pane.id}' foreground command '${command ?? "unknown"}' contradicts runtime '${input.runtime ?? "unknown"}'`,
+      detail: `tmux pane '${printable(pane.id)}' foreground command '${printable(command ?? "unknown")}' contradicts runtime '${input.runtime ?? "unknown"}'`,
     };
   }
   return { ok: true, pane: pane.id, pid: pid!, command };

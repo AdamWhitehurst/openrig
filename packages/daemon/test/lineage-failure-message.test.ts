@@ -20,7 +20,7 @@ const sleeper: NativeProcessRow = { pid: 101, ppid: 100, pgid: 100, tpgid: 100, 
 const databases: Database.Database[] = [];
 afterEach(() => { for (const db of databases.splice(0)) db.close(); });
 
-async function check(runtime: "claude-code" | "codex", rows: NativeProcessRow[] | (() => NativeProcessRow[]), opts: { token?: string | null; strict?: boolean; command?: string | null; rotation?: { token: string; process: { pid: number; startedAt: string } }; splitAfterFirstPaneRead?: boolean } = {}) {
+async function check(runtime: "claude-code" | "codex", rows: NativeProcessRow[] | (() => NativeProcessRow[]), opts: { token?: string | null; strict?: boolean; explainFailure?: boolean; command?: string | null; rotation?: { token: string; process: { pid: number; startedAt: string } }; splitAfterFirstPaneRead?: boolean } = {}) {
   const db = createFullTestDb(); databases.push(db);
   const repo = new RigRepository(db), registry = new SessionRegistry(db);
   const rig = repo.createRig("lineage"), name = "worker@lineage";
@@ -33,7 +33,7 @@ async function check(runtime: "claude-code" | "codex", rows: NativeProcessRow[] 
   };
   let paneReads = 0;
   const result = await rebindAndVerifyPaneIdentity({ db, sessionRegistry: registry, tmux, nodeId: node.id, sessionName: name, runtime,
-    expectedResumeToken: opts.token === undefined ? STORED : opts.token, requireExactResumeLineage: opts.strict ?? true, ...(opts.rotation ? { resumeRotation: opts.rotation } : {}), listProcesses: async () => typeof rows === "function" ? rows() : rows });
+    expectedResumeToken: opts.token === undefined ? STORED : opts.token, requireExactResumeLineage: opts.strict ?? true, ...(opts.explainFailure === false ? { explainFailure: false } : {}), ...(opts.rotation ? { resumeRotation: opts.rotation } : {}), listProcesses: async () => typeof rows === "function" ? rows() : rows });
   const verdict = db.prepare("SELECT verdict, reason FROM seat_identity_verdicts WHERE node_id = ?").get(node.id);
   return { result, verdict };
 }
@@ -46,12 +46,12 @@ async function detail(...args: Parameters<typeof check>): Promise<string> {
 }
 
 describe("a failed lineage check names the check, not the pane label", () => {
-  it("Claude launched with another conversation: names both conversations", async () => {
+  it("Claude launched with another conversation: says it does not match the record, and does not print what it read", async () => {
     const text = await detail("claude-code", [shell, claude(RUNNING)]);
-    expect(text).toContain(`launched with conversation ${RUNNING.slice(0, 8)}`);
+    expect(text).toContain("read a conversation from the launch of the process it recognised as Claude that does not match the seat's record");
     expect(text).toContain(`the seat records ${STORED.slice(0, 8)}`);
     expect(text).not.toContain("does not positively identify");
-    expect(text).not.toContain(RUNNING);
+    expect(text).not.toContain(RUNNING.slice(0, 8));
     expect(text).not.toContain(STORED);
   });
   it("Claude whose launch names no conversation", async () => {
@@ -69,10 +69,11 @@ describe("a failed lineage check names the check, not the pane label", () => {
   it("non-strict Claude, no conversation recorded: no single Claude in the foreground", async () => {
     expect(await detail("claude-code", [shell, sleeper], { token: null, strict: false })).toContain("does not hold exactly one process the check recognises as Claude");
   });
-  it("Codex resumed on another conversation: names both conversations", async () => {
+  it("Codex resumed on another conversation: says it does not match the record, and does not print what it read", async () => {
     const text = await detail("codex", [shell, codex(`resume ${RUNNING}`)]);
-    expect(text).toContain(`read conversation ${RUNNING.slice(0, 8)}… from the running Codex`);
+    expect(text).toContain("read a conversation from the running Codex's launch that does not match the seat's record");
     expect(text).toContain(`the seat records ${STORED.slice(0, 8)}`);
+    expect(text).not.toContain(RUNNING.slice(0, 8));
     expect(text).not.toContain("does not positively identify");
   });
   it("Codex started fresh instead of resuming", async () => {
@@ -85,7 +86,8 @@ describe("a failed lineage check names the check, not the pane label", () => {
     // The pane's own process is the Claude here, so the label is "claude". The strict exact-resume check reads argv its
     // own way, so the text claims only that the Claude could not be verified.
     const text = await detail("claude-code", [{ ...claude(RUNNING, 100), ppid: 1 }], { command: "claude" });
-    expect(text).toContain("The running Claude could not be verified against the stored conversation");
+    expect(text).toContain("A process in the pane's tree names a Claude executable and could not be verified against the stored conversation");
+    expect(text).not.toContain("The running Claude");
   });
   it("the label is still the reason when no process check ran", async () => {
     // Non-strict, no token and a label that is not a shell wrapper: nothing was checked beyond the label.
@@ -104,7 +106,7 @@ describe("a failed lineage check names the check, not the pane label", () => {
     const quiet = await run(false, "quiet");
     const explained = await run(true, "explained");
     expect(quiet.ok || quiet.detail).toContain("does not positively identify runtime 'claude-code'");
-    expect(explained.ok || explained.detail).toContain("launched with conversation");
+    expect(explained.ok || explained.detail).toContain("does not match the seat's record");
     expect(reads.explained).toBeGreaterThan(reads.quiet);
   });
   it("a match still verifies", async () => {
@@ -169,7 +171,7 @@ describe("the explanation mirrors the check's own rejection (round 2)", () => {
   it("non-strict Codex resume that names no conversation (--last) is not called unsteady", async () => {
     for (const token of [STORED, null]) {
       const text = await detail("codex", [shell, codex("resume --last")], { strict: false, token });
-      expect(text).toContain("resume names no conversation");
+      expect(text).toContain("read no conversation after the running Codex's resume");
       expect(text).not.toContain("may have changed during the check");
     }
   });
@@ -178,7 +180,8 @@ describe("the explanation mirrors the check's own rejection (round 2)", () => {
     const inner: NativeProcessRow = { ...codex("-C /p"), pid: 102, ppid: 101 };
     // Non-strict: any link naming another conversation rejects. Strict: the deepest link must name the conversation itself, and it names none.
     const loose = await detail("codex", [shell, launcher, inner], { strict: false });
-    expect(loose).toContain(`read conversation ${RUNNING.slice(0, 8)}… from the running Codex`);
+    expect(loose).toContain("read a conversation from the running Codex's launch that does not match the seat's record");
+    expect(loose).not.toContain(RUNNING.slice(0, 8));
     expect(loose).not.toContain("may have changed during the check");
     expect(loose).not.toContain("could not read a resume from the running Codex");
     expect(await detail("codex", [shell, launcher, inner], { strict: true })).toContain("could not read a resume from the running Codex");
@@ -188,7 +191,7 @@ describe("the explanation mirrors the check's own rejection (round 2)", () => {
     const rows = [shell, claude(RUNNING)];
     const text = await detail("claude-code", unsteady(rows, 101), { rotation });
     expect(text).toContain("may have changed during the check");
-    expect(text).not.toContain("launched with conversation");
+    expect(text).not.toContain("does not match the seat's record");
     expect(text).not.toContain("needs the two to agree");
   });
   it("a rotation's conversation in a process other than the recorded one says so", async () => {
@@ -283,12 +286,80 @@ describe("'names no conversation' is scoped to what the reader could read (verif
   it("Codex: a flag's value read as the conversation is worded as what the check read", async () => {
     // codexResumeToken reads "gpt-5" (the value of -m) as the conversation for `resume -m gpt-5 STORED`.
     const text = await detail("codex", [shell, codex(`resume -m gpt-5 ${STORED}`)]);
-    expect(text).toContain("The check read conversation gpt-5 from the running Codex's launch");
+    expect(text).toContain("read a conversation from the running Codex's launch that does not match the seat's record");
+    expect(text).not.toContain("gpt-5");
     expect(text).not.toContain("resumed conversation");
   });
   it("Codex: 'resume names no conversation' stays, since the reader returns null only when no positional follows resume", async () => {
     for (const args of ["resume", "resume --last", "resume --all"]) {
-      expect(await detail("codex", [shell, codex(args)], { strict: false })).toContain("resume names no conversation");
+      expect(await detail("codex", [shell, codex(args)], { strict: false })).toContain("read no conversation after the running Codex's resume");
     }
+  });
+});
+
+// The maintainer's review of #1398: the message never reproduces a value the argv readers returned (they are
+// heuristics: a flag's value, or something shaped like an id), prints no control characters, and says what the
+// recognizer found. Wording is the only change: each case pins the result to the one without the explanation.
+async function wordingOnly(...args: Parameters<typeof check>): Promise<string> {
+  const [runtime, rows, opts = {}] = args;
+  const explained = await check(runtime, rows, opts);
+  const quiet = await check(runtime, rows, { ...opts, explainFailure: false });
+  expect(explained.result.ok).toBe(false);
+  expect({ ...explained.result, detail: "" }).toEqual({ ...quiet.result, detail: "" });
+  expect(explained.verdict).toEqual(quiet.verdict);
+  expect(explained.verdict).toEqual({ verdict: "mismatch", reason: "process_identity_ambiguous" });
+  return explained.result.ok ? "" : explained.result.detail;
+}
+const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+describe("values the check cannot vouch for are not printed (maintainer review)", () => {
+  it("a flag's value read as the conversation (gpt-5) is not shown", async () => {
+    const text = await wordingOnly("codex", [shell, codex(`resume -m gpt-5 ${STORED}`)]);
+    expect(text).toContain("does not match the seat's record");
+    expect(text).not.toContain("gpt-5");
+  });
+  it("a value shaped like a conversation id that is not the conversation is not shown, whole or clipped", async () => {
+    const looksLikeId = "0f8fad5b-d9cb-469f-a165-70867728950e";
+    const text = await wordingOnly("codex", [shell, codex(`resume -m ${looksLikeId} ${STORED}`)]);
+    expect(text).toContain("does not match the seat's record");
+    expect(text).not.toContain(looksLikeId);
+    expect(text).not.toContain(looksLikeId.slice(0, 8));
+  });
+  it("a short value the reader returned is not shown either", async () => {
+    const text = await wordingOnly("codex", [shell, codex(`resume -m x ${STORED}`)]);
+    expect(text).toContain("does not match the seat's record");
+    expect(text).not.toContain(" x ");
+    expect(text).not.toMatch(/conversation x\b/);
+  });
+  it("control characters in what the reader returned are not printed", async () => {
+    const text = await wordingOnly("codex", [shell, codex(`resume -m a\u001b[2Jb ${STORED}`)]);
+    expect(text).not.toMatch(CONTROL);
+    expect(text).not.toContain("[2J");
+  });
+  it("control characters in the seat's record are replaced; a short record is shown whole", async () => {
+    const text = await wordingOnly("codex", [shell, codex(`resume ${RUNNING}`)], { token: "ab\u001b[2Jc\nforged line" });
+    expect(text).not.toMatch(CONTROL);
+    expect(text).toContain("the seat records ab?[2Jc?…");
+    expect(await wordingOnly("codex", [shell, codex(`resume ${RUNNING}`)], { token: "tok" })).toContain("the seat records tok");
+  });
+  it("control characters in the pane's foreground command are replaced, with and without a process check", async () => {
+    expect(await wordingOnly("codex", [shell, codex(`resume ${RUNNING}`)], { command: "sh\u001b]0;x\u0007" })).not.toMatch(CONTROL);
+    const label = await detail("claude-code", [], { token: null, strict: false, command: "no\u0007de" });
+    expect(label).not.toMatch(CONTROL);
+    expect(label).toContain("foreground command 'no?de'");
+  });
+  it("a process that only mentions a Claude executable is not called the running Claude", async () => {
+    // The pane's own process, under the label "claude" so the exact-resume check runs, only has a Claude path in argv.
+    const mention: NativeProcessRow = { pid: 100, ppid: 1, pgid: 100, tpgid: 100, executableName: "vim", startedAt, command: "vim /home/u/.local/bin/claude" };
+    const text = await wordingOnly("claude-code", [mention], { command: "claude" });
+    expect(text).toContain("A process in the pane's tree names a Claude executable and could not be verified against the stored conversation");
+    expect(text).not.toContain("running Claude");
+  });
+  it("conflicting conversations are what the reader reported, not a fact about the launcher chain", async () => {
+    const launcher: NativeProcessRow = { ...codex(`resume ${RUNNING}`), pid: 101 };
+    const inner: NativeProcessRow = { ...codex("resume 9b2f0c3e-1111-4222-8333-444455556666"), pid: 102, ppid: 101 };
+    const text = await wordingOnly("codex", [shell, launcher, inner]);
+    expect(text).toContain("The check read different conversations from the Codex launcher chain");
+    expect(text).not.toContain("names different conversations");
   });
 });

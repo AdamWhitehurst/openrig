@@ -780,9 +780,12 @@ describe("post-relaunch identity observation window", () => {
     expect(report).toMatchObject({ outcome: "native_unknown" });
     expect(w.replacementYields).toEqual([1, 1]);
     // The final failed attempt reads the process table once more to name the failing check; earlier attempts do not.
-    // The wrong-token case names the conversation the running Codex resumed.
+    // The wrong-token case says the conversation the running Codex resumed does not match the record, without printing it.
     expect(w.replacementReads).toBe(7);
-    if (kind === "wrong token") expect(JSON.stringify(report)).toContain("read conversation other-th");
+    if (kind === "wrong token") {
+      expect(JSON.stringify(report)).toContain("does not match the seat's record");
+      expect(JSON.stringify(report)).not.toContain("other-th");
+    }
     expect(w.launches).toHaveLength(1);
   });
 
