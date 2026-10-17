@@ -198,6 +198,37 @@ describe("RECENT queue transition projection", () => {
       expect(entry("q-emoji").bodyPreview).toBe(`${"😀".repeat(237)}...`);
     });
 
+    it("reads the body only for a row whose summary is blank, by the same rule as trim()", () => {
+      // The body is read through substr(); replace it with a counting copy to see which rows reach it.
+      const reads: string[] = [];
+      db.function("substr", (text: unknown, from: unknown, length: unknown) => {
+        reads.push(String(text).slice(0, 12));
+        return Array.from(String(text)).slice(Number(from) - 1, Number(from) - 1 + Number(length)).join("");
+      });
+      claimed("q-authored", { summary: "Authored subject", body: "AUTHORED body" });
+      claimed("q-padded", { summary: "  \u00a0Padded subject\t ", body: "PADDED body" });
+      claimed("q-null", { summary: null, body: "NULL body" });
+      claimed("q-empty", { summary: "", body: "EMPTY body" });
+      claimed("q-nbsp", { summary: "\u00a0\u00a0", body: "NBSP body" });
+      claimed("q-tab", { summary: "\t\t", body: "TAB body" });
+      claimed("q-mixed", { summary: " \t\u00a0\r\n\u2003\ufeff", body: "MIXED body" });
+      const rows = repo.listRecentTransitions("rig-a");
+      expect(reads.sort()).toEqual(["EMPTY body", "MIXED body", "NBSP body", "NULL body", "TAB body"]);
+      expect(Object.fromEntries(rows.map((row) => [row.qitemId, row.bodyPreview]))).toEqual({
+        "q-authored": null, "q-padded": null,
+        "q-null": "NULL body", "q-empty": "EMPTY body", "q-nbsp": "NBSP body", "q-tab": "TAB body", "q-mixed": "MIXED body",
+      });
+    });
+
+    it("ends the preview at an embedded NUL, and gives none when the NUL comes before any text", () => {
+      claimed("q-nul-late", { summary: null, body: "Review the restore\u0000 path\nnext" });
+      claimed("q-nul-first", { summary: null, body: "\u0000Review the restore path" });
+      claimed("q-nul-after-blank", { summary: null, body: "\n  \u0000Review the restore path" });
+      expect(entry("q-nul-late").bodyPreview).toBe("Review the restore");
+      expect(entry("q-nul-first").bodyPreview).toBeNull();
+      expect(entry("q-nul-after-blank").bodyPreview).toBeNull();
+    });
+
     it("does not let the body change what the event is, and the route serves the same entries", async () => {
       claimed("q-words", { summary: null, body: "Completed, denied, failed and canceled" });
       const [row] = repo.listRecentTransitions("rig-a");
