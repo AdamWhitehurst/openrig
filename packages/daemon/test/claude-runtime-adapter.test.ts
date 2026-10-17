@@ -744,6 +744,26 @@ describe("Claude Code runtime adapter", () => {
       });
     });
 
+    it("ends the wait early when Claude exits after the first window: the shell is proven idle, not waited out", async () => {
+      // Claude is under the launch script when the first window ends, then exits at read 19; the pane label stays a shell.
+      const { result, reads } = await run({ rows: (read) => (read < 19 ? occupied : [pane]) });
+      expect(result).toEqual({
+        ok: false,
+        error: "Claude resume failed: pane returned to shell instead of entering Claude",
+        recovery: "retry_fresh",
+      });
+      // Found at the next once-a-second check, not at the bound (31 reads).
+      expect(reads).toBeLessThan(25);
+    });
+
+    it("looks at the process table about once a second during the extra wait, not on every poll", async () => {
+      let listings = 0;
+      const { result } = await run({ rows: () => { listings++; return [{ ...pane, tpgid: 11 }, launchScript]; } });
+      expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+      // The 14 extra polls of this bound would cost 28 listings if every one checked.
+      expect(listings).toBeLessThan(16);
+    });
+
     it("does not wait at all for a pane that is provably back at its shell when the first window ends", async () => {
       const { result, reads } = await run({ rows: () => [pane] });
       expect(result).toMatchObject({ ok: false, recovery: "retry_fresh" });

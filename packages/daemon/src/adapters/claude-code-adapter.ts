@@ -454,6 +454,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     // and in polls; it is per seat, nothing is shared across the seats of a restore.
     const pollMs = 200;
     const windowAttempts = 16;
+    const idleShellCheckEvery = 5;
     let attempts = windowAttempts;
     let slowStart = false;
 
@@ -510,6 +511,14 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
           claudeAutoIdentityVerified: true, claudeResumeIdentityVerified: true }).status === "resumed";
       if (slowStart && looksReady) {
         slowStart = false;
+        break;
+      }
+      // A shell label can't tell Claude having exited from the launch script not having started it yet, so the process
+      // tree decides. Two listings per check: about once a second, not on every poll. A pane proven idle ends the wait
+      // here and the final check below reports it; if it isn't idle by then, the seat is kept as for any slow start.
+      if (slowStart && probe.code === "returned_to_shell" && (attempt - windowAttempts + 1) % idleShellCheckEvery === 0
+        && await this.paneReturnedToShell(binding, paneCommand)) {
+        attempts = attempt + 1;
         break;
       }
       // The first window is over. A pane provably back at its shell ends here, as does anything that isn't a boot in
