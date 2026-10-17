@@ -14,7 +14,7 @@ import { resolveConcreteHint } from "../domain/runtime-adapter.js";
 import type { ProjectionPlan, ProjectionEntry } from "../domain/projection-planner.js";
 import { assessNativeResumeProbe } from "../domain/native-resume-probe.js";
 import { resolveReadinessTimeoutMs } from "../domain/readiness-timeout.js";
-import { observeClaudeDelivery, observeClaudePaneProcess, observeClaudePaneRuntime, verifyPaneIdleShell, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
+import { listNativeProcesses, observeClaudeDelivery, observeClaudePaneProcess, observeClaudePaneRuntime, observeCodexPaneProcess, verifyCodexPaneProcess, verifyPaneIdleShell, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
 import { mergeManagedBlock, DEFAULT_CLAUDE_MANAGED_BLOCK_FILE, type ClaudeManagedBlockFile } from "../domain/managed-blocks.js";
 import { claudeResumeLaunchEnv, claudeResumeLaunchPrefix } from "./claude-resume-launch.js";
 import { shellQuote } from "./shell-quote.js";
@@ -445,27 +445,33 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     return observed.state === "idle_shell";
   }
 
-  /** A resume that is slow shows no Claude under the pane yet (the launch script is starting it) or the very Claude
-   *  this launch started, and has not drawn Claude's ready screen. A Claude naming another conversation, or a
-   *  ready screen whose lineage failed the check, is not a start in progress: waiting won't make it this
-   *  launch's, and its token is not recorded as an attempt. */
-  private async occupantIsOurStart(binding: NodeBinding, looksReady: boolean): Promise<boolean> {
-    if (looksReady) return false;
+  /** Whether the pane is positively held by something other than this launch's own start: a ready screen whose lineage
+   *  failed the check, a Claude naming another conversation, or a stable Codex. Waiting won't make any of them this
+   *  launch's, and its token is not recorded as an attempt. A pane showing no Claude yet (the launch script is starting
+   *  it), this launch's own Claude, or a process list that can't be read is unknown, not another occupant. One process
+   *  listing serves the Claude observations. */
+  private async occupantIsAnother(binding: NodeBinding, looksReady: boolean): Promise<boolean> {
+    if (looksReady) return true;
     const launch = this.autoLaunches.get(binding.nodeId);
-    if (!binding.tmuxPane || !launch) return true;
-    const observation = { target: binding.tmuxPane, tmux: this.tmux, listProcesses: this.listProcesses, selectedExecutable: launch.executable };
-    if (await observeClaudePaneProcess({ ...observation, expectedToken: launch.token })) return true;
-    return !(await observeClaudePaneRuntime(observation));
+    if (!binding.tmuxPane || !launch) return false;
+    let rows: Awaited<ReturnType<NativeProcessLister>>;
+    try { rows = await (this.listProcesses ?? listNativeProcesses)(); } catch { return false; }
+    const observation = { target: binding.tmuxPane, tmux: this.tmux, listProcesses: () => rows, selectedExecutable: launch.executable };
+    if (await observeClaudePaneProcess({ ...observation, expectedToken: launch.token })) return false;
+    if (await observeClaudePaneRuntime(observation)) return true;
+    return !!(await observeCodexPaneProcess(observation))
+      && !!(await verifyCodexPaneProcess({ ...observation, listProcesses: this.listProcesses }));
   }
 
   private async verifyResumeLaunch(binding: NodeBinding): Promise<HarnessLaunchResult> {
     const tmuxSession = binding.tmuxSession!;
     // A quick window, then a longer one only while the boot is still in progress, as the Codex adapter does it.
-    // The longer one runs to the time a fresh launch gets before its readiness timeout, counted from the launch
-    // and in polls; it is per seat, nothing is shared across the seats of a restore.
+    // The longer one is the readiness setting less the quick window, as a number of polls counted from here; it is per
+    // seat, nothing is shared across the seats of a restore. A setting no longer than the quick window adds no polls, but
+    // an unresolved boot is still kept (attention_required) rather than failed.
     const pollMs = 200;
     const windowAttempts = 16;
-    const idleShellCheckEvery = 5;
+    const checkEvery = 5;
     let attempts = windowAttempts;
     let slowStart = false;
 
@@ -524,22 +530,23 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         slowStart = false;
         break;
       }
-      // A shell label can't tell Claude having exited from the launch script not having started it yet, so the process
-      // tree decides. Two listings per check: about once a second, not on every poll. A pane proven idle ends the wait
-      // here and the final check below reports it; if it isn't idle by then, the seat is kept as for any slow start.
-      if (slowStart && probe.code === "returned_to_shell" && (attempt - windowAttempts + 1) % idleShellCheckEvery === 0
-        && await this.paneReturnedToShell(binding, paneCommand)) {
-        attempts = attempt + 1;
-        break;
-      }
-      // The first window is over. A pane provably back at its shell ends here, as does anything that isn't a boot in
-      // progress or isn't this launch's own start (a ready-looking screen, another conversation's Claude).
-      if (attempt === windowAttempts - 1 && booting) {
-        if (!(await this.paneReturnedToShell(binding, await this.tmux.getPaneCommand(tmuxSession)))
-          && await this.occupantIsOurStart(binding, looksReady)) {
-          const extraMs = Math.max(0, resolveReadinessTimeoutMs(this.readinessTimeoutMs) - windowAttempts * pollMs);
-          attempts = windowAttempts + Math.floor(extraMs / pollMs);
-          slowStart = attempts > windowAttempts;
+      // Checked where the window ends and then about once a second of the longer wait (two listings for the shell, one for
+      // the occupant), not on every poll. A shell label can't tell Claude having exited from the launch script not having
+      // started it yet, and the occupant can change while we wait, so the process tree decides.
+      const windowEnd = attempt === windowAttempts - 1;
+      if (booting && (windowEnd || (slowStart && (attempt - windowAttempts + 1) % checkEvery === 0))) {
+        if (await this.paneReturnedToShell(binding, await this.tmux.getPaneCommand(tmuxSession))) {
+          // Provably back at its shell: the final check reports it. If it isn't by then, the seat is kept.
+          if (slowStart) { attempts = attempt + 1; break; }
+        } else if (await this.occupantIsAnother(binding, looksReady)) {
+          // Not this launch's start: keep main's result.
+          slowStart = false;
+          break;
+        } else if (windowEnd) {
+          // A boot in progress, or one we can't see: keep the launch past the window even when the readiness setting
+          // leaves no room for more polls (1 to 3 s), so it ends as attention_required, not as the failure that loses the token.
+          attempts = windowAttempts + Math.floor(Math.max(0, resolveReadinessTimeoutMs(this.readinessTimeoutMs) - windowAttempts * pollMs) / pollMs);
+          slowStart = true;
         }
       }
       if (attempt < attempts - 1) {
@@ -582,7 +589,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       };
     }
 
-    if (slowStart) {
+    if (slowStart && (finalProbe.code === "awaiting_runtime" || finalProbe.code === "returned_to_shell")) {
       // Claude, or the script about to start it, may still be coming up. Keep the launch and its resume token for
       // a person (or the reconciler) rather than failing a seat that may be running. Never `resumed` from this.
       return {

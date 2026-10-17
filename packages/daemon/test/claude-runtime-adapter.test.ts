@@ -8,6 +8,7 @@ import type { NodeBinding, ResolvedStartupFile } from "../src/domain/runtime-ada
 import type { ProjectionPlan, ProjectionEntry } from "../src/domain/projection-planner.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { claudePostureFlag } from "../src/adapters/yolo-mode.js";
+import { resolveReadinessTimeoutMs } from "../src/domain/readiness-timeout.js";
 
 function mockTmux(): TmuxAdapter {
   return {
@@ -712,7 +713,7 @@ describe("Claude Code runtime adapter", () => {
       (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue(opts.paneCommand ?? "sh");
       (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockImplementation(async () => (opts.screen ?? (() => ""))(reads++));
       (tmux as unknown as { getPanePid: unknown }).getPanePid = vi.fn(async () => 10);
-      const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, readinessTimeoutMs: opts.readinessTimeoutMs ?? WAIT_MS,
+      const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, readinessTimeoutMs: "readinessTimeoutMs" in opts ? opts.readinessTimeoutMs : WAIT_MS,
         listProcesses: () => (opts.rows ?? (() => occupied))(reads) });
       const result = await adapter.launchHarness({ ...makeBinding(), tmuxPane: "%1" }, { name: "dev-impl@test-rig", resumeToken: "abc-123" });
       return { result, reads, tmux };
@@ -810,6 +811,80 @@ describe("Claude Code runtime adapter", () => {
       expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
       // The 14 extra polls of this bound would cost 28 listings if every one checked.
       expect(listings).toBeLessThan(16);
+    });
+
+    // The readiness setting runs 1 to 600 s; the quick window is 3.2 s, so 1 to 3 s leave no room for extra polls.
+    describe.each([1000, 2000, 3000])("with a readiness setting of %i ms, no longer than the quick window", (readinessTimeoutMs) => {
+      const stuck = [{ ...pane, tpgid: 11 }, launchScript];
+
+      it("still ends attention_required for an unresolved own launch, not the failure that loses the token", async () => {
+        const { result, reads } = await run({ readinessTimeoutMs, screen: () => "something Claude draws that no probe knows" });
+        expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+        expect(reads).toBe(17);
+      });
+
+      it("still ends attention_required when the process list can't be read", async () => {
+        const { result } = await run({ readinessTimeoutMs, rows: () => { throw new Error("ps unavailable"); } });
+        expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+      });
+
+      it("keeps real failures distinct: a shell proven idle, another occupant and a gate are not attention", async () => {
+        expect((await run({ readinessTimeoutMs, rows: () => [pane] })).result).toMatchObject({ ok: false, recovery: "retry_fresh" });
+        const other = { ...claude, command: "claude --permission-mode acceptEdits --resume some-other-session --name other" };
+        expect((await run({ readinessTimeoutMs, rows: () => [{ ...pane, tpgid: 11 }, launchScript, other] })).result)
+          .toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+        expect((await run({ readinessTimeoutMs, rows: () => stuck, screen: () => "Not logged in · Run /login" })).result)
+          .toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+      });
+    });
+
+    it("with 4 s, just above the quick window, waits the four polls that fit, then attention_required", async () => {
+      const { result, reads } = await run({ readinessTimeoutMs: 4_000 });
+      expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+      expect(reads).toBe(21);
+    });
+
+    it("with the default setting, waits the polls its bound gives after the quick window, then attention_required", async () => {
+      const { result, reads } = await run({ readinessTimeoutMs: undefined });
+      expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+      expect(reads).toBe(16 + Math.floor((resolveReadinessTimeoutMs(undefined) - 3_200) / 200) + 1);
+    });
+
+    describe("a different occupant keeps main's result (timed out, no token): only unknown observations get attention", () => {
+      const timedOut = { ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" };
+      const codex = { pid: 13, ppid: 11, pgid: 11, tpgid: 11, executableName: "codex", startedAt, command: "codex resume some-codex-session" };
+      const otherClaude = { ...claude, command: "claude --permission-mode acceptEdits --resume some-other-session --name other" };
+      const booting = [{ ...pane, tpgid: 11 }, launchScript];
+
+      it("a stable Codex under the shell is not waited for", async () => {
+        const { result, reads } = await run({ rows: () => [...booting, codex] });
+        expect(result).toEqual(timedOut);
+        expect(reads).toBe(17);
+      });
+
+      it("a Codex under the shell is not waited for at a 1 s setting either", async () => {
+        const { result } = await run({ readinessTimeoutMs: 1_000, rows: () => [...booting, codex] });
+        expect(result).toEqual(timedOut);
+      });
+
+      it("a Claude that names another conversation, there when the first window ends, is not waited for", async () => {
+        const { result, reads } = await run({ rows: () => [...booting, otherClaude] });
+        expect(result).toEqual(timedOut);
+        expect(reads).toBe(17);
+      });
+
+      it.each([["a Claude that names another conversation", otherClaude], ["a Codex", codex]])(
+        "%s that arrives during the longer wait ends it, at the next check", async (_label, arrival) => {
+          const { result, reads } = await run({ rows: (read) => (read < 19 ? booting : [...booting, arrival]) });
+          expect(result).toEqual(timedOut);
+          expect(reads).toBeLessThan(25);
+        });
+
+      it("an unknown occupant (nothing seen, own launch script only) is waited for, then attention_required", async () => {
+        const { result, reads } = await run({ rows: () => booting });
+        expect(result).toMatchObject({ ok: false, recovery: "attention_required" });
+        expect(reads).toBe(31);
+      });
     });
 
     it("does not wait at all for a pane that is provably back at its shell when the first window ends", async () => {
