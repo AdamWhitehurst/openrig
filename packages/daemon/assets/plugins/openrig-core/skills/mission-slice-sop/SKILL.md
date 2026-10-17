@@ -92,13 +92,12 @@ Never go idle holding a baton.
 
 ## Records
 
-- **Lifecycle stamps:** plan-lock with `rig scope slice approve <slice> --scope spec` before the build; `rig proof judge` per contract item when the scope's proof policy selects judges; `--scope delivery` (the default) as the terminal sign-off once the proof is in. `rig scope slice stage <slice> <stage>` moves wip → provisional → established (no approve stamp does), and `established` without a current `verified:` (`rig scope slice verified`) reads as provisional.
-- **`rig proof add <slice> --artifact-type … --verdict … --candidate-sha <sha> --money-evidence "…" --file <artifact>`** writes the proof artifact into the slice's `proof/` with its header. `--candidate-sha` is the commit you checked (the slice's built candidate), never an installed build or a local integration commit: a review counts only when it resolves to the built commit. `rig proof show <slice>` reads it against the selected proof policy.
+The rules for recording a slice's state are in the conventions SSOT (`docs/reference/sdlc-conventions.md` in the OpenRig source repository, `$OPENRIG_HOME/reference/sdlc-conventions.md` when installed). Read them before you stamp, judge or report:
+
+- **Stamps, stages and proof:** A2 (`rig proof judge`, `rig scope slice stage` and `verified`) and B2–B3 (`rig scope slice approve --scope spec|delivery`, `rig proof add` and `--candidate-sha`).
+- **Built and merged:** the release-mission paragraphs of A1 (`candidate:<sha>`, `merged:<pr-number>`, `arrangement.source.integration_ref`).
+- **Dispatch data:** the DISPATCH DATA row of the component menu (the `worktree_path=` body line).
 - **Editing judged evidence resets the judgment.** An accepted `rig proof judge` records the sha256 of the evidence it cites; edit that evidence (the cited section, when it cites a heading), the contract item's text or the scope's proof policy, and the item reads `unknown` until you judge it again.
-- **`candidate:<sha>` tag** on the handoff row that delivers a build, with a `slice:` tag on the same row. `rig view show execution` reads the newest one as the slice's built commit, and joins reviews and tests to that commit.
-- **`merged:<pr-number>` tag** on a row bound to the slice when its PR merges. It is a recorded report, not a verified merge: the execution view shows it on the merged rung, and it turns the answer only when the same row's `candidate:<sha>` resolves to the built commit and ancestry says not merged (a squash or rebase merge).
-- **`arrangement.source.integration_ref`** in `mission.yaml` is the ref the execution view tests a candidate's ancestry against (`main` when unset), so a mission that integrates somewhere else reads as not merged until you set it.
-- **`worktree_path=<absolute path>`** alone on a line in the body of the rows you dispatch, review, verify and build on: the execution view reads the lane's branch and head from it, and runs the merge test in the first reachable one on the mission's rows. With none, merged reads indeterminate.
 
 ## Verify (deterministic backstop)
 
