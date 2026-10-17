@@ -1423,7 +1423,9 @@ describe("RestoreOrchestrator", () => {
       if (!result.ok) return;
       expect(result.result.rigResult).toBe("partially_restored");
       expect(result.result.nodes[0]!.status).toBe("attention_required");
-      expect(result.result.nodes[0]!.error).toContain("does not positively identify runtime 'claude-code'");
+      expect(result.result.nodes[0]!.error).toContain("did not pass the process check for runtime 'claude-code'");
+      // The fixture's pane pid is not in the real process table, so the check cannot say what runs in the pane.
+      expect(result.result.nodes[0]!.error).toContain("could not be found in the process listing");
       expect(db.prepare("SELECT verdict, reason FROM seat_identity_verdicts WHERE node_id = ?")
         .get(result.result.nodes[0]!.nodeId)).toEqual({ verdict: "mismatch", reason: "process_identity_ambiguous" });
     },
