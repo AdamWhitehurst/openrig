@@ -632,9 +632,10 @@ handover successors longer to become interactive. The setting accepts 1–600
 seconds, applies to the next launch without a daemon restart, and can also be
 set with `OPENRIG_RUNTIME_READINESS_TIMEOUT_SECONDS`. It also bounds how long a
 restore keeps watching a Claude seat whose resume is still starting, so raising
-it for slow fresh launches lengthens that wait too. After the usual 3.2-second
-check the adapter polls for about the rest of the setting (nominally: it counts
-polls, and each poll's tmux and process reads add a little), per seat. A restore
+it for slow fresh launches lengthens that wait too. The wait is about the
+setting in total per seat, counting the usual 3.2-second check: the adapter polls
+for the rest of it (nominally: it counts polls, and each poll's tmux and process
+reads add a little). A restore
 starts seats one after another, so each seat that never starts Claude adds up to
 about this much, minus the 3.2 seconds, to the restore; the time adds up seat by
 seat, and a longer setting means a longer wait before a stuck seat is reported.
