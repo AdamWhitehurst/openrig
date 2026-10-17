@@ -2124,7 +2124,7 @@ describe("RestoreOrchestrator", () => {
     }
   });
 
-  it("restore hands one slow-start allowance to every seat, so several slow resumes do not stack their waits", async () => {
+  it("restore threads no shared allowance: each seat's launch is handed only its own request", async () => {
     const rig = rigRepo.createRig("test-rig");
     db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-slow", rig.id, "Dev");
     const sessions: string[] = [];
@@ -2140,11 +2140,10 @@ describe("RestoreOrchestrator", () => {
     for (const id of sessions) sessionRegistry.updateStatus(id, "exited");
     db.prepare("DELETE FROM bindings WHERE node_id IN (SELECT id FROM nodes WHERE rig_id = ?)").run(rig.id);
 
-    // Each launch spends what it is allowed, as a stuck Claude would: the first takes all of it.
-    const seen: Array<{ budget: unknown; remainingOnEntry: number | undefined }> = [];
-    const launchSpy = vi.fn(async (_binding: unknown, opts: { slowStartBudget?: { remainingMs: number } }) => {
-      seen.push({ budget: opts.slowStartBudget, remainingOnEntry: opts.slowStartBudget?.remainingMs });
-      if (opts.slowStartBudget) opts.slowStartBudget.remainingMs = 0;
+    // A slow seat's wait is its own per-seat bound, decided inside the adapter; nothing restore-wide is handed down.
+    const seen: Array<Record<string, unknown>> = [];
+    const launchSpy = vi.fn(async (_binding: unknown, opts: Record<string, unknown>) => {
+      seen.push(opts);
       return { ok: false as const, error: "Claude resume did not finish; the launch was kept", recovery: "attention_required" as const, evidence: "still starting" };
     });
     const mockAdapter = {
@@ -2162,10 +2161,7 @@ describe("RestoreOrchestrator", () => {
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.result.nodes.map((node) => node.status)).toEqual(["attention_required", "attention_required", "attention_required"]);
     expect(seen).toHaveLength(3);
-    // One object for the whole restore, starting at the readiness setting (30 s by default), already spent for the later seats.
-    expect(seen[1]!.budget).toBe(seen[0]!.budget);
-    expect(seen[2]!.budget).toBe(seen[0]!.budget);
-    expect(seen.map((entry) => entry.remainingOnEntry)).toEqual([30_000, 0, 0]);
+    for (const opts of seen) expect(Object.keys(opts).sort()).toEqual(["name", "resumeToken"]);
   });
 
   it("pod-aware chooser attention preserves the attempted native token for no-input reconciliation", async () => {

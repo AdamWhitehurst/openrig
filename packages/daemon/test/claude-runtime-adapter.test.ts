@@ -658,7 +658,7 @@ describe("Claude Code runtime adapter", () => {
     const WAIT_MS = 6_000;
 
     // `screen(read)` is the pane text on the nth capture; `rows(read)` the process list at that point.
-    const run = async (opts: { screen?: (read: number) => string; rows?: (read: number) => typeof occupied; paneCommand?: string; readinessTimeoutMs?: number; budget?: { remainingMs: number } } = {}) => {
+    const run = async (opts: { screen?: (read: number) => string; rows?: (read: number) => typeof occupied; paneCommand?: string; readinessTimeoutMs?: number } = {}) => {
       let reads = 0;
       const tmux = mockTmux();
       (tmux.getPaneCommand as ReturnType<typeof vi.fn>).mockResolvedValue(opts.paneCommand ?? "sh");
@@ -666,7 +666,7 @@ describe("Claude Code runtime adapter", () => {
       (tmux as unknown as { getPanePid: unknown }).getPanePid = vi.fn(async () => 10);
       const adapter = new ClaudeCodeAdapter({ tmux, fsOps: mockFs(), sleep: async () => {}, readinessTimeoutMs: opts.readinessTimeoutMs ?? WAIT_MS,
         listProcesses: () => (opts.rows ?? (() => occupied))(reads) });
-      const result = await adapter.launchHarness({ ...makeBinding(), tmuxPane: "%1" }, { name: "dev-impl@test-rig", resumeToken: "abc-123", ...(opts.budget ? { slowStartBudget: opts.budget } : {}) });
+      const result = await adapter.launchHarness({ ...makeBinding(), tmuxPane: "%1" }, { name: "dev-impl@test-rig", resumeToken: "abc-123" });
       return { result, reads, tmux };
     };
 
@@ -769,30 +769,18 @@ describe("Claude Code runtime adapter", () => {
       expect(reads).toBe(17);
     });
 
-    it("several slow seats in one restore share one allowance, so their waits do not stack", async () => {
-      // 6s setting: 3.2s first window + 2.8s of extra wait for the whole restore.
-      const budget = { remainingMs: WAIT_MS - 3_200 };
-      const first = await run({ budget });
-      const second = await run({ budget });
-      const third = await run({ budget });
-      expect(first.reads).toBe(31);
-      expect(budget.remainingMs).toBe(0);
-      // The seats after the first get only their first window; they still end attention_required, token kept.
-      expect([second.reads, third.reads]).toEqual([17, 17]);
-      for (const seat of [first, second, third]) expect(seat.result).toMatchObject({ ok: false, recovery: "attention_required" });
-      expect(second.result).toMatchObject({ error: "Claude resume did not finish within 3s; Claude may still be starting, so the launch was kept" });
-      // Unshared, three stuck seats would have read 31 + 31 + 31 times.
-      expect(first.reads + second.reads + third.reads).toBe(65);
+    it("stops waiting as soon as a real prompt appears during the extra wait: a gate won't clear itself", async () => {
+      // A trust prompt that shows up at read 22 ends the wait there; it is not a start in progress.
+      const gate = ["Accessing workspace:", "/project", "❯ 1. Yes, I trust this folder", "  2. No, exit"].join("\n");
+      const { result, reads } = await run({ screen: (read) => (read < 22 ? "" : gate) });
+      expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
+      expect(reads).toBeLessThan(26);
     });
 
-    it("a seat that comes up early spends only the wait it used, leaving the rest for the next", async () => {
-      const budget = { remainingMs: WAIT_MS - 3_200 };
-      const early = await run({ budget, screen: (read) => (read < 20 ? "" : tui) });
-      expect(early.result).toMatchObject({ ok: true });
-      // Polls 17 to 21 were the extra wait: five polls of 200 ms.
-      expect(budget.remainingMs).toBe(2_800 - 5 * 200);
-      const next = await run({ budget });
-      expect(next.reads).toBe(1 + 16 + 14 - 5);
+    it("the bound is per seat: three stuck seats launched one after another each wait their full bound", async () => {
+      const reads = [(await run()).reads, (await run()).reads, (await run()).reads];
+      // 16 quick polls, 14 more up to the 6 s test bound, and the read after them: 31 each, nothing carried over.
+      expect(reads).toEqual([31, 31, 31]);
     });
 
     it("waits and ends attention_required when tmux names Claude's version string and the screen is never recognised (#86)", async () => {

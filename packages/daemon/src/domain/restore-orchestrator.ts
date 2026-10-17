@@ -20,7 +20,6 @@ import type { PiResumeAdapter } from "../adapters/pi-resume.js";
 import type { OmpResumeAdapter } from "../adapters/omp-resume.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { assessNativeResumeProbe } from "./native-resume-probe.js";
-import { resolveReadinessTimeoutMs } from "./readiness-timeout.js";
 import { observeClaudeDelivery, observeClaudeResumeLaunch, verifyClaudePaneProcess, type ClaudeLaunchedProcess } from "./native-process-lineage.js";
 import { reanchorBuiltinStartupFile, reanchorShippedProjectionEntry } from "./builtin-startup-files.js";
 import { seatGuidance, restoreMissingGuidance, missingGuidanceBlocks } from "./restore-guidance.js";
@@ -396,10 +395,8 @@ export class RestoreOrchestrator {
       const restoreWarnings: string[] = [...validation.warnings];
       if (this.rigRepo.getRigNonInterruptive(rigId)) restoreWarnings.push(nonInterruptiveSummary(true));
       else if (opts?.nonInterruptive === false) restoreWarnings.push(nonInterruptiveSummary(false));
-      // Seats start one after another; one shared allowance keeps slow starts from stacking their waits.
-      const nodeOpts = { ...opts, slowStartBudget: { remainingMs: resolveReadinessTimeoutMs(undefined) } };
       for (const entry of plan) {
-        const result = await this.restoreNodeWithCompensation(entry, rigId, snapshotId, snapshot.data, nodeOpts, restoreWarnings);
+        const result = await this.restoreNodeWithCompensation(entry, rigId, snapshotId, snapshot.data, opts, restoreWarnings);
         nodeResults.push(result);
       }
 
@@ -519,8 +516,6 @@ export class RestoreOrchestrator {
 
     // Per-target tmux-liveness classification (runtime truth, fail-closed)
     const launched: RestoreNodeResult[] = [];
-    // One allowance for the whole subset: seats start one after another, so slow-start waits must not stack.
-    const slowStartBudget = { remainingMs: resolveReadinessTimeoutMs(undefined) };
     const alreadyRunning: Array<{ nodeId: string; logicalId: string }> = [];
     const failedTargets: Array<{ nodeId: string; logicalId: string; reason: string }> = [];
     // Subset-level aggregate of per-node warnings (incl. FR-5 derived-name
@@ -607,7 +602,7 @@ export class RestoreOrchestrator {
       // API result (FR-5 fallback observability must not be discarded here).
       const planEntry = { node };
       const result = await this.restoreNodeWithCompensation(
-        planEntry, rigId, snapshot.id, snapshot.data, { adapters: opts?.adapters, fsOps: opts?.fsOps, slowStartBudget }, subsetWarnings,
+        planEntry, rigId, snapshot.id, snapshot.data, { adapters: opts?.adapters, fsOps: opts?.fsOps }, subsetWarnings,
       );
       launched.push(result);
     }
@@ -846,7 +841,7 @@ export class RestoreOrchestrator {
     rigId: string,
     snapshotId: string,
     data: SnapshotData,
-    opts?: { adapters?: Record<string, import("./runtime-adapter.js").RuntimeAdapter>; fsOps?: { exists(path: string): boolean }; freshLogicalIds?: string[]; slowStartBudget?: import("./runtime-adapter.js").SlowStartBudget },
+    opts?: { adapters?: Record<string, import("./runtime-adapter.js").RuntimeAdapter>; fsOps?: { exists(path: string): boolean }; freshLogicalIds?: string[] },
     warnings?: string[],
   ): Promise<RestoreNodeResult> {
     // Compare against the live logical target without changing saved post-launch inputs.
@@ -1099,7 +1094,7 @@ export class RestoreOrchestrator {
     data: SnapshotData,
     sessionName: string,
     launchResult?: { ok: true; sessionName: string; session: import("./types.js").Session; binding: import("./types.js").Binding },
-    opts?: { adapters?: Record<string, import("./runtime-adapter.js").RuntimeAdapter>; fsOps?: { exists(path: string): boolean }; freshLogicalIds?: string[]; slowStartBudget?: import("./runtime-adapter.js").SlowStartBudget },
+    opts?: { adapters?: Record<string, import("./runtime-adapter.js").RuntimeAdapter>; fsOps?: { exists(path: string): boolean }; freshLogicalIds?: string[] },
     warnings?: string[],
     priorState?: { binding: import("./types.js").Binding | null; sessions: { id: string; status: string }[] },
   ): Promise<RestoreNodeResult> {
@@ -1424,7 +1419,6 @@ export class RestoreOrchestrator {
               resumeType: (isPodAware && resumeRequested) ? resumeType ?? undefined : undefined,
               sessionName: sessionName,
               allowFreshFallback: !(isPodAware && resumeRequested),
-              ...(opts?.slowStartBudget ? { slowStartBudget: opts.slowStartBudget } : {}),
             });
             warnings?.push(...(startupResult.warnings ?? []));
             if (startupResult.ok) {

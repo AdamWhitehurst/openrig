@@ -10,10 +10,10 @@ import type {
   InstalledResource, ProjectionResult, StartupDeliveryResult, ReadinessResult,
   HarnessLaunchResult,
 } from "../domain/runtime-adapter.js";
-import { resolveConcreteHint, type SlowStartBudget } from "../domain/runtime-adapter.js";
-import { resolveReadinessTimeoutMs } from "../domain/readiness-timeout.js";
+import { resolveConcreteHint } from "../domain/runtime-adapter.js";
 import type { ProjectionPlan, ProjectionEntry } from "../domain/projection-planner.js";
 import { assessNativeResumeProbe } from "../domain/native-resume-probe.js";
+import { resolveReadinessTimeoutMs } from "../domain/readiness-timeout.js";
 import { observeClaudeDelivery, observeClaudePaneProcess, observeClaudePaneRuntime, type ClaudeLaunchedProcess, type NativeProcessLister } from "../domain/native-process-lineage.js";
 import { mergeManagedBlock, DEFAULT_CLAUDE_MANAGED_BLOCK_FILE, type ClaudeManagedBlockFile } from "../domain/managed-blocks.js";
 import { claudeResumeLaunchEnv, claudeResumeLaunchPrefix } from "./claude-resume-launch.js";
@@ -239,7 +239,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
 
   async launchHarness(
     binding: NodeBinding,
-    opts: { name: string; resumeToken?: string; forkSource?: import("../domain/runtime-adapter.js").ForkSource; slowStartBudget?: SlowStartBudget },
+    opts: { name: string; resumeToken?: string; forkSource?: import("../domain/runtime-adapter.js").ForkSource },
   ): Promise<HarnessLaunchResult> {
     binding = { ...binding };
     this.autoLaunches.delete(binding.nodeId);
@@ -343,7 +343,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       { binding: NodeBinding; token: string; executable?: string; fingerprint?: string; process?: ClaudeLaunchedProcess };
     this.autoLaunches.set(binding.nodeId, launch);
     if (opts.resumeToken) {
-      const verification = await this.verifyResumeLaunch(binding, opts.slowStartBudget);
+      const verification = await this.verifyResumeLaunch(binding);
       // The process readiness pinned first, if it observed one: the caller records it, not a later read.
       const launchedProcess = launch.process ? { launchedProcess: { ...launch.process } } : {};
       if (!verification.ok) return { ...verification, ...launchedProcess };
@@ -447,84 +447,78 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     return !(await observeClaudePaneRuntime(observation));
   }
 
-  /** One look at a resuming pane: a verdict when the pane shows one, null to keep watching. */
-  private async resumeVerdict(binding: NodeBinding): Promise<{ verdict: HarnessLaunchResult | null; definiteFailure: boolean; looksReady: boolean }> {
+  private async verifyResumeLaunch(binding: NodeBinding): Promise<HarnessLaunchResult> {
     const tmuxSession = binding.tmuxSession!;
-    const paneCommand = await this.tmux.getPaneCommand(tmuxSession);
-    const paneContent = (await this.tmux.capturePaneContent(tmuxSession, 40)) ?? "";
-    const probe = await this.assessManagedProbe(binding, paneCommand, paneContent);
-
-    if (probe.code === "no_conversation_found") {
-      return { verdict: {
-        ok: false,
-        error: "Claude resume failed: no conversation found for the requested session",
-        recovery: "retry_fresh",
-        missingConversation: true,
-      }, definiteFailure: false, looksReady: false };
-    }
-
-    if (probe.status === "resumed") {
-      return { verdict: { ok: true }, definiteFailure: false, looksReady: false };
-    }
-
-    // OPR.0.3.4.5: Claude resume-selection prompt -> attention_required,
-    // never timed-out. The menu is alive and recoverable; auto-selecting
-    // is governance BLOCKING. Surface evidence and exit immediately.
-    if (probe.status === "attention_required") {
-      return { verdict: {
-        ok: false,
-        error: probe.detail,
-        recovery: "attention_required",
-        evidence: paneContent.split("\n").slice(-12).join("\n"),
-      }, definiteFailure: false, looksReady: false };
-    }
-
-    if (this.autoDriveProviderPrompts && probe.code === "trust_gate") {
-      const enterResult = await this.tmux.sendKeys(tmuxSession, ["Enter"]);
-      if (!enterResult.ok) {
-        return { verdict: { ok: false, error: `Claude trust prompt auto-drive failed: ${enterResult.message}` }, definiteFailure: false, looksReady: false };
-      }
-    }
-    // Claude's own report that it can't continue (login), or that it waits for a person (trust, MCP approval), is
-    // no slow start; "returned to shell" is only the pane-command guess.
-    // A start still in progress can't have drawn Claude's ready screen. One that has, with its lineage unproven,
-    // is not a slow start, so it keeps the result it had before the watch.
-    const looksReady = assessNativeResumeProbe({ runtime: "claude-code", paneCommand, paneContent,
-      claudeAutoIdentityVerified: true, claudeResumeIdentityVerified: true }).status === "resumed";
-    return { verdict: null, looksReady, definiteFailure: (probe.status === "failed" && probe.code !== "returned_to_shell")
-      || probe.code === "trust_gate" || probe.code === "mcp_gate" };
-  }
-
-  private async verifyResumeLaunch(binding: NodeBinding, budget?: SlowStartBudget): Promise<HarnessLaunchResult> {
-    const tmuxSession = binding.tmuxSession!;
+    // A quick window, then a longer one only while the boot is still in progress, as the Codex adapter does it.
+    // The longer one runs to the time a fresh launch gets before its readiness timeout, counted from the launch
+    // and in polls; it is per seat, nothing is shared across the seats of a restore.
     const pollMs = 200;
     const windowAttempts = 16;
-    // A resume that is slow, not failed, gets the time a fresh launch gets before its readiness timeout, counted
-    // from the launch and in polls. A restore shares one allowance across its seats (they start one after another).
     let attempts = windowAttempts;
     let slowStart = false;
 
     for (let attempt = 0; attempt < attempts; attempt++) {
-      const { verdict, definiteFailure, looksReady } = await this.resumeVerdict(binding);
-      if (verdict) {
-        if (budget) budget.remainingMs -= Math.max(0, attempt + 1 - windowAttempts) * pollMs;
-        return verdict;
+      const paneCommand = await this.tmux.getPaneCommand(tmuxSession);
+      const paneContent = (await this.tmux.capturePaneContent(tmuxSession, 40)) ?? "";
+      const probe = await this.assessManagedProbe(binding, paneCommand, paneContent);
+
+      if (probe.code === "no_conversation_found") {
+        return {
+          ok: false,
+          error: "Claude resume failed: no conversation found for the requested session",
+          recovery: "retry_fresh",
+          missingConversation: true,
+        };
       }
 
-      // The first window is over. A pane provably back at its shell ends here, as does a definite failure or an
-      // occupant that isn't this launch's Claude; anything else is a slow start.
-      if (attempt === windowAttempts - 1 && !definiteFailure
-        && !(await this.paneReturnedToShell(binding, await this.tmux.getPaneCommand(tmuxSession)))
-        && await this.occupantIsOurStart(binding, looksReady)) {
-        slowStart = true;
-        const extraMs = Math.max(0, resolveReadinessTimeoutMs(this.readinessTimeoutMs) - windowAttempts * pollMs);
-        attempts = windowAttempts + Math.floor(Math.min(extraMs, budget?.remainingMs ?? extraMs) / pollMs);
+      if (probe.status === "resumed") {
+        return { ok: true };
+      }
+
+      // OPR.0.3.4.5: Claude resume-selection prompt -> attention_required,
+      // never timed-out. The menu is alive and recoverable; auto-selecting
+      // is governance BLOCKING. Surface evidence and exit immediately.
+      if (probe.status === "attention_required") {
+        return {
+          ok: false,
+          error: probe.detail,
+          recovery: "attention_required",
+          evidence: paneContent.split("\n").slice(-12).join("\n"),
+        };
+      }
+
+      if (this.autoDriveProviderPrompts && probe.code === "trust_gate") {
+        const enterResult = await this.tmux.sendKeys(tmuxSession, ["Enter"]);
+        if (!enterResult.ok) {
+          return { ok: false, error: `Claude trust prompt auto-drive failed: ${enterResult.message}` };
+        }
+        await this.sleep(200);
+        continue;
+      }
+
+      // Only a boot in progress (no verdict, no gate, a label that proves nothing) is worth waiting for; a real
+      // gate (login, trust or MCP approval, auto-mode identity) won't clear itself.
+      const booting = probe.code === "awaiting_runtime" || probe.code === "returned_to_shell";
+      if (slowStart && !booting) {
+        slowStart = false;
+        break;
+      }
+      // The first window is over. A pane provably back at its shell ends here, as does anything that isn't a boot in
+      // progress or isn't this launch's own start (a ready-looking screen, another conversation's Claude).
+      if (attempt === windowAttempts - 1 && booting) {
+        const looksReady = assessNativeResumeProbe({ runtime: "claude-code", paneCommand, paneContent,
+          claudeAutoIdentityVerified: true, claudeResumeIdentityVerified: true }).status === "resumed";
+        if (!(await this.paneReturnedToShell(binding, await this.tmux.getPaneCommand(tmuxSession)))
+          && await this.occupantIsOurStart(binding, looksReady)) {
+          const extraMs = Math.max(0, resolveReadinessTimeoutMs(this.readinessTimeoutMs) - windowAttempts * pollMs);
+          attempts = windowAttempts + Math.floor(extraMs / pollMs);
+          slowStart = attempts > windowAttempts;
+        }
       }
       if (attempt < attempts - 1) {
         await this.sleep(pollMs);
       }
     }
-    if (budget) budget.remainingMs -= (attempts - windowAttempts) * pollMs;
 
     const finalCommand = await this.tmux.getPaneCommand(tmuxSession);
     const finalContent = (await this.tmux.capturePaneContent(tmuxSession, 40)) ?? "";
@@ -563,7 +557,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
 
     if (slowStart) {
       // Claude, or the script about to start it, may still be coming up. Keep the launch and its resume token for
-      // a person (or the reconciler) rather than failing a seat that may be running.
+      // a person (or the reconciler) rather than failing a seat that may be running. Never `resumed` from this.
       return {
         ok: false,
         error: `Claude resume did not finish within ${Math.round(attempts * pollMs / 1000)}s; Claude may still be starting, so the launch was kept`,

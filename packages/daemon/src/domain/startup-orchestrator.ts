@@ -8,7 +8,7 @@ import { isClaudeResumeType } from "../adapters/claude-resume.js";
 import type { StartupAction, StartupProofSelection, StartupFailureStage } from "./types.js";
 import type {
   RuntimeAdapter, NodeBinding, ResolvedStartupFile,
-  ProjectionResult, StartupDeliveryResult, ForkSource, SlowStartBudget,
+  ProjectionResult, StartupDeliveryResult, ForkSource,
 } from "./runtime-adapter.js";
 import { isAttentionRequiredReadinessCode, resolveConcreteHint } from "./runtime-adapter.js";
 import type { ProjectionPlan } from "./projection-planner.js";
@@ -162,8 +162,6 @@ export interface StartupInput {
   skipHarnessLaunch?: boolean;
   /** Allow runtime adapter retry_fresh fallback when native resume data is stale. */
   allowFreshFallback?: boolean;
-  /** One restore's shared allowance for resumes that are slow to start (see SlowStartBudget). */
-  slowStartBudget?: SlowStartBudget;
   /** Exact resume preserves saved context; its empty Claude plan must not disable activity hooks. */
   preserveStartupContext?: boolean;
   /** Continue the same fresh occupant after a prerequisite, without another harness launch. */
@@ -415,7 +413,6 @@ export class StartupOrchestrator {
             name: input.sessionName ?? input.binding.tmuxSession ?? "",
             resumeToken: launchResumeToken,
             ...(input.forkSource && !launchResumeToken ? { forkSource: input.forkSource } : {}),
-            ...(input.slowStartBudget ? { slowStartBudget: input.slowStartBudget } : {}),
           });
           if (launchResult.ok) {
             appliedLaunch = launchResult.appliedLaunch;
