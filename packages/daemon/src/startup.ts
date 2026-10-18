@@ -29,6 +29,7 @@ import { TmuxAdapter } from "./adapters/tmux.js";
 import { setDaemonTmuxServer, tmuxServerArgs } from "./adapters/tmux-server.js";
 import { CmuxAdapter } from "./adapters/cmux.js";
 import { execArgvCommand, execCommand } from "./adapters/tmux-exec.js";
+import { tmuxControlExec } from "./adapters/tmux-control.js";
 import { boundedProbeExec } from "./adapters/bounded-probe-exec.js";
 import { execPreflightCommand } from "./adapters/preflight-exec.js";
 import { createCmuxCliTransport } from "./adapters/cmux-transport.js";
@@ -176,6 +177,7 @@ import type { NotificationAdapter } from "./domain/mission-control/notification-
 import { OPENRIG_HOME } from "./openrig-compat.js";
 import { homeIsolationAdvisory } from "./domain/home-isolation.js";
 import { materializeBuiltinPolicyReference } from "./domain/builtin-policy-reference.js";
+import { withAgentAppResolver, withAgentApps } from "./adapters/agent-app-runtime-adapter.js";
 import { ensureActivityHookToken, writeActivityEndpointFile, deriveActivityUrl, readActivityEndpointFile } from "./domain/activity-endpoint.js";
 import {
   getCompatibleOpenRigPath,
@@ -490,8 +492,12 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   const watchdogHistoryLogInstance = new WatchdogHistoryLog(db);
 
   // An injected string exec keeps the shell path, so its fake sees every command. OPENRIG_TMUX_SHELL=1 keeps it too.
-  const argvExec = opts?.argvExec
+  const spawnedArgvExec = opts?.argvExec
     ?? (opts?.tmuxExec || (process.env.OPENRIG_TMUX_SHELL === "1" && process.platform !== "win32") ? undefined : execArgvCommand);
+  // OPENRIG_TMUX_CONTROL=1 drives the real tmux through one control-mode client (tmux-control.ts); by default a client
+  // is spawned per command. An injected exec is the test's own, and psmux has no control mode.
+  const argvExec = spawnedArgvExec === execArgvCommand && process.platform !== "win32" && process.env.OPENRIG_TMUX_CONTROL === "1"
+    ? tmuxControlExec(execArgvCommand) : spawnedArgvExec;
   const tmuxAdapter = new TmuxAdapter(opts?.tmuxExec ?? execCommand, undefined, argvExec);
   // The real tmux runs with this process's environment, so its server is the one $TMUX names.
   // An injected exec has no server of its own: printed attach commands stay in the default form.
@@ -1018,7 +1024,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     db, rigRepo, podRepo,
     sessionRegistry, eventBus, nodeLauncher, startupOrchestrator,
     fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf-8"), exists: (p: string) => fs.existsSync(p) },
-    adapters: { "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() },
+    adapters: withAgentApps({ "claude-code": claudeAdapter, "codex": codexAdapter, "pi": piAdapter, "omp": ompAdapter, "stub": stubAdapter, "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter() }, { tmux: tmuxAdapter, seatLaunchEnvironment }),
     tmuxAdapter,
     agentImageLibrary,
     continuityPolicyMaterializer,
@@ -1235,14 +1241,14 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
   // Capture compatibility before the spec-library initializer creates the primary directory.
   const userSpecLibraryRoot = getDefaultOpenRigPath("specs");
   const compatibleSpecLibraryRoot = getCompatibleOpenRigPath("specs");
-  const runtimeAdaptersMap = {
+  const runtimeAdaptersMap = withAgentAppResolver({
     "claude-code": claudeAdapter,
     "codex": codexAdapter,
     "pi": piAdapter,
     "omp": ompAdapter,
     "stub": stubAdapter,
     "terminal": new (await import("./adapters/terminal-adapter.js")).TerminalAdapter(),
-  };
+  }, { tmux: tmuxAdapter, seatLaunchEnvironment });
 
   const deps: AppDeps = {
     rigRepo,
@@ -2135,6 +2141,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
                 limit,
               }),
               getParkWake: (qitemId: string) => queueRepoInstance.getParkWakeStatus(qitemId),
+              servedByOwnReminder: (qitemId: string) => queueRepoInstance.parkWakeServedByOwnReminder(qitemId),
             };
             return diagnoseRigParked(
               parkedDeps,
@@ -2272,7 +2279,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     {
       const { ModelDivergenceMonitor } = await import("./domain/model-divergence/model-divergence-monitor.js");
       const { readClaudeEffectiveModel, readCodexEffectiveModel } = await import("./domain/model-divergence/effective-model-readers.js");
-      const { resolveIdentityVerifiedClaudeRecord, resolveLiveCodexThreadId } = await import("./domain/model-divergence/current-generation-record.js");
+      const { readCurrentPiOccupantModel, resolveIdentityVerifiedClaudeRecord, resolveLiveCodexThreadId } = await import("./domain/model-divergence/current-generation-record.js");
       const { defaultListProcesses } = await import("./domain/resume-metadata-refresher.js");
       const { readCodexThreadIdFromCandidateHomes, defaultResolveHomeDirByPid } = await import("./domain/codex-thread-id.js");
       const nodeOs = await import("node:os");
@@ -2344,6 +2351,19 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
             return model
               ? { ok: true as const, model }
               : { ok: false as const, reason: `no assistant turn yet in the current occupant record ${selection.path} (selected from ${selection.source})` };
+          }
+          if (seat.runtime === "pi") {
+            const binding = sessionRegistry.getBindingForNode(seat.nodeId);
+            return readCurrentPiOccupantModel({
+              sessionName: seat.sessionName,
+              pinnedModel: seat.pinnedModel,
+              generation: seat.generation,
+              occupantBootAt: sessionRegistry.currentOccupantTenure(seat.nodeId)?.bootAt ?? null,
+              binding: binding ? { tmuxSession: binding.tmuxSession, tmuxPane: binding.tmuxPane } : null,
+              runner: piAdapter.readRunnerSidecar(seat.sessionName),
+            }, genDeps, (path) => {
+              try { return nodeFs.realpathSync(path); } catch { return null; }
+            });
           }
           return { ok: false as const, reason: `runtime ${seat.runtime ?? "unknown"} has no effective-model reader yet` };
         },

@@ -9,7 +9,7 @@ import type { NodeInventoryEntry, PersistedEvent } from "./types.js";
 import { deriveCanonicalFromEntry, getNodeInventory } from "./node-inventory.js";
 import { deriveSessionName, parseSessionName } from "./session-name.js";
 import type { NodeLauncher } from "./node-launcher.js";
-import type { StartupOrchestrator } from "./startup-orchestrator.js";
+import type { PendingStartupContext, StartupOrchestrator } from "./startup-orchestrator.js";
 import type { RuntimeAdapter, ResolvedStartupFile } from "./runtime-adapter.js";
 import type { ProjectionEntry, ProjectionPlan } from "./projection-planner.js";
 import type { StartupAction } from "./types.js";
@@ -37,6 +37,8 @@ import {
   CodexInPlaceRestart, type InPlaceCodexLauncher, type InPlaceRestartIo, type InPlaceRestartRefusal,
   type InPlaceRestartReport, type InPlaceRestartTarget, type InPlaceVerifyResult,
 } from "./seat-restart-in-place.js";
+import { seatAdapter } from "../adapters/agent-app-runtime-adapter.js";
+import { sessionAgentAppSelect } from "./session-registry.js";
 
 /**
  * S5 (OPR.0.5.4.7) — the seat-lifecycle verb surface: set-model, single-seat stop,
@@ -216,6 +218,7 @@ interface LatestSessionRow {
   session_name: string;
   status: string;
   origin: string;
+  agent_app?: string | null;
 }
 
 interface PersistedStartupContextRow {
@@ -714,32 +717,33 @@ export class SeatLifecycleService {
     return { ok: true, seat, actions: { sessionsExited, bindingCleared: binding !== null } };
   }
 
-  /** Finish context delivery to the same fresh occupant after its native gate.
+  /** Finish context delivery to the same fresh or forked occupant after its native gate.
    * This never launches a process or replays an uncertain/finished delivery.
    */
-  async continueFreshStartup(seatRef: string) {
+  async continueStartup(seatRef: string) {
     const resolved = this.resolveSeat(seatRef);
     if ("code" in resolved) return resolved;
     const guard = this.tmuxAdapter.deliveryGuard;
     return guard
-      ? guard.lifecycle([resolved.nodeId], () => this.continueFreshStartupUnchecked(seatRef))
-      : this.continueFreshStartupUnchecked(seatRef);
+      ? guard.lifecycle([resolved.nodeId], () => this.continueStartupUnchecked(seatRef))
+      : this.continueStartupUnchecked(seatRef);
   }
 
-  private async continueFreshStartupUnchecked(seatRef: string) {
+  private async continueStartupUnchecked(seatRef: string) {
     const resolved = this.resolveSeat(seatRef);
     if ("code" in resolved) return resolved;
     const seat = this.describe(resolved);
     const node = this.rigRepo.getRig(seat.rigId)?.nodes.find((n) => n.id === seat.nodeId);
     const session = this.latestSession(seat.nodeId);
     const binding = this.sessionRegistry.getBindingForNode(seat.nodeId);
+    const pending = session && this.startupOrchestrator?.pendingStartupContext(seat.nodeId, session.id);
     if (!node || !session || !binding?.tmuxSession || !this.startupOrchestrator
-      || !this.startupOrchestrator.canContinueFresh(node.id, session.id)) {
-      return { ok: false as const, code: "continuation_unavailable", message: "No verified pending fresh-context delivery exists for this occupant. Refresh to inspect its actual state." };
+      || !pending) {
+      return { ok: false as const, code: "continuation_unavailable", message: "No verified pending startup-context delivery exists for this occupant. Refresh to inspect its actual state." };
     }
     const pane = await observeSolePane(this.tmuxAdapter, binding.tmuxSession);
     if (!pane.ok || pane.pane !== binding.tmuxPane) return { ok: false as const, code: "binding_changed", message: "The managed terminal binding changed; context was not delivered." };
-    const adapter = node.runtime ? this.runtimeAdapters[node.runtime] : undefined;
+    const adapter = seatAdapter(this.runtimeAdapters, node.runtime, session.agent_app);
     if (!adapter) return { ok: false as const, code: "runtime_adapter_missing", message: "The configured runtime adapter is unavailable." };
     const ready = await adapter.checkReady({ ...binding, cwd: node.cwd ?? "." });
     if (!ready.ready) return { ok: false as const, code: "attention_required", message: ready.reason ?? "Resolve the native prerequisite first." };
@@ -749,15 +753,16 @@ export class SeatLifecycleService {
     // Recheck after the asynchronous native observation; startNode immediately
     // records pending before its first await, consuming the retained permission.
     if (this.latestSession(node.id)?.id !== session.id || this.sessionRegistry.getBindingForNode(node.id)?.tmuxPane !== pane.pane
-      || !this.startupOrchestrator.canContinueFresh(node.id, session.id)) return { ok: false as const, code: "continuation_unavailable", message: "Startup changed during the readiness check. Refresh." };
+      || !this.stillPending(node.id, session.id, pending)) return { ok: false as const, code: "continuation_unavailable", message: "Startup changed during the readiness check. Refresh." };
     const result = await this.startupOrchestrator.startNode({
       rigId: seat.rigId, nodeId: node.id, sessionId: session.id,
       binding: { ...binding, cwd: node.cwd ?? ".", model: node.model ?? undefined, effort: resolveSeatEffort(node).effective ?? undefined, codexConfigProfile: node.codexConfigProfile ?? undefined },
       adapter, plan: startup.context.plan, resolvedStartupFiles: startup.context.resolvedStartupFiles,
-      startupActions: startup.context.startupActions, isRestore: false,
-      sessionName: session.session_name, skipHarnessLaunch: true, continueFreshStartup: true, includeDurableObligations: true, allowFreshFallback: false,
+      startupActions: startup.context.startupActions, isRestore: pending.mode === "fork" && pending.isRestore,
+      sessionName: session.session_name, skipHarnessLaunch: true, continueFreshStartup: pending.mode === "fresh", includeDurableObligations: true, allowFreshFallback: false,
+      ...(pending.mode === "fork" ? { forkSource: { kind: "native_id" as const, value: pending.parentToken } } : {}),
     });
-    return { ...result, message: result.ok ? "Configured context delivered to the existing fresh conversation." : result.errors.join("; ") };
+    return { ...result, message: result.ok ? "Configured context delivered to the existing conversation." : result.errors.join("; ") };
   }
 
   /**
@@ -786,7 +791,7 @@ export class SeatLifecycleService {
         message: `Persisted startup context runtime '${startup.context.runtime}' does not match current node runtime '${node.runtime ?? "missing"}'.`,
       };
     }
-    const adapter = this.runtimeAdapters[node.runtime];
+    const adapter = seatAdapter(this.runtimeAdapters, node.runtime, this.latestSession(node.id)?.agent_app);
     if (!adapter) {
       return {
         ok: false as const,
@@ -806,6 +811,14 @@ export class SeatLifecycleService {
    * mismatched sessions. Return its session row or a refusal, including unknown pane
    * observations, without stopping, repairing, or starting a tmux server.
    */
+  /** Whether the context found before the native check is still owed. A fork continuation needs the exact
+   *  same pending event: its child is verified against that attempt. A fresh continuation keeps main's
+   *  check (fresh context still pending for this occupant), so another pending event doesn't refuse it. */
+  private stillPending(nodeId: string, sessionId: string, pending: PendingStartupContext): boolean {
+    const now = this.startupOrchestrator?.pendingStartupContext(nodeId, sessionId);
+    return pending.mode === "fork" ? now?.eventSeq === pending.eventSeq : now?.mode === "fresh";
+  }
+
   private async validateFreshCollision(resolved: ResolvedSeat, canonicalSessionName: string, stop: boolean): Promise<LatestSessionRow | SeatRefusal> {
     const currentSession = this.latestSession(resolved.nodeId);
     const currentBinding = this.sessionRegistry.getBindingForNode(resolved.nodeId);
@@ -1664,7 +1677,7 @@ export class SeatLifecycleService {
 
   private latestSession(nodeId: string): LatestSessionRow | null {
     const row = this.db.prepare(
-      "SELECT id, session_name, status, origin FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1",
+      `SELECT id, session_name, status, origin, ${sessionAgentAppSelect(this.db, "sessions")} AS agent_app FROM sessions WHERE node_id = ? ORDER BY id DESC LIMIT 1`,
     ).get(nodeId) as LatestSessionRow | undefined;
     return row ?? null;
   }

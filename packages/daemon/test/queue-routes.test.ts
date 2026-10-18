@@ -253,6 +253,37 @@ describe("queue routes", () => {
     expect(queueRepo.list({ limit: 100 })).toHaveLength(2);
   });
 
+  it("handoffAdvisory guides callers to rig queue handoff commands", async () => {
+    const source = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "task", nudge: false });
+    const res = await app.request(`/api/queue/${source.qitemId}/update`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+      body: JSON.stringify({ state: "done", closureReason: "handed_off_to", closureTarget: "next@r" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.handoffAdvisory?.status).toBe("unverified");
+    expect(body.handoffAdvisory?.message).toContain("rig queue handoff");
+    expect(body.handoffAdvisory?.message).toContain("handoff-and-complete");
+    expect(body.handoffAdvisory?.message).toContain("a local handoff is atomic");
+    expect(body.handoffAdvisory?.message).toContain("across hosts the successor is created first and the source closed after");
+    expect(body.handoffAdvisory?.message).toContain("re-running the same handoff is idempotent");
+  });
+
+  it("handoffAdvisory is not hidden by candidate with malformed chain_of_record", async () => {
+    const source = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "task", nudge: false });
+    const candidate = await queueRepo.create({ sourceSession: "b@r", destinationSession: "next@r", body: "corrupted candidate", nudge: false });
+    db.prepare("UPDATE queue_items SET chain_of_record = 'not-valid-json' WHERE qitem_id = ?").run(candidate.qitemId);
+
+    const res = await app.request(`/api/queue/${source.qitemId}/update`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "b@r" },
+      body: JSON.stringify({ state: "done", closureReason: "handed_off_to", closureTarget: "next@r" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.handoffAdvisory?.status).toBe("unverified");
+    expect(body.handoffAdvisory?.message).toContain("rig queue handoff");
+  });
+
   it("keeps legacy custody note appends and explicit reopen/repair available", async () => {
     const source = await queueRepo.create({ sourceSession: "a@r", destinationSession: "b@r", body: "legacy", nudge: false });
     queueRepo.update({ qitemId: source.qitemId, actorSession: "b@r",
@@ -1518,6 +1549,39 @@ describe("queue routes", () => {
     await expectLimitParsing(app, "/api/queue/list?destinationSession=b@r");
     await expectLimitParsing(app, "/api/queue/inbox/list?destinationSession=b@r");
     await expectLimitParsing(app, "/api/queue/outbox/list?senderSession=a@r");
+  });
+
+  it("GET /api/queue/overdue refuses only a positive limit SQLite cannot bind; every limit main serves is still served", async () => {
+    for (const body of ["one", "two", "three"]) {
+      const res = await app.request("/api/queue/create", {
+        method: "POST", headers: { "Content-Type": "application/json", "X-OpenRig-Session": "a@r" },
+        body: JSON.stringify({ destinationSession: "b@r", body, nudge: false }),
+      });
+      expect(res.status).toBe(201);
+    }
+    const overdue = db.prepare("UPDATE queue_items SET state = 'in-progress', closure_required_at = ? WHERE body = ?");
+    overdue.run("2026-01-01T00:00:01.000Z", "one");
+    overdue.run("2026-01-01T00:00:02.000Z", "two");
+    overdue.run("2026-01-01T00:00:03.000Z", "three");
+    const bodies = async (query: string) => {
+      const res = await app.request(`/api/queue/overdue${query}`);
+      return { status: res.status, bodies: res.status === 200 ? ((await res.json()) as Array<{ body: string }>).map((q) => q.body) : await res.json() };
+    };
+    const all = { status: 200, bodies: ["one", "two", "three"] };
+    expect(await bodies("")).toEqual(all);
+    expect(await bodies("?limit=2")).toEqual({ status: 200, bodies: ["one", "two"] });
+
+    // A positive limit SQLite cannot bind was a 500; it is now a 400.
+    for (const limit of ["9223372036854775296", "99999999999999999999"]) {
+      expect({ limit, ...(await bodies(`?limit=${limit}`)) })
+        .toEqual({ limit, status: 400, bodies: { error: "limit must be an integer" } });
+    }
+    // Every limit main serves keeps its answer: the largest bindable value, and the values the
+    // route's normalization drops (non-numeric, non-positive, and magnitudes that parse to Infinity).
+    const nines = "9".repeat(400);
+    for (const limit of ["9223372036854775295", "abc", "-1", "0", "-99999999999999999999", nines, `-${nines}`]) {
+      expect({ limit, ...(await bodies(`?limit=${limit}`)) }).toEqual({ limit, ...all });
+    }
   });
 
   it("GET /api/queue/list filters by destination + state", async () => {

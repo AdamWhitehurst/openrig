@@ -24,7 +24,7 @@ import { deriveCurrentWork, deriveRole, deriveWorkCandidates, type RoleOrientati
 import type { WhoamiService } from "../domain/whoami-service.js";
 import type Database from "better-sqlite3";
 import type { HumanQuestion } from "../domain/human-questions.js";
-import { queryLimit } from "./query-limit.js";
+import { queryLimit, SQL_LIMIT_BOUND } from "./query-limit.js";
 
 /**
  * Coordination L3 — Queue HTTP routes (PL-004 Phase A).
@@ -182,6 +182,23 @@ export function queueRoutes(): Hono {
         // misuse of a queue verb on a live workflow packet; structured
         // 400 with the what/why/fix message, never a 500.
         : err.code === "workflow_frontier_packet" ? 400
+        // Park/close input the caller can fix (wake options on a non-park transition, closure
+        // fields or blocked_on on a transition that cannot store them) are client errors, not
+        // daemon faults. wake_intent_store_unavailable, outbox_db_mismatch and
+        // terminal_close_without_wake_intent describe the daemon's own state and stay 500.
+        // blocker_not_found / blocker_not_live / blocker_malformed stay 500 on purpose: the CLI
+        // tests pin their exit code 2 (queue-update-metadata-reject-cli.test.ts).
+        : err.code === "closure_fields_not_admitted" ? 400
+        : err.code === "blocked_on_not_admitted" ? 400
+        : err.code === "wake_not_admitted" ? 400
+        : err.code === "wake_ambiguous" ? 400
+        : err.code === "wake_after_invalid" ? 400
+        : err.code === "wake_max_invalid" ? 400
+        : err.code === "wake_message_not_admitted" ? 400
+        : err.code === "wake_message_invalid" ? 400
+        : err.code === "wake_watchdog_not_live" ? 400
+        : err.code === "wake_watchdog_target_mismatch" ? 400
+        : err.code === "wake_self_blocker" ? 400
         : 500;
       return c.json({ error: err.code, message: err.message, ...(err.meta ?? {}) }, status as 200);
     }
@@ -1008,6 +1025,10 @@ export function queueRoutes(): Hono {
     const rig = q.rig || undefined;
     const limitRaw = q.limit !== undefined ? Number.parseInt(q.limit, 10) : undefined;
     const limit = limitRaw !== undefined && Number.isInteger(limitRaw) && limitRaw > 0 ? limitRaw : undefined;
+    // findOverdue binds the limit into SQL; refuse a value SQLite cannot bind rather than answer 500.
+    if (limit !== undefined && limit >= SQL_LIMIT_BOUND) {
+      return c.json({ error: "limit must be an integer" }, 400);
+    }
     const compact = q.compact === "1" || q.compact === "true";
     const items = getRepo(c).findOverdue({ rig, limit, compact });
     return c.json(items);
@@ -1036,7 +1057,9 @@ export function queueRoutes(): Hono {
 
   // GET /recent-transitions — one bounded, read-only topology chronology over
   // typed queue state/closure facts. `scope=instance` spans local rigs in ONE
-  // read; a rig query stays backward-compatible. MUST precede /:qitemId.
+  // read; a rig query stays backward-compatible. Each entry's `summary` is the authored
+  // subject (null when none); `bodyPreview` is display text derived from the body for a row
+  // with no summary (see RecentQueueTransition). MUST precede /:qitemId.
   app.get("/recent-transitions", (c) => {
     const scopeKind = c.req.query("scope")?.trim();
     const rig = c.req.query("rig")?.trim();
