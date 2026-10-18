@@ -833,7 +833,7 @@ describe("Claude Code runtime adapter", () => {
         const other = { ...claude, command: "claude --permission-mode acceptEdits --resume some-other-session --name other" };
         expect((await run({ readinessTimeoutMs, rows: () => [{ ...pane, tpgid: 11 }, launchScript, other] })).result)
           .toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
-        expect((await run({ readinessTimeoutMs, rows: () => stuck, screen: () => "Not logged in · Run /login" })).result)
+        expect((await run({ readinessTimeoutMs, rows: () => stuck, screen: () => "● Not logged in · Please run /login" })).result)
           .toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
       });
     });
@@ -984,7 +984,7 @@ describe("Claude Code runtime adapter", () => {
     });
 
     it("does not wait for a Claude that says it needs a login: timed out as before", async () => {
-      const { result, reads } = await run({ screen: () => "Not logged in · Run /login" });
+      const { result, reads } = await run({ screen: () => "● Not logged in · Please run /login" });
       expect(result).toEqual({ ok: false, error: "Claude resume failed: timed out waiting for Claude to become active" });
       expect(reads).toBe(17);
     });
