@@ -1417,13 +1417,15 @@ describe("RestoreOrchestrator", () => {
         resumeToken: "tok",
       });
       const tmux = { ...mockTmux(), getPaneCommand: vi.fn(async () => command) } as unknown as TmuxAdapter;
-      const result = await createOrchestrator({ tmux, claude: mockClaudeResume({ ok: true }) }).restore(snap.id);
+      // An empty process table: the fixture's pane pid is not in it, so the check cannot say what runs in the pane.
+      const result = await createOrchestrator({ tmux, claude: mockClaudeResume({ ok: true }), listProcesses: async () => [] }).restore(snap.id);
 
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.result.rigResult).toBe("partially_restored");
       expect(result.result.nodes[0]!.status).toBe("attention_required");
-      expect(result.result.nodes[0]!.error).toContain("does not positively identify runtime 'claude-code'");
+      expect(result.result.nodes[0]!.error).toContain("did not pass the process check for runtime 'claude-code'");
+      expect(result.result.nodes[0]!.error).toContain("could not be found in the process listing");
       expect(db.prepare("SELECT verdict, reason FROM seat_identity_verdicts WHERE node_id = ?")
         .get(result.result.nodes[0]!.nodeId)).toEqual({ verdict: "mismatch", reason: "process_identity_ambiguous" });
     },
@@ -1918,7 +1920,7 @@ describe("RestoreOrchestrator", () => {
   });
 
   it.each(["exact", "requested-codex-type", "requested-legacy-type", "wrong-token", "foreign-process", "replaced-pane", "replaced-process",
-    "chooser", "login", "trust", "mcp", "error", "missing-token",
+    "chooser", "login", "login-footer", "trust", "mcp", "error", "missing-token",
     "hook-token", "hook-equal", "operator-token", "operator-equal", "hook-wrong-type", "hook-late", "hook-join", "hook-join-equal",
     "join-native-loss", "join-native-loss-hook",
     "join-native-loss-exited", "join-native-loss-foreign", "join-native-loss-replacement",
@@ -1944,11 +1946,13 @@ describe("RestoreOrchestrator", () => {
       // not a native launch or proof that Claude consumed a conversation.
       const gates: Record<string, string> = {
         chooser: "Choose a conversation to resume:\n  1. example",
-        login: "Not logged in · Run /login", trust: "Accessing workspace:\n/fixture\n1. Yes, I trust this folder\n2. No, exit",
+        login: "● Not logged in · Please run /login", trust: "Accessing workspace:\n/fixture\n1. Yes, I trust this folder\n2. No, exit",
         mcp: "new MCP servers found in .mcp.json\nSelect any you wish to enable\nEnter to confirm",
         error: "No conversation found",
       };
-      const screen = `${gates[mode] ?? "Restored conversation"}\n❯\u00a0\n  ⏵⏵ bypass permissions on (shift+tab to cycle)`;
+      // A current refusal blocks; the persistent not-logged-in footer under the input box does not (#1405).
+      const screen = `${gates[mode] ?? "Restored conversation"}\n❯\u00a0\n  ⏵⏵ bypass permissions on (shift+tab to cycle)`
+        + (mode === "login-footer" ? "\n                                   Not logged in · Run /login" : "");
       let launched = false, samples = 0;
       const protectedSource = mode.startsWith("hook-") ? "hook" : mode.startsWith("operator-") ? "operator" : null;
       const protectedToken = mode.endsWith("-equal") || mode === "hook-wrong-type" ? token : "protected-other-token";
@@ -2041,7 +2045,7 @@ describe("RestoreOrchestrator", () => {
         expect(db.prepare("SELECT resume_type, resume_token, resume_provenance FROM sessions WHERE id = ?").get(latest.id))
           .toEqual({ resume_type: "claude_id", resume_token: token, resume_provenance: "scrape" });
         expect(db.prepare("SELECT type FROM events WHERE node_id = ? AND type = 'node.startup_ready'").all(node.id)).toEqual([]);
-      } else if (mode === "exact" || mode === "requested-legacy-type" || mode.endsWith("-equal")) {
+      } else if (mode === "exact" || mode === "login-footer" || mode === "requested-legacy-type" || mode.endsWith("-equal")) {
         expect({ status: outcome.status, token: latest.resumeToken }).toEqual({ status: "resumed", token });
         expect(latest.id).not.toBe(old.id);
         expect(latest.startupStatus).toBe("ready");
@@ -2640,6 +2644,66 @@ describe("RestoreOrchestrator", () => {
       expect(result.result.warnings).not.toContain("Node dev.impl: resume was unavailable; launched fresh instead.");
       expect(launchHarness).toHaveBeenCalledTimes(1);
       expect(launchHarness.mock.calls[0]![1].resumeToken).toBe("stable-codex-token");
+    }
+  });
+
+  it("an agent app's seat stops at resume-unsupported even with a saved token, launching nothing", async () => {
+    const rig = rigRepo.createRig("test-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-agent-app", rig.id, "Dev");
+    const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "synth-app", podId: "pod-agent-app" });
+    const session = sessionRegistry.registerSession(node.id, "dev-impl@test-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+    // A token left by a former runtime: nothing resumes an agent app with it.
+    sessionRegistry.updateResumeToken(session.id, "codex_id", "former-runtime-token");
+    sessionRegistry.recordAgentAppSelection(session.id, "synth-app");
+    db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)").run(node.id, "[]", "[]", "[]", "synth-app");
+    const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+    sessionRegistry.updateStatus(session.id, "exited");
+    db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+
+    const launchHarness = vi.fn(async () => ({ ok: true as const }));
+    const mockAdapter = {
+      runtime: "synth-app",
+      listInstalled: vi.fn(async () => []),
+      project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+      deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+      checkReady: vi.fn(async () => ({ ready: true })),
+      launchHarness,
+    };
+
+    const orch = createOrchestrator();
+    const result = await orch.restore(snap.id, { adapters: { "synth-app": mockAdapter } });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const nodeResult = result.result.nodes.find((n) => n.nodeId === node.id);
+      expect(nodeResult!.status).toBe("awaiting-decision");
+      expect(nodeResult!.error).toBe(`Resume is unsupported for agent app "synth-app": its preset is launch-only. No session was started, and the earlier conversation is left as it is. Re-run with --fresh dev.impl only if you want a new conversation.`);
+      expect(launchHarness).not.toHaveBeenCalled();
+    }
+  });
+
+  it("a free-text runtime seat that wasn't launched for an agent app keeps the existing restore result", async () => {
+    const rig = rigRepo.createRig("test-rig");
+    db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-free-text", rig.id, "Dev");
+    const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "synth-app", podId: "pod-free-text" });
+    const session = sessionRegistry.registerSession(node.id, "dev-impl@test-rig");
+    sessionRegistry.updateStatus(session.id, "running");
+    sessionRegistry.updateResumeToken(session.id, "codex_id", "some-token");
+    db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)").run(node.id, "[]", "[]", "[]", "synth-app");
+    const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+    sessionRegistry.updateStatus(session.id, "exited");
+    db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+
+    const orch = createOrchestrator();
+    const result = await orch.restore(snap.id, { adapters: {} });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const nodeResult = result.result.nodes.find((n) => n.nodeId === node.id);
+      expect(nodeResult!.status).toBe("awaiting-decision");
+      expect(nodeResult!.error).toContain("Original session unresumable");
+      expect(nodeResult!.error).not.toContain("Resume is unsupported for agent app");
     }
   });
 
