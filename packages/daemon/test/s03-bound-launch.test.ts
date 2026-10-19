@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
 import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync, chmodSync, readFileSync, symlinkSync, renameSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync, chmodSync, readFileSync, symlinkSync, renameSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runInNewContext } from "node:vm";
@@ -208,7 +208,11 @@ else console.log(JSON.stringify(Object.fromEntries(['TMUX', 'TERM_PROGRAM', 'TER
   // xdg-open) that nothing in the editor or paste path uses; SSH_AUTH_SOCK is a credential channel.
   const withheldNames = ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "SSH_AUTH_SOCK", "TMUX", "TMUX_PANE"];
   const paneNames = [...sessionNames, "WAYLAND_DISPLAY", ...withheldNames];
-  async function runPane(f: ReturnType<typeof fixture>, pane: Record<string, string>, unset: string[] = []): Promise<Record<string, string>> {
+  // A managed launch runs as a staged script under /bin/sh, which is dash on Debian and Ubuntu. Run the cases under dash too
+  // when the host has it (OPENRIG_TEST_DASH names one).
+  const dash = [process.env.OPENRIG_TEST_DASH, "/usr/bin/dash", "/bin/dash"].find(file => file && existsSync(file));
+  const shells = ["/bin/sh", ...(dash ? [dash] : [])];
+  async function runPane(f: ReturnType<typeof fixture>, pane: Record<string, string>, unset: string[] = [], shell = "/bin/sh"): Promise<Record<string, string>> {
     writeFileSync(f.executable, `#!${process.execPath}\n
 if (process.argv.includes('--help')) console.log(${JSON.stringify(help)});
 else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
@@ -221,7 +225,7 @@ else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
     // Some shells set these themselves; model the absent case before the command expands them.
     const paneCommand = unset.length ? `unset ${unset.join(" ")}; ${command}` : command;
     const stdout = await new Promise<string>((resolve, reject) => {
-      native.execFile("/bin/sh", ["-c", paneCommand], { encoding: "utf8", timeout: 3000, env: { ...f.env, ...pane } },
+      native.execFile(shell, ["-c", paneCommand], { encoding: "utf8", timeout: 3000, env: { ...f.env, ...pane } },
         (error, out) => error ? reject(error) : resolve(out));
     });
     return JSON.parse(stdout);
@@ -237,19 +241,35 @@ else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
     expect(await runPane(f, { ...withheldInPane, ...sessionEnv }, [...unset, "WAYLAND_DISPLAY"]))
       .toEqual(Object.fromEntries(Object.entries(sessionEnv).filter(([, value]) => value !== "")));
   });
-  it.each([
+  const waylandCases: [string, Record<string, string>, string | undefined][] = [
     ["absolute", { WAYLAND_DISPLAY: "/run/user/1000/wayland-1", XDG_RUNTIME_DIR: "/run/user/1000" }, "/run/user/1000/wayland-1"],
     ["absolute with no XDG_RUNTIME_DIR", { WAYLAND_DISPLAY: "/run/user/1000/wayland-1" }, "/run/user/1000/wayland-1"],
     ["absolute outside the runtime dir", { WAYLAND_DISPLAY: "/elsewhere/sock", XDG_RUNTIME_DIR: "/run/user/1000" }, "/elsewhere/sock"],
     ["relative", { WAYLAND_DISPLAY: "wayland-1", XDG_RUNTIME_DIR: "/run/user/1000" }, "/run/user/1000/wayland-1"],
+    ["absolute with a space", { WAYLAND_DISPLAY: "/run/user/1000/way land", XDG_RUNTIME_DIR: "/run/user/1000" }, "/run/user/1000/way land"],
+    ["relative with a space", { WAYLAND_DISPLAY: "way land", XDG_RUNTIME_DIR: "/run/user/1000" }, "/run/user/1000/way land"],
+    ["relative in a runtime dir with a space", { WAYLAND_DISPLAY: "wayland-1", XDG_RUNTIME_DIR: "/run/my user/1000" }, "/run/my user/1000/wayland-1"],
+    ["absolute with a glob character", { WAYLAND_DISPLAY: "/run/user/1000/way*", XDG_RUNTIME_DIR: "/run/user/1000" }, "/run/user/1000/way*"],
+    ["relative with a glob character", { WAYLAND_DISPLAY: "wayland-*", XDG_RUNTIME_DIR: "/run/user/1000" }, "/run/user/1000/wayland-*"],
     ["relative with an empty XDG_RUNTIME_DIR", { WAYLAND_DISPLAY: "wayland-1", XDG_RUNTIME_DIR: "" }, undefined],
     ["relative with no XDG_RUNTIME_DIR", { WAYLAND_DISPLAY: "wayland-1" }, undefined],
     ["empty", { WAYLAND_DISPLAY: "", XDG_RUNTIME_DIR: "/run/user/1000" }, undefined],
     ["absent", { XDG_RUNTIME_DIR: "/run/user/1000" }, undefined],
-  ])("hands Claude an absolute WAYLAND_DISPLAY when the pane's is %s, without XDG_RUNTIME_DIR", async (_label, pane, expected) => {
+  ];
+  it.each(shells.flatMap(shell => waylandCases.map(([label, pane, expected]) => [label, shell, pane, expected] as const)))(
+    "hands Claude an absolute WAYLAND_DISPLAY when the pane's is %s under %s, without XDG_RUNTIME_DIR", async (_label, shell, pane, expected) => {
     const f = fixture();
     const unset = ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"].filter(key => !(key in pane));
-    expect(await runPane(f, { ...withheldInPane, ...pane }, unset)).toEqual(expected === undefined ? {} : { WAYLAND_DISPLAY: expected });
+    expect(await runPane(f, { ...withheldInPane, ...pane }, unset, shell)).toEqual(expected === undefined ? {} : { WAYLAND_DISPLAY: expected });
+  });
+  it("uses balanced case patterns and no unquoted substitution for WAYLAND_DISPLAY", async () => {
+    const f = fixture();
+    const cmd = (await f.managed.prepare({ nodeId: "node", session: "seat", pane: "%1" }, "auto")).command([]);
+    // An unbalanced `)` inside `$(…)` does not parse in bash before 4.0 or in macOS's /bin/sh; a bare `$(` word would be split.
+    expect(cmd).toContain("(/*) printf %s");
+    expect(cmd).toContain("(?*) if [");
+    expect(cmd).not.toMatch(/(^|\s)\$\(/);
+    expect(cmd).toContain('${__openrig_wayland_display:+"WAYLAND_DISPLAY=$__openrig_wayland_display"}');
   });
   it.each(["fresh", "resume", "fork", "legacy"])("names the editor and display session variables on a %s launch", async kind => {
     const f = fixture();
@@ -263,7 +283,7 @@ else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
     expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
     const cmd = f.calls[0]!;
     for (const key of sessionNames) expect(cmd).toContain(`\${${key}:+"${key}=$${key}"}`);
-    expect(cmd).toContain("printf 'WAYLAND_DISPLAY=%s'");
+    expect(cmd).toContain('"WAYLAND_DISPLAY=$__openrig_wayland_display"');
     // XDG_RUNTIME_DIR is read to resolve WAYLAND_DISPLAY, never forwarded as a variable.
     expect(cmd).not.toMatch(/XDG_RUNTIME_DIR=\$|"XDG_RUNTIME_DIR=/);
     for (const key of withheldNames.filter(key => key !== "XDG_RUNTIME_DIR")) expect(cmd).not.toContain(key);

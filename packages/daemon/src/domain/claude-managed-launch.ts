@@ -44,11 +44,16 @@ const PANE_TERMINAL_KEYS = ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_V
 const PANE_SESSION_KEYS = ["EDITOR", "VISUAL", "DISPLAY", "XAUTHORITY"];
 
 /** WAYLAND_DISPLAY without XDG_RUNTIME_DIR: a client resolves a relative socket name against XDG_RUNTIME_DIR, but an
- *  absolute path needs nothing else. Expanded in the pane shell: an absolute value is kept, a relative one is joined to
- *  the pane's XDG_RUNTIME_DIR, and a relative one with no XDG_RUNTIME_DIR (or an unset or empty one) leaves the name
- *  absent. The word is unquoted on purpose so that an empty result is no word at all. */
-const WAYLAND_DISPLAY_WORD = '$(case "${WAYLAND_DISPLAY-}" in /*) printf \'WAYLAND_DISPLAY=%s\' "$WAYLAND_DISPLAY";; ?*) '
-  + '[ -n "${XDG_RUNTIME_DIR-}" ] && printf \'WAYLAND_DISPLAY=%s/%s\' "$XDG_RUNTIME_DIR" "$WAYLAND_DISPLAY";; esac)';
+ *  absolute path needs nothing else. The pane shell computes the value into a variable ahead of `env -i`: an absolute
+ *  value is kept, a relative one is joined to the pane's XDG_RUNTIME_DIR, and a relative one with no XDG_RUNTIME_DIR (or
+ *  an unset or empty one) leaves the variable empty, so the name is never forwarded. An assignment is not word-split or
+ *  globbed, so a value with a space or a `*` arrives whole. The case patterns are balanced `(…)` so that shells that
+ *  mis-parse an unbalanced `)` inside `$(…)` (bash before 4.0, a macOS /bin/sh) accept it. The variable stays in the
+ *  shell that runs the command, which is a staged `/bin/sh` script for a managed launch; `env -i` does not pass it on. */
+const WAYLAND_DISPLAY_VAR = "__openrig_wayland_display";
+const WAYLAND_DISPLAY_ASSIGNMENT = `${WAYLAND_DISPLAY_VAR}=$(case "\${WAYLAND_DISPLAY-}" in (/*) printf %s "$WAYLAND_DISPLAY";; `
+  + `(?*) if [ -n "\${XDG_RUNTIME_DIR-}" ]; then printf %s/%s "$XDG_RUNTIME_DIR" "$WAYLAND_DISPLAY"; fi;; esac)`;
+const WAYLAND_DISPLAY_WORD = `\${${WAYLAND_DISPLAY_VAR}:+"WAYLAND_DISPLAY=$${WAYLAND_DISPLAY_VAR}"}`;
 
 export class ClaudeManagedLaunch {
   constructor(private readonly db: Database.Database,
@@ -206,7 +211,7 @@ export class ClaudeManagedLaunch {
     return Object.freeze({ assertCurrent, configDir: context.configDir, executable: context.executable, command: (args: readonly string[], launchEnv: Readonly<Record<string, string>> = {}) => {
       assertCurrent();
       const launch = Object.entries(launchEnv).map(([key, value]) => shellQuote(`${key}=${value}`));
-      return `cd ${shellQuote(cwd)} && /usr/bin/env -i ${[...assignments, ...forwarded, ...seatForwarded, ...projectForwarded, ...terminal, ...launch, shellQuote(context.executable), ...args.map(shellQuote)].join(" ")}`;
+      return `${WAYLAND_DISPLAY_ASSIGNMENT}; cd ${shellQuote(cwd)} && /usr/bin/env -i ${[...assignments, ...forwarded, ...seatForwarded, ...projectForwarded, ...terminal, ...launch, shellQuote(context.executable), ...args.map(shellQuote)].join(" ")}`;
     } });
   }
 }
