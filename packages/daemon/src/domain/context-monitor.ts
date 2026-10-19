@@ -339,7 +339,7 @@ export class ContextMonitor {
           // A live prompt does not deliver saved context. Check after the await:
           // startup may have reached an attention gate while we were observing.
           if (readPendingStartupContext(this.db, session.node_id, session.session_id)) return;
-          if (claude && this.requestedConversationDiffers(session)) return;
+          if (readiness.provedWithoutLaunch && this.requestedConversationDiffers(session)) return;
           this.db.prepare(`
             UPDATE sessions
             SET startup_status = 'ready',
@@ -362,8 +362,8 @@ export class ContextMonitor {
     }
   }
 
-  /** The conversation the failed start asked for, in addition to the recorded one (#1477). `node.startup_failed`'s
-   *  `requestedResumeToken` is written by the daemon and survives a restart; the SessionStart hook rewrites only
+  /** For a promotion the no-launch process proof made (#1477), the conversation the failed start asked for, in addition
+   *  to the recorded one. `node.startup_failed`'s `requestedResumeToken` is written by the daemon and survives a restart; the SessionStart hook rewrites only
    *  `sessions.resume_token`, so a record the hook moved to another conversation no longer matches the request. The
    *  same comparison the post-send reconcile makes (stored token, or a rotation that started from it). With no such
    *  event, or a null request (a fresh launch), or an event from before the fields existed, this holds nothing back,

@@ -9,8 +9,8 @@ import { binary, name, real, rotatedToken, rotation, rowsWith, seat, standIn, to
 const unproved = { ready: false, code: "claude_auto_identity_required" };
 
 describe("a banner-less auto-mode Claude with no launch record", () => {
-  it("is proved by the real binding and the exact conversation token", async () => {
-    expect((await seat().adapter.checkReady(real, { resumeToken: token })).ready).toBe(true);
+  it("is proved by the real binding and the exact conversation token, and says the process proved it", async () => {
+    expect(await seat().adapter.checkReady(real, { resumeToken: token })).toEqual({ ready: true, provedWithoutLaunch: true });
   });
 
   it("is proved without a frozen executable, as clear-attention proves it", async () => {
@@ -94,6 +94,7 @@ describe("a banner-less auto-mode Claude with no launch record", () => {
   it("still needs no token when the screen is already recognised", async () => {
     const { adapter, tmux } = seat();
     (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockResolvedValue("Claude Code v2.1.303\n" + autoScreen);
-    expect((await adapter.checkReady(real)).ready).toBe(true);
+    expect(await adapter.checkReady(real)).toEqual({ ready: true });
+    expect(await adapter.checkReady(real, { resumeToken: token })).toEqual({ ready: true });
   });
 });

@@ -70,6 +70,8 @@ export interface ReadinessResult {
   ready: boolean;
   reason?: string;
   code?: string;
+  /** Ready because the pane's process proved the seat with no launch record (#1477): the screen alone would not have. */
+  provedWithoutLaunch?: boolean;
 }
 
 export const ATTENTION_REQUIRED_READINESS_CODES = new Set([

@@ -9,7 +9,7 @@ import { SessionRegistry } from "../src/domain/session-registry.js";
 import { ContextMonitor } from "../src/domain/context-monitor.js";
 import { ContextUsageStore } from "../src/domain/context-usage-store.js";
 import type { NodeBinding } from "../src/domain/runtime-adapter.js";
-import { name, recordRotation, requestedToken, rotatedToken, rotation, rowsWith, seat, token } from "./helpers/claude-sweeper-seat.js";
+import { autoScreen, name, recordRotation, requestedToken, rotatedToken, rotation, rowsWith, seat, token } from "./helpers/claude-sweeper-seat.js";
 
 // #1477 section 2 at the context monitor's tick: a Claude seat left in attention after a daemon restart,
 // on an auto-mode screen with no banner, is promoted when the seat's real binding and resume token prove it.
@@ -126,6 +126,15 @@ describe("ContextMonitor proves a banner-less auto-mode Claude with no launch re
         expect(await poll(ids.session.id)).toBe("ready");
         db.prepare("DELETE FROM events").run(); db.prepare("DELETE FROM sessions").run(); db.prepare("DELETE FROM nodes").run();
       }
+    });
+
+    it("leaves a banner-recognised seat as it is today: promoted although its request and record disagree", async () => {
+      const ids = seed("attention_required");
+      failedStart(ids, { requestedResumeToken: requestedToken, requestedResumeType: "claude_id" });
+      const { adapter, tmux } = seat();
+      (tmux.capturePaneContent as ReturnType<typeof vi.fn>).mockResolvedValue("Claude Code v2.1.303\n" + autoScreen);
+      await monitorWith((binding, opts) => adapter.checkReady(binding, opts)).pollOnce();
+      expect(status(ids.session.id)).toBe("ready");
     });
 
     it("still compares the process with the record after an in-process /resume: the process names the request, the record another conversation", async () => {

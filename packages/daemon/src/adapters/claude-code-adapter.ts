@@ -385,7 +385,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
       };
     }
 
-    if (probe.status === "resumed") return { ready: true };
+    if (probe.status === "resumed") return "provedWithoutLaunch" in probe ? { ready: true, provedWithoutLaunch: true } : { ready: true };
     return { ready: false, reason: probe.detail, code: probe.code };
   }
 
@@ -413,7 +413,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     const launch = this.autoLaunches.get(binding.nodeId);
     // No launch record (this daemon did not launch the seat): the caller's real binding and the seat's recorded
     // conversation are the proof's inputs. A record for another launch keeps today's result below.
-    if (!launch) return await this.proveWithoutLaunch(binding, options) ? verifiedProbe : probe;
+    if (!launch) return await this.proveWithoutLaunch(binding, options) ? { ...verifiedProbe, provedWithoutLaunch: true } : probe;
     if (!binding.tmuxPane || !binding.tmuxSession
       || launch.binding.id !== binding.id || launch.binding.tmuxPane !== binding.tmuxPane
       || launch.binding.tmuxSession !== binding.tmuxSession
