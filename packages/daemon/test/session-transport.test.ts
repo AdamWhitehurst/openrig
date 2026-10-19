@@ -28,7 +28,7 @@ import { createFullTestDb } from "./helpers/test-app.js";
 import { StartupOrchestrator } from "../src/domain/startup-orchestrator.js";
 import { assessNativeResumeProbe } from "../src/domain/native-resume-probe.js";
 import type { NodeBinding, RuntimeAdapter } from "../src/domain/runtime-adapter.js";
-import { recordRotation, rotatedToken, rotation, rowsWith as claudeRows, seat as claudeSeat } from "./helpers/claude-sweeper-seat.js";
+import { recordRotation, requestedToken, rotatedToken, rotation, rowsWith as claudeRows, seat as claudeSeat } from "./helpers/claude-sweeper-seat.js";
 
 describe("agent pane activity classifier", () => {
   it("classifies active Working pane as agent_active", () => {
@@ -3052,6 +3052,50 @@ describe("startup readiness reconciliation on session interaction (#7)", () => {
       const { adapter } = claudeSeat();
       await transportWith((binding, opts) => adapter.checkReady(binding, opts)).capture("worker-1@test-rig");
       expect(startupStatus(session.id)).toBe("ready");
+    });
+
+    // The anchor (#1477, the maintainer's shape) is the reconcile's own existing comparison; these pin it beside the proof.
+    describe("the requested conversation", () => {
+      const reconcile = async (session: { id: string }) => {
+        const { adapter } = claudeSeat();
+        await transportWith((binding, opts) => adapter.checkReady(binding, opts)).capture("worker-1@test-rig");
+        return startupStatus(session.id);
+      };
+      const reseed = (ids: ReturnType<typeof seedClaude>, fields: Record<string, unknown>) => {
+        db.prepare("DELETE FROM events WHERE type = 'node.startup_failed'").run();
+        seedStartupFailureEvent(ids.rig.id, ids.node.id, ids.session.id, fields);
+      };
+
+      it("leaves flagged a seat whose record and process are on another conversation than the one it asked for", async () => {
+        const ids = seedClaude("attention_required");
+        reseed(ids, { requestedResumeToken: requestedToken, requestedResumeType: "claude_id" });
+        expect(await reconcile(ids.session)).toBe("attention_required");
+      });
+
+      it("promotes a seat whose recorded rotation started from the requested conversation, which the process names", async () => {
+        const ids = seedClaude("attention_required");
+        recordRotation(db, ids.session.id);
+        reseed(ids, { requestedResumeToken: resumeToken, requestedResumeType: "claude_id" });
+        expect(await reconcile(ids.session)).toBe("ready");
+      });
+
+      it("promotes a fresh launch (null request); an older event without the fields keeps the reconcile's existing hold", async () => {
+        const fresh = seedClaude("attention_required");
+        reseed(fresh, { requestedResumeToken: null, requestedResumeType: null });
+        expect(await reconcile(fresh.session)).toBe("ready");
+        const older = seedClaude("attention_required");
+        db.prepare("DELETE FROM events WHERE type = 'node.startup_failed' AND node_id = ?").run(older.node.id);
+        db.prepare("INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, ?, 'node.startup_failed', ?)").run(older.rig.id, older.node.id,
+          JSON.stringify({ type: "node.startup_failed", sessionId: older.session.id, stage: "readiness_check", hasPendingWork: false, error: "x" }));
+        expect(await reconcile(older.session)).toBe("attention_required");
+      });
+
+      it("still compares the process with the record after an in-process /resume", async () => {
+        const ids = seedClaude("attention_required");
+        db.prepare("UPDATE sessions SET resume_token = ? WHERE id = ?").run(rotatedToken, ids.session.id);
+        reseed(ids, { requestedResumeToken: resumeToken, requestedResumeType: "claude_id" });
+        expect(await reconcile(ids.session)).toBe("attention_required");
+      });
     });
 
     it("leaves a seat whose pane runs another conversation flagged", async () => {

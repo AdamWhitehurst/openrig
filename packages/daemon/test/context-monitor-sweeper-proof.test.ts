@@ -9,7 +9,7 @@ import { SessionRegistry } from "../src/domain/session-registry.js";
 import { ContextMonitor } from "../src/domain/context-monitor.js";
 import { ContextUsageStore } from "../src/domain/context-usage-store.js";
 import type { NodeBinding } from "../src/domain/runtime-adapter.js";
-import { name, recordRotation, rotatedToken, rotation, rowsWith, seat, token } from "./helpers/claude-sweeper-seat.js";
+import { name, recordRotation, requestedToken, rotatedToken, rotation, rowsWith, seat, token } from "./helpers/claude-sweeper-seat.js";
 
 // #1477 section 2 at the context monitor's tick: a Claude seat left in attention after a daemon restart,
 // on an auto-mode screen with no banner, is promoted when the seat's real binding and resume token prove it.
@@ -34,6 +34,9 @@ describe("ContextMonitor proves a banner-less auto-mode Claude with no launch re
     registry.updateBinding(node.id, { tmuxSession: name, tmuxPane: "%1" });
     return { rig, node, session };
   }
+  const failedStart = (ids: { rig: { id: string }; node: { id: string }; session: { id: string } }, fields: Record<string, unknown>) =>
+    db.prepare("INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, ?, 'node.startup_failed', ?)").run(ids.rig.id, ids.node.id,
+      JSON.stringify({ type: "node.startup_failed", sessionId: ids.session.id, stage: "readiness_check", hasPendingWork: false, error: "x", ...fields }));
   const monitorWith = (checkReady: (binding: NodeBinding, opts?: { resumeToken?: string | null }) => Promise<{ ready: boolean }>) =>
     new ContextMonitor(db, new ContextUsageStore(db, { stateDir: home, codexHomeDir: home }), undefined, undefined, { "claude-code": { checkReady } as never });
   const status = (id: string) => (db.prepare("SELECT startup_status FROM sessions WHERE id = ?").get(id) as { startup_status: string }).startup_status;
@@ -92,6 +95,44 @@ describe("ContextMonitor proves a banner-less auto-mode Claude with no launch re
     set(rowsWith({ pid: 103 }));
     await monitorWith((binding, opts) => adapter.checkReady(binding, opts)).pollOnce();
     expect(status(session.id)).toBe("attention_required");
+  });
+
+  // The anchor (#1477, the maintainer's shape): the request the daemon wrote for the failed start, which the SessionStart
+  // hook never touches, must also agree with the record, by the comparison the post-send reconcile makes.
+  describe("the requested conversation", () => {
+    const poll = async (id: string, process = rowsWith()) => {
+      const { adapter, set } = seat(); set(process);
+      await monitorWith((binding, opts) => adapter.checkReady(binding, opts)).pollOnce();
+      return status(id);
+    };
+
+    it("leaves flagged a seat whose record and process are on another conversation than the one it asked for", async () => {
+      const ids = seed("attention_required"); // record and process: token. The seat's own conversation was requestedToken.
+      failedStart(ids, { requestedResumeToken: requestedToken, requestedResumeType: "claude_id" });
+      expect(await poll(ids.session.id)).toBe("attention_required");
+    });
+
+    it("promotes a seat whose recorded rotation started from the requested conversation, which the process names", async () => {
+      const ids = seed("attention_required", rotatedToken);
+      recordRotation(db, ids.session.id);
+      failedStart(ids, { requestedResumeToken: token, requestedResumeType: "claude_id" });
+      expect(await poll(ids.session.id)).toBe("ready");
+    });
+
+    it("changes nothing for a fresh launch, with no failure event, or with an older event that has no request fields", async () => {
+      for (const fields of [null, { requestedResumeToken: null, requestedResumeType: null }, {}] as const) {
+        const ids = seed("attention_required");
+        if (fields) failedStart(ids, fields);
+        expect(await poll(ids.session.id)).toBe("ready");
+        db.prepare("DELETE FROM events").run(); db.prepare("DELETE FROM sessions").run(); db.prepare("DELETE FROM nodes").run();
+      }
+    });
+
+    it("still compares the process with the record after an in-process /resume: the process names the request, the record another conversation", async () => {
+      const ids = seed("attention_required", rotatedToken); // the hook moved the record to rotatedToken, no rotation recorded
+      failedStart(ids, { requestedResumeToken: token, requestedResumeType: "claude_id" });
+      expect(await poll(ids.session.id)).toBe("attention_required");
+    });
   });
 
   it("passes no options when the session records no token", async () => {

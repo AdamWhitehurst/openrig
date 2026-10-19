@@ -28,6 +28,9 @@ export const standIn: NodeBinding = { ...real, id: "sweeper:stand-in", tmuxPane:
 // rotation back to `token`, which is what the process on the pane still names (pid 102, as rowsWith has it).
 export const rotatedToken = "00000000-0000-4000-8000-000000001478";
 export const rotation = { token, process: { pid: 102, startedAt } };
+// The conversation a failed start asked for (`node.startup_failed.requestedResumeToken`), when it is not the one the
+// seat's own record and process name.
+export const requestedToken = "00000000-0000-4000-8000-000000001479";
 export function recordRotation(db: Database.Database, sessionId: string): void {
   db.prepare(`UPDATE sessions SET resume_token = ?, resume_provenance = 'hook', resume_rotated_from = ?,
     resume_rotated_process = ?, resume_launch_process = ? WHERE id = ?`).run(rotatedToken, token,

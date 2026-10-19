@@ -9,8 +9,8 @@ import {
 } from "./runtime-adapter.js";
 import type { UsageSamplesStore, ProviderWindowSampleInput } from "./usage-samples-store.js";
 import type { ContextUsage } from "./types.js";
-import { readPendingStartupContext } from "./startup-orchestrator.js";
-import { claudeResumeRotation } from "./session-registry.js";
+import { getLatestStartupFailedEvent, hasClaudeResumeIdentityWork, readPendingStartupContext } from "./startup-orchestrator.js";
+import { claudeResumeRotation, SessionRegistry } from "./session-registry.js";
 
 /** Default polling interval: 30 seconds. */
 export const DEFAULT_POLL_INTERVAL_MS = 30_000;
@@ -339,6 +339,7 @@ export class ContextMonitor {
           // A live prompt does not deliver saved context. Check after the await:
           // startup may have reached an attention gate while we were observing.
           if (readPendingStartupContext(this.db, session.node_id, session.session_id)) return;
+          if (claude && this.requestedConversationDiffers(session)) return;
           this.db.prepare(`
             UPDATE sessions
             SET startup_status = 'ready',
@@ -359,5 +360,18 @@ export class ContextMonitor {
     } catch {
       // Best-effort normalization only; telemetry polling still succeeds.
     }
+  }
+
+  /** The conversation the failed start asked for, in addition to the recorded one (#1477). `node.startup_failed`'s
+   *  `requestedResumeToken` is written by the daemon and survives a restart; the SessionStart hook rewrites only
+   *  `sessions.resume_token`, so a record the hook moved to another conversation no longer matches the request. The
+   *  same comparison the post-send reconcile makes (stored token, or a rotation that started from it). With no such
+   *  event, or a null request (a fresh launch), or an event from before the fields existed, this holds nothing back,
+   *  unlike the post-send reconcile's default: a seat the monitor promotes today stays promoted. */
+  private requestedConversationDiffers(session: EligibleSession): boolean {
+    const event = getLatestStartupFailedEvent(this.db, session.node_id, session.session_id);
+    if (!event?.requestedResumeToken) return false;
+    return hasClaudeResumeIdentityWork(new SessionRegistry(this.db), session.session_id, "claude-code",
+      event.requestedResumeToken, event.requestedResumeType);
   }
 }
