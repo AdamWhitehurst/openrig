@@ -1,4 +1,5 @@
 import { vi } from "vitest";
+import type Database from "better-sqlite3";
 import { ClaudeCodeAdapter } from "../../src/adapters/claude-code-adapter.js";
 import type { TmuxAdapter } from "../../src/adapters/tmux.js";
 import type { NativeProcessRow } from "../../src/domain/native-process-lineage.js";
@@ -22,6 +23,16 @@ export const real: NodeBinding = { id: "binding", nodeId: "node", tmuxSession: n
   cmuxWorkspace: null, cmuxSurface: null, updatedAt: "", cwd: "/fixture", permissionMode: "auto" };
 // What the sweepers passed before: no pane.
 export const standIn: NodeBinding = { ...real, id: "sweeper:stand-in", tmuxPane: null };
+
+// A seat whose Claude continued its conversation under a new id (#1077): the record names `rotatedToken` and carries the
+// rotation back to `token`, which is what the process on the pane still names (pid 102, as rowsWith has it).
+export const rotatedToken = "00000000-0000-4000-8000-000000001478";
+export const rotation = { token, process: { pid: 102, startedAt } };
+export function recordRotation(db: Database.Database, sessionId: string): void {
+  db.prepare(`UPDATE sessions SET resume_token = ?, resume_provenance = 'hook', resume_rotated_from = ?,
+    resume_rotated_process = ?, resume_launch_process = ? WHERE id = ?`).run(rotatedToken, token,
+    JSON.stringify(rotation.process), JSON.stringify({ ...rotation.process, token }), sessionId);
+}
 
 export function seat(over: { panes?: { id: string }[]; panePid?: (target: string, call: number) => number; managed?: boolean } = {}) {
   let rows = rowsWith();

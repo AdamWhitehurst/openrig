@@ -367,7 +367,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
 
     const paneCommand = await this.tmux.getPaneCommand(binding.tmuxSession);
     const paneContent = (await this.tmux.capturePaneContent(binding.tmuxSession, 40)) ?? "";
-    const probe = await this.assessManagedProbe(binding, paneCommand, paneContent, options?.resumeToken);
+    const probe = await this.assessManagedProbe(binding, paneCommand, paneContent, options);
 
     // A script-launched Claude reads as `sh` until the script hands over the foreground, so the label alone
     // is not a return to a shell. Say so only for a proven idle shell (the rule Codex's checkReady uses).
@@ -396,7 +396,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
 
   // -- Private helpers --
 
-  private async assessManagedProbe(binding: NodeBinding, paneCommand: string | null, paneContent: string, resumeToken?: string | null) {
+  private async assessManagedProbe(binding: NodeBinding, paneCommand: string | null, paneContent: string, options?: ReadinessOptions) {
     const input = { runtime: "claude-code", paneCommand, paneContent };
     const probe = assessNativeResumeProbe(input);
     // Headerless managed launches (including bypass mode) use the same readiness
@@ -408,7 +408,7 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
     const launch = this.autoLaunches.get(binding.nodeId);
     // No launch record (this daemon did not launch the seat): the caller's real binding and the seat's recorded
     // conversation are the proof's inputs. A record for another launch keeps today's result below.
-    if (!launch) return await this.proveWithoutLaunch(binding, resumeToken) ? verifiedProbe : probe;
+    if (!launch) return await this.proveWithoutLaunch(binding, options) ? verifiedProbe : probe;
     if (!binding.tmuxPane || !binding.tmuxSession
       || launch.binding.id !== binding.id || launch.binding.tmuxPane !== binding.tmuxPane
       || launch.binding.tmuxSession !== binding.tmuxSession
@@ -440,14 +440,14 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
   /** The observation `rig seat clear-attention` uses: the pane's one foreground Claude names exactly `resumeToken`, the
    *  same process in two samples, with no frozen executable, in the session's only pane with an unchanged PID. Reads
    *  only. Anything missing or inconclusive is not proof. */
-  private async proveWithoutLaunch(binding: NodeBinding, resumeToken: string | null | undefined): Promise<boolean> {
-    const token = resumeToken?.trim();
+  private async proveWithoutLaunch(binding: NodeBinding, options: ReadinessOptions | undefined): Promise<boolean> {
+    const token = options?.resumeToken?.trim();
     if (!token || !binding.tmuxPane || !binding.tmuxSession) return false;
     try {
       const panes = await this.tmux.listPanes(binding.tmuxSession);
       if (panes.length !== 1 || panes[0]?.id !== binding.tmuxPane) return false;
       const native = await verifyClaudePaneProcess({ target: binding.tmuxPane, tmux: this.tmux,
-        listProcesses: this.listProcesses, expectedToken: token });
+        listProcesses: this.listProcesses, expectedToken: token, rotation: options?.resumeRotation ?? null });
       if (!native) return false;
       const currentPanes = await this.tmux.listPanes(binding.tmuxSession);
       return currentPanes.length === 1 && currentPanes[0]?.id === binding.tmuxPane

@@ -1,5 +1,6 @@
 import type { Binding, StartupFile } from "./types.js";
 import type { ProjectionPlan } from "./projection-planner.js";
+import type { ClaudeResumeRotation } from "./native-process-lineage.js";
 
 // -- Bridge type: NodeBinding extends Binding with cwd --
 // Interim repo type. The current repo only has Binding in types.ts.
@@ -90,7 +91,9 @@ export function isAttentionRequiredReadinessCode(code: string | undefined): bool
   return !!code && ATTENTION_REQUIRED_READINESS_CODES.has(code);
 }
 
-export interface ReadinessOptions { resumeToken?: string | null }
+/** `resumeRotation`: the rotation recorded with `resumeToken` (#1077), as `rig seat clear-attention` passes it, so a
+ *  seat whose Claude continued its conversation under a new id is proved by the process that recorded the rotation. */
+export interface ReadinessOptions { resumeToken?: string | null; resumeRotation?: ClaudeResumeRotation | null }
 
 // -- Harness launch result --
 

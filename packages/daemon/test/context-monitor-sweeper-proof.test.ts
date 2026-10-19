@@ -9,7 +9,7 @@ import { SessionRegistry } from "../src/domain/session-registry.js";
 import { ContextMonitor } from "../src/domain/context-monitor.js";
 import { ContextUsageStore } from "../src/domain/context-usage-store.js";
 import type { NodeBinding } from "../src/domain/runtime-adapter.js";
-import { name, rowsWith, seat, token } from "./helpers/claude-sweeper-seat.js";
+import { name, recordRotation, rotatedToken, rotation, rowsWith, seat, token } from "./helpers/claude-sweeper-seat.js";
 
 // #1477 section 2 at the context monitor's tick: a Claude seat left in attention after a daemon restart,
 // on an auto-mode screen with no banner, is promoted when the seat's real binding and resume token prove it.
@@ -72,6 +72,26 @@ describe("ContextMonitor proves a banner-less auto-mode Claude with no launch re
     await monitorWith((binding, opts) => wrong.adapter.checkReady(binding, opts)).pollOnce();
     expect(status(good.session.id)).toBe("attention_required");
     expect(eventCount()).toBe(events);
+  });
+
+  it("passes the rotation recorded with the token, and the real adapter promotes a rotated seat by it", async () => {
+    const { session } = seed("attention_required", rotatedToken);
+    recordRotation(db, session.id);
+    const check = vi.fn(async () => ({ ready: false }));
+    await monitorWith(check).pollOnce();
+    expect(check.mock.calls[0]![1]).toEqual({ resumeToken: rotatedToken, resumeRotation: rotation });
+    const { adapter } = seat();
+    await monitorWith((binding, opts) => adapter.checkReady(binding, opts)).pollOnce();
+    expect(status(session.id)).toBe("ready");
+  });
+
+  it("leaves a rotated seat flagged when the process is not the one that recorded the rotation", async () => {
+    const { session } = seed("attention_required", rotatedToken);
+    recordRotation(db, session.id);
+    const { adapter, set } = seat();
+    set(rowsWith({ pid: 103 }));
+    await monitorWith((binding, opts) => adapter.checkReady(binding, opts)).pollOnce();
+    expect(status(session.id)).toBe("attention_required");
   });
 
   it("passes no options when the session records no token", async () => {

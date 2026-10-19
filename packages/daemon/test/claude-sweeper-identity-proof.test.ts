@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { NativeProcessRow } from "../src/domain/native-process-lineage.js";
-import { binary, name, real, rowsWith, seat, standIn, token, autoScreen } from "./helpers/claude-sweeper-seat.js";
+import { binary, name, real, rotatedToken, rotation, rowsWith, seat, standIn, token, autoScreen } from "./helpers/claude-sweeper-seat.js";
 
 // #1477 section 2. After a daemon restart no launch record exists, so a banner-less auto-mode Claude can
 // never be proved by the launch path, and the sweepers (which pass a binding with no pane) left it in
@@ -64,6 +64,31 @@ describe("a banner-less auto-mode Claude with no launch record", () => {
     const { adapter } = seat();
     await adapter.launchHarness({ ...real, id: "another-binding" }, { name });
     expect(await adapter.checkReady(real, { resumeToken: token })).toMatchObject(unproved);
+  });
+
+  // The record says B; Claude continued A as B, and the process on the pane still names A. clear-attention passes the
+  // rotation recorded with B, so the sweepers do too.
+  it("is proved for a seat whose conversation rotated, by the stored rotation", async () => {
+    const { adapter } = seat();
+    expect((await adapter.checkReady(real, { resumeToken: rotatedToken, resumeRotation: rotation })).ready).toBe(true);
+  });
+
+  it("is not proved for a rotated seat when no rotation is passed", async () => {
+    expect(await seat().adapter.checkReady(real, { resumeToken: rotatedToken })).toMatchObject(unproved);
+  });
+
+  it.each([
+    ["a rotation recorded by another process", { token, process: { ...rotation.process, pid: 103 } }],
+    ["a rotation recorded at another start time", { token, process: { ...rotation.process, startedAt: "Mon Oct 19 09:00:09 2026" } }],
+    ["a rotation from a conversation the process does not name", { token: "other", process: rotation.process }],
+  ])("stays flagged for %s", async (_name, resumeRotation) => {
+    expect(await seat().adapter.checkReady(real, { resumeToken: rotatedToken, resumeRotation })).toMatchObject(unproved);
+  });
+
+  it("does not let a rotation excuse a seat whose process names neither conversation", async () => {
+    const { adapter, set } = seat();
+    set(rowsWith({ command: `${binary} --permission-mode auto --resume other --name ${name}` }));
+    expect(await adapter.checkReady(real, { resumeToken: rotatedToken, resumeRotation: rotation })).toMatchObject(unproved);
   });
 
   it("still needs no token when the screen is already recognised", async () => {

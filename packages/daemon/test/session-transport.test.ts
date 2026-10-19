@@ -28,7 +28,7 @@ import { createFullTestDb } from "./helpers/test-app.js";
 import { StartupOrchestrator } from "../src/domain/startup-orchestrator.js";
 import { assessNativeResumeProbe } from "../src/domain/native-resume-probe.js";
 import type { NodeBinding, RuntimeAdapter } from "../src/domain/runtime-adapter.js";
-import { rowsWith as claudeRows, seat as claudeSeat } from "./helpers/claude-sweeper-seat.js";
+import { recordRotation, rotatedToken, rotation, rowsWith as claudeRows, seat as claudeSeat } from "./helpers/claude-sweeper-seat.js";
 
 describe("agent pane activity classifier", () => {
   it("classifies active Working pane as agent_active", () => {
@@ -3041,6 +3041,17 @@ describe("startup readiness reconciliation on session interaction (#7)", () => {
       await transportWith((binding, opts) => adapter.checkReady(binding, opts)).capture("worker-1@test-rig");
       expect(startupStatus(session.id)).toBe("ready");
       expect(cleared).toEqual([]);
+    });
+
+    it("passes the rotation recorded with the token, and the real adapter promotes a rotated seat by it", async () => {
+      const { session } = seedClaude("attention_required");
+      recordRotation(db, session.id);
+      const check = vi.fn(async () => ({ ready: false }));
+      await transportWith(check).capture("worker-1@test-rig");
+      expect(check.mock.calls[0]![1]).toEqual({ resumeToken: rotatedToken, resumeRotation: rotation });
+      const { adapter } = claudeSeat();
+      await transportWith((binding, opts) => adapter.checkReady(binding, opts)).capture("worker-1@test-rig");
+      expect(startupStatus(session.id)).toBe("ready");
     });
 
     it("leaves a seat whose pane runs another conversation flagged", async () => {

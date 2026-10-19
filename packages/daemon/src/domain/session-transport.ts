@@ -1743,6 +1743,10 @@ interface SessionReconciliationSnapshot {
   startup_completed_at: string | null;
   resume_type: string | null;
   resume_token: string | null;
+  resume_provenance: string | null;
+  resume_rotated_from: string | null;
+  resume_rotated_process: string | null;
+  resume_launch_process: string | null;
   binding_session: string | null;
   binding_window: string | null;
   binding_pane: string | null;
@@ -3651,7 +3655,7 @@ export class SessionTransport {
     return this.db.prepare(`
       SELECT n.id as node_id, r.id as rig_id, s.id as session_id, s.session_name, n.runtime, n.cwd,
              s.startup_status, s.status as session_status, s.startup_completed_at,
-             s.resume_type, s.resume_token,
+             s.resume_type, s.resume_token, s.resume_provenance, s.resume_rotated_from, s.resume_rotated_process, s.resume_launch_process,
              b.tmux_session as binding_session, b.tmux_window as binding_window, b.tmux_pane as binding_pane,
              b.updated_at as binding_updated_at,
              (SELECT generation_uuid FROM occupant_tenures WHERE node_id = n.id ORDER BY generation_ordinal DESC LIMIT 1) as occupant_generation,
@@ -3717,6 +3721,7 @@ export class SessionTransport {
 
     // A Claude seat is checked with its real pane, occupant and recorded conversation (#1477); others keep the stand-in.
     const claude = snapshot.runtime === "claude-code";
+    const rotation = claude ? claudeResumeRotation(snapshot) : null;
     const probeBinding: NodeBinding = {
       id: `session-transport:${snapshot.session_id}`,
       nodeId: snapshot.node_id,
@@ -3738,7 +3743,7 @@ export class SessionTransport {
 
     let readiness: ReadinessResult;
     try {
-      readiness = await Promise.race([checker.checkReady(probeBinding, ...(claude && snapshot.resume_token ? [{ resumeToken: snapshot.resume_token }] : [])), timeoutPromise]);
+      readiness = await Promise.race([checker.checkReady(probeBinding, ...(claude && snapshot.resume_token ? [{ resumeToken: snapshot.resume_token, ...(rotation ? { resumeRotation: rotation } : {}) }] : [])), timeoutPromise]);
     } catch {
       return false;
     } finally {
