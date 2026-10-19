@@ -201,35 +201,55 @@ else console.log(JSON.stringify(Object.fromEntries(['TMUX', 'TERM_PROGRAM', 'TER
   });
   // The names Claude needs for its external-editor action (Ctrl+G) and for image paste, which shells out to
   // `xclip || wl-paste`. The pane supplies the values, so a person's editor and display session reach the seat
-  // without a per-spec value.
-  const sessionNames = ["EDITOR", "VISUAL", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DISPLAY", "XAUTHORITY"];
-  // Present in the pane on purpose: they must stay out. The bus and desktop names reach services (keyring,
-  // notifications, xdg-open) that nothing in the editor or paste path uses; SSH_AUTH_SOCK is a credential channel.
-  const withheldNames = ["DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "SSH_AUTH_SOCK", "TMUX", "TMUX_PANE"];
-  it.each([
-    ["present", Object.fromEntries(sessionNames.map(key => [key, `/pane/${key}`]))],
-    ["absent", {}],
-    ["empty", Object.fromEntries(sessionNames.map(key => [key, ""]))],
-  ])("hands Claude the pane's editor and display session variables when they are %s", async (label, sessionEnv) => {
-    const f = fixture();
+  // without a per-spec value. WAYLAND_DISPLAY is resolved to an absolute path instead of forwarding XDG_RUNTIME_DIR.
+  const sessionNames = ["EDITOR", "VISUAL", "DISPLAY", "XAUTHORITY"];
+  // Present in the pane on purpose: they must stay out. XDG_RUNTIME_DIR is where sd-bus, GDBus and libdbus look for the
+  // session bus when DBUS_SESSION_BUS_ADDRESS is unset; the bus and desktop names reach services (keyring, notifications,
+  // xdg-open) that nothing in the editor or paste path uses; SSH_AUTH_SOCK is a credential channel.
+  const withheldNames = ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "SSH_AUTH_SOCK", "TMUX", "TMUX_PANE"];
+  const paneNames = [...sessionNames, "WAYLAND_DISPLAY", ...withheldNames];
+  async function runPane(f: ReturnType<typeof fixture>, pane: Record<string, string>, unset: string[] = []): Promise<Record<string, string>> {
     writeFileSync(f.executable, `#!${process.execPath}\n
 if (process.argv.includes('--help')) console.log(${JSON.stringify(help)});
-else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify([...sessionNames, ...withheldNames])}
+else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify(paneNames)}
   .filter(k => process.env[k] !== undefined).map(k => [k, process.env[k]]))));
 `);
     const native = await vi.importActual<typeof import("node:child_process")>("node:child_process");
     vi.mocked(execFile).mockImplementation(native.execFile);
     const prepared = await f.managed.prepare({ nodeId: "node", session: "seat", pane: "%1" }, "auto");
     const command = prepared.command(["--permission-mode", "auto"]);
-    const paneEnv: Record<string, string> = { ...f.env, ...Object.fromEntries(withheldNames.map(key => [key, `/pane/${key}`])), ...sessionEnv };
     // Some shells set these themselves; model the absent case before the command expands them.
-    const paneCommand = label === "absent" ? `unset ${[...sessionNames, ...withheldNames].join(" ")}; ${command}` : command;
+    const paneCommand = unset.length ? `unset ${unset.join(" ")}; ${command}` : command;
     const stdout = await new Promise<string>((resolve, reject) => {
-      native.execFile("/bin/sh", ["-c", paneCommand], { encoding: "utf8", timeout: 3000, env: paneEnv },
+      native.execFile("/bin/sh", ["-c", paneCommand], { encoding: "utf8", timeout: 3000, env: { ...f.env, ...pane } },
         (error, out) => error ? reject(error) : resolve(out));
     });
-    // An empty or absent variable stays absent; the withheld names never arrive.
-    expect(JSON.parse(stdout)).toEqual(label === "present" ? sessionEnv : {});
+    return JSON.parse(stdout);
+  }
+  const withheldInPane = Object.fromEntries(withheldNames.map(key => [key, `/pane/${key}`]));
+  it.each([
+    ["present", Object.fromEntries(sessionNames.map(key => [key, `/pane/${key}`])), []],
+    ["absent", {}, sessionNames],
+    ["empty", Object.fromEntries(sessionNames.map(key => [key, ""])), []],
+  ])("hands Claude the pane's editor and X11 variables when they are %s, and never the withheld names", async (_label, sessionEnv, unset) => {
+    const f = fixture();
+    // An empty or absent variable stays absent; the withheld names (XDG_RUNTIME_DIR among them) never arrive.
+    expect(await runPane(f, { ...withheldInPane, ...sessionEnv }, [...unset, "WAYLAND_DISPLAY"]))
+      .toEqual(Object.fromEntries(Object.entries(sessionEnv).filter(([, value]) => value !== "")));
+  });
+  it.each([
+    ["absolute", { WAYLAND_DISPLAY: "/run/user/1000/wayland-1", XDG_RUNTIME_DIR: "/run/user/1000" }, "/run/user/1000/wayland-1"],
+    ["absolute with no XDG_RUNTIME_DIR", { WAYLAND_DISPLAY: "/run/user/1000/wayland-1" }, "/run/user/1000/wayland-1"],
+    ["absolute outside the runtime dir", { WAYLAND_DISPLAY: "/elsewhere/sock", XDG_RUNTIME_DIR: "/run/user/1000" }, "/elsewhere/sock"],
+    ["relative", { WAYLAND_DISPLAY: "wayland-1", XDG_RUNTIME_DIR: "/run/user/1000" }, "/run/user/1000/wayland-1"],
+    ["relative with an empty XDG_RUNTIME_DIR", { WAYLAND_DISPLAY: "wayland-1", XDG_RUNTIME_DIR: "" }, undefined],
+    ["relative with no XDG_RUNTIME_DIR", { WAYLAND_DISPLAY: "wayland-1" }, undefined],
+    ["empty", { WAYLAND_DISPLAY: "", XDG_RUNTIME_DIR: "/run/user/1000" }, undefined],
+    ["absent", { XDG_RUNTIME_DIR: "/run/user/1000" }, undefined],
+  ])("hands Claude an absolute WAYLAND_DISPLAY when the pane's is %s, without XDG_RUNTIME_DIR", async (_label, pane, expected) => {
+    const f = fixture();
+    const unset = ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"].filter(key => !(key in pane));
+    expect(await runPane(f, { ...withheldInPane, ...pane }, unset)).toEqual(expected === undefined ? {} : { WAYLAND_DISPLAY: expected });
   });
   it.each(["fresh", "resume", "fork", "legacy"])("names the editor and display session variables on a %s launch", async kind => {
     const f = fixture();
@@ -243,7 +263,10 @@ else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify([...sessionN
     expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
     const cmd = f.calls[0]!;
     for (const key of sessionNames) expect(cmd).toContain(`\${${key}:+"${key}=$${key}"}`);
-    for (const key of withheldNames) expect(cmd).not.toContain(key);
+    expect(cmd).toContain("printf 'WAYLAND_DISPLAY=%s'");
+    // XDG_RUNTIME_DIR is read to resolve WAYLAND_DISPLAY, never forwarded as a variable.
+    expect(cmd).not.toMatch(/XDG_RUNTIME_DIR=\$|"XDG_RUNTIME_DIR=/);
+    for (const key of withheldNames.filter(key => key !== "XDG_RUNTIME_DIR")) expect(cmd).not.toContain(key);
   });
   it("detects unset config becoming explicit even when the storage directory stays the same", async () => {
     const f = fixture(); delete f.env.CLAUDE_CONFIG_DIR;

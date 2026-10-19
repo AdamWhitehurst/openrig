@@ -36,10 +36,19 @@ const PANE_TERMINAL_KEYS = ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_V
 
 /** The person's editor and display session, so a managed seat behaves like a plain one for Claude's external-editor
  *  action (EDITOR, VISUAL; Claude falls back to VS Code without them) and for image paste, which runs
- *  `xclip || wl-paste` (WAYLAND_DISPLAY with XDG_RUNTIME_DIR locate the compositor socket; DISPLAY with XAUTHORITY reach
- *  X11). Names only: the pane supplies the values. DBUS_SESSION_BUS_ADDRESS, XDG_SESSION_TYPE and XDG_CURRENT_DESKTOP are
- *  left out: neither path reads them, and the bus would give the seat keyring and desktop services it does not have now. */
-const PANE_SESSION_KEYS = ["EDITOR", "VISUAL", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DISPLAY", "XAUTHORITY"];
+ *  `xclip || wl-paste` (DISPLAY with XAUTHORITY reach X11; WAYLAND_DISPLAY reaches the compositor, see below). Names only:
+ *  the pane supplies the values. Left out: XDG_RUNTIME_DIR, because sd-bus, GDBus and libdbus fall back to
+ *  $XDG_RUNTIME_DIR/bus when DBUS_SESSION_BUS_ADDRESS is unset, so it would hand the seat the session bus (keyring,
+ *  `systemctl --user`) that the cleared environment keeps out; and DBUS_SESSION_BUS_ADDRESS, XDG_SESSION_TYPE and
+ *  XDG_CURRENT_DESKTOP, which neither path reads. */
+const PANE_SESSION_KEYS = ["EDITOR", "VISUAL", "DISPLAY", "XAUTHORITY"];
+
+/** WAYLAND_DISPLAY without XDG_RUNTIME_DIR: a client resolves a relative socket name against XDG_RUNTIME_DIR, but an
+ *  absolute path needs nothing else. Expanded in the pane shell: an absolute value is kept, a relative one is joined to
+ *  the pane's XDG_RUNTIME_DIR, and a relative one with no XDG_RUNTIME_DIR (or an unset or empty one) leaves the name
+ *  absent. The word is unquoted on purpose so that an empty result is no word at all. */
+const WAYLAND_DISPLAY_WORD = '$(case "${WAYLAND_DISPLAY-}" in /*) printf \'WAYLAND_DISPLAY=%s\' "$WAYLAND_DISPLAY";; ?*) '
+  + '[ -n "${XDG_RUNTIME_DIR-}" ] && printf \'WAYLAND_DISPLAY=%s/%s\' "$XDG_RUNTIME_DIR" "$WAYLAND_DISPLAY";; esac)';
 
 export class ClaudeManagedLaunch {
   constructor(private readonly db: Database.Database,
@@ -193,6 +202,7 @@ export class ClaudeManagedLaunch {
     // as a plain Enter. TMUX is left out on purpose: a bare `tmux` follows $TMUX ahead of
     // TMUX_TMPDIR, so tools the seat runs (and any daemon it starts) would follow the seat's own tmux server.
     const terminal = [...PANE_TERMINAL_KEYS, ...PANE_SESSION_KEYS].map(key => `\${${key}:+"${key}=$${key}"}`);
+    terminal.push(WAYLAND_DISPLAY_WORD);
     return Object.freeze({ assertCurrent, configDir: context.configDir, executable: context.executable, command: (args: readonly string[], launchEnv: Readonly<Record<string, string>> = {}) => {
       assertCurrent();
       const launch = Object.entries(launchEnv).map(([key, value]) => shellQuote(`${key}=${value}`));
