@@ -40,7 +40,7 @@ function seat(launch: { executable: string; executableIsScript: boolean }) {
     fsOps: { exists: () => false, readFile: () => "", writeFile: () => {}, mkdirp: () => {}, copyFile: () => {} } });
   const binding: NodeBinding = { id: "binding", nodeId: "node", tmuxSession: name, tmuxPane: "%1", tmuxWindow: null,
     cmuxWorkspace: null, cmuxSurface: null, updatedAt: "", cwd: "/fixture", permissionMode: "auto" };
-  return { adapter, binding, listProcesses, set: (next: NativeProcessRow[]) => { rows = next; } };
+  return { adapter, binding, listProcesses, tmux, set: (next: NativeProcessRow[]) => { rows = next; } };
 }
 const script = { executable: wrapper, executableIsScript: true };
 
@@ -63,6 +63,43 @@ describe("a Claude launched through a #! wrapper script", () => {
     expect((await adapter.checkReady(binding)).ready).toBe(false);
     set(rowsWith());
     expect((await adapter.checkReady(binding)).ready).toBe(true);
+  });
+
+  it.each([["pid", { pid: 103 }], ["start time", { startedAt: "Mon Oct 19 09:00:09 2026" }]] as const)(
+    "refuses a process whose %s differs from the pinned one, with the same executable path", async (_name, patch) => {
+      const { adapter, binding, set } = seat(script);
+      await adapter.launchHarness(binding, { name, resumeToken: token });
+      expect((await adapter.checkReady(binding)).ready).toBe(true);
+      set(rowsWith(patch));
+      expect(await adapter.checkReady(binding)).toMatchObject({ ready: false, code: "claude_auto_identity_required" });
+      set(rowsWith());
+      expect((await adapter.checkReady(binding)).ready).toBe(true);
+    });
+
+  it("verifies only the process that was pinned when two checks overlap before any pin", async () => {
+    const { adapter, binding, listProcesses, tmux } = seat(script);
+    await adapter.launchHarness(binding, { name });
+    const other = "/home/user/other/installs/claude/2.1.302/claude";
+    // Each check holds at its last await before it can pin, the pane PID read against the session name.
+    const held: (() => void)[] = [];
+    const reached: (() => void)[] = [];
+    (tmux.getPanePid as ReturnType<typeof vi.fn>).mockImplementation(async (target: string) => {
+      if (target !== name) return 100;
+      await new Promise<void>(resolve => { held.push(resolve); reached.shift()?.(); });
+      return 100;
+    });
+    const waitHeld = () => new Promise<void>(resolve => { if (held.length > 0) resolve(); else reached.push(resolve); });
+    listProcesses.mockImplementation(async () => rowsWith());
+    const first = adapter.checkReady(binding);
+    await waitHeld();
+    // The second check saw another process twice; it is the later of the two to reach the pin.
+    listProcesses.mockImplementation(async () => rowsWith({ executablePath: other }));
+    const second = adapter.checkReady(binding);
+    await new Promise<void>(resolve => { const poll = () => held.length === 2 ? resolve() : setTimeout(poll, 1); poll(); });
+    held[0]!();
+    expect((await first).ready).toBe(true);
+    held[1]!();
+    expect(await second).toMatchObject({ ready: false, code: "claude_auto_identity_required" });
   });
 
   it("pins nothing from a first sample that its second sample does not confirm", async () => {

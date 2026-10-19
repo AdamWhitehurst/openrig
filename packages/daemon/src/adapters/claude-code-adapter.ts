@@ -436,6 +436,8 @@ export class ClaudeCodeAdapter implements RuntimeAdapter {
         || currentPanes[0]?.id !== binding.tmuxPane
         || await this.tmux.getPanePid(binding.tmuxSession) !== native.panePid) return probe;
       if (!launch.fingerprint) pin();
+      // Another check of this launch can pin while this one awaits; only the pinned process is verified.
+      if (launch.fingerprint !== first.fingerprint) return probe;
       return verifiedProbe;
     } catch { return probe; }
   }
