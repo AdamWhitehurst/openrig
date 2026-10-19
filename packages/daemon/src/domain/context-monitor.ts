@@ -4,6 +4,7 @@ import type { ContextUsageStore } from "./context-usage-store.js";
 import {
   isAttentionRequiredReadinessCode,
   type NodeBinding,
+  type ReadinessOptions,
   type ReadinessResult,
 } from "./runtime-adapter.js";
 import type { UsageSamplesStore, ProviderWindowSampleInput } from "./usage-samples-store.js";
@@ -34,11 +35,11 @@ interface EligibleSession {
 
 interface ClaudeContextProvisioner {
   ensureContextCollector(binding: { cwd?: string | null; tmuxSession?: string | null }): void;
-  checkReady?(binding: NodeBinding): Promise<ReadinessResult>;
+  checkReady?(binding: NodeBinding, options?: ReadinessOptions): Promise<ReadinessResult>;
 }
 
 interface RuntimeReadinessChecker {
-  checkReady?(binding: NodeBinding): Promise<ReadinessResult>;
+  checkReady?(binding: NodeBinding, options?: ReadinessOptions): Promise<ReadinessResult>;
 }
 
 /**
@@ -303,18 +304,22 @@ export class ContextMonitor {
     const isCurrent = () => JSON.stringify(this.getEligibleSessions(session.node_id)[0]) === JSON.stringify(session);
     try {
       if (!isCurrent()) return;
+      // A Claude seat is checked with its real binding (pane, session, current occupant) and recorded conversation, so a
+      // banner-less auto-mode screen can be proved when no launch record exists (#1477). Other runtimes keep the stand-in.
+      const claude = session.runtime === "claude-code";
       const readiness = await checker.checkReady({
-        id: `context-monitor:${session.session_id}`,
+        id: claude && session.binding_id ? session.binding_id : `context-monitor:${session.session_id}`,
         nodeId: session.node_id,
         attachmentType: "tmux",
         tmuxSession: session.session_name,
         tmuxWindow: null,
-        tmuxPane: null,
+        tmuxPane: claude ? session.binding_pane : null,
         cmuxWorkspace: null,
         cmuxSurface: null,
         updatedAt: "",
         cwd: session.cwd ?? "",
-      });
+        ...(claude && session.generation_uuid ? { launchGeneration: session.generation_uuid } : {}),
+      }, ...(claude && session.resume_token ? [{ resumeToken: session.resume_token }] : []));
       // Hold no database lock while observing the runtime. Revalidation and
       // the write share an immediate transaction, reserving the writer before the
       // snapshot read so WAL contention cannot fail a later read-to-write upgrade.

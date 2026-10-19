@@ -90,6 +90,8 @@ export function isAttentionRequiredReadinessCode(code: string | undefined): bool
   return !!code && ATTENTION_REQUIRED_READINESS_CODES.has(code);
 }
 
+export interface ReadinessOptions { resumeToken?: string | null }
+
 // -- Harness launch result --
 
 export type HarnessLaunchRecovery = "retry_fresh" | "attention_required";
@@ -201,6 +203,8 @@ export interface RuntimeAdapter {
     binding: NodeBinding, parentToken: string,
   ): Promise<{ resumeToken: string; resumeType: string } | null>;
 
-  /** Check if the runtime harness is responsive and ready. */
-  checkReady(binding: NodeBinding): Promise<ReadinessResult>;
+  /** Check if the runtime harness is responsive and ready. `options.resumeToken` is the seat's recorded conversation,
+   *  passed by a caller that holds the real binding (its pane) and has no launch to ask: the Claude adapter then
+   *  proves a banner-less auto-mode screen by that exact conversation (#1477). */
+  checkReady(binding: NodeBinding, options?: ReadinessOptions): Promise<ReadinessResult>;
 }
