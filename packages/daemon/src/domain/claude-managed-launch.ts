@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { accessSync, constants, realpathSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, openSync, readSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import { publicSeatEnvironment } from "./seat-launch-environment.js";
@@ -119,16 +119,27 @@ export class ClaudeManagedLaunch {
       executable = realpathSync(candidate); break;
     }
     if (!executable) throw new Error("Claude managed launch executable is unavailable on the intended PATH; no fallback was selected.");
+    // The kernel runs a file as a script only when its first two bytes are `#!`. The frozen executable is then not the
+    // process that ends up running, so its path can't prove the launched Claude. Nothing in the file is read past that.
+    const startsWithShebang = (file: string) => {
+      let fd: number | undefined;
+      try {
+        fd = openSync(file, "r");
+        const head = Buffer.alloc(2);
+        return readSync(fd, head, 0, 2, 0) === 2 && head[0] === 0x23 && head[1] === 0x21;
+      } catch { return false; }
+      finally { if (fd !== undefined) try { closeSync(fd); } catch { /* nothing to release */ } }
+    };
     const identity = (file: string) => {
       const s = statSync(file);
       return [realpathSync(file), s.dev, s.ino, s.mode, s.size, s.mtimeMs, s.ctimeMs];
     };
-    return Object.freeze({ env: Object.freeze(env), configDir, executable,
+    return Object.freeze({ env: Object.freeze(env), configDir, executable, executableIsScript: startsWithShebang(executable),
       fileIdentity: Object.freeze(identity(executable)), cwdIdentity: Object.freeze(identity(cwd).slice(0, 3)) });
   }
 
   async prepare(request: ClaudeLaunchTarget, mode: string): Promise<{
-    assertCurrent: () => void; command: (args: readonly string[], launchEnv?: Readonly<Record<string, string>>) => string; configDir: string; executable: string;
+    assertCurrent: () => void; command: (args: readonly string[], launchEnv?: Readonly<Record<string, string>>) => string; configDir: string; executable: string; executableIsScript: boolean;
   }> {
     const target = Object.freeze({ ...request });
     const before = this.target(target.nodeId);
@@ -185,7 +196,7 @@ export class ClaudeManagedLaunch {
     const terminal = ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
       "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "LC_MONETARY"]
       .map(key => `\${${key}:+"${key}=$${key}"}`);
-    return Object.freeze({ assertCurrent, configDir: context.configDir, executable: context.executable, command: (args: readonly string[], launchEnv: Readonly<Record<string, string>> = {}) => {
+    return Object.freeze({ assertCurrent, configDir: context.configDir, executable: context.executable, executableIsScript: context.executableIsScript, command: (args: readonly string[], launchEnv: Readonly<Record<string, string>> = {}) => {
       assertCurrent();
       const launch = Object.entries(launchEnv).map(([key, value]) => shellQuote(`${key}=${value}`));
       return `cd ${shellQuote(cwd)} && /usr/bin/env -i ${[...assignments, ...forwarded, ...seatForwarded, ...projectForwarded, ...terminal, ...launch, shellQuote(context.executable), ...args.map(shellQuote)].join(" ")}`;
