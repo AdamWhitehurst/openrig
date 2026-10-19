@@ -24,11 +24,13 @@ function inHerdr(env: NodeJS.ProcessEnv): boolean {
 }
 
 /**
- * The Herdr markers of the tmux client that was active last, normally the one whose key started this (tmux only counts
- * keys a client types, so a key sent with `send-keys` or by a control-mode client marks no one). A shared TUI runs in the daemon's tmux server, so its own
- * environment never carries them; they are on the attached client. Linux only (the client's environment is read from
- * /proc). Undefined whenever the viewer isn't certain: no client, more than one active in the same second, a client
- * that can't be read or isn't in Herdr, or any failure. The child then keeps today's detection.
+ * The Herdr markers of the tmux client that was active last: a hint for which Herdr the person is viewing, normally the
+ * client whose key started this. tmux only counts keys a client types, so a key sent with `send-keys` or by a
+ * control-mode client marks no one, and the client found may belong to a different viewer. A shared TUI runs in the
+ * daemon's tmux server, so its own environment never carries the markers; they are on the attached client. Linux only
+ * (the client's environment is read from /proc). Undefined when there's no single last-active Herdr client: no client,
+ * more than one active in the same second, a client that can't be read or isn't in Herdr, or any failure. The child
+ * then keeps today's detection.
  */
 export async function viewerHerdrEnv(): Promise<NodeJS.ProcessEnv | undefined> {
   const pane = process.env["TMUX"] && process.env["TMUX_PANE"];
