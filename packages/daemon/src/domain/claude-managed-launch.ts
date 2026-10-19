@@ -31,6 +31,16 @@ interface TargetSnapshot {
  */
 const MANAGED_LAUNCH_KEYS = ["PATH", "HOME", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"];
 
+const PANE_TERMINAL_KEYS = ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+  "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "LC_MONETARY"];
+
+/** The person's editor and display session, so a managed seat behaves like a plain one for Claude's external-editor
+ *  action (EDITOR, VISUAL; Claude falls back to VS Code without them) and for image paste, which runs
+ *  `xclip || wl-paste` (WAYLAND_DISPLAY with XDG_RUNTIME_DIR locate the compositor socket; DISPLAY with XAUTHORITY reach
+ *  X11). Names only: the pane supplies the values. DBUS_SESSION_BUS_ADDRESS, XDG_SESSION_TYPE and XDG_CURRENT_DESKTOP are
+ *  left out: neither path reads them, and the bus would give the seat keyring and desktop services it does not have now. */
+const PANE_SESSION_KEYS = ["EDITOR", "VISUAL", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DISPLAY", "XAUTHORITY"];
+
 export class ClaudeManagedLaunch {
   constructor(private readonly db: Database.Database,
     private readonly sessionEnv: Readonly<Record<string, string | undefined>>,
@@ -182,9 +192,7 @@ export class ClaudeManagedLaunch {
     // inside tmux; without it Claude never asks tmux for extended keys, and Shift+Enter reaches it
     // as a plain Enter. TMUX is left out on purpose: a bare `tmux` follows $TMUX ahead of
     // TMUX_TMPDIR, so tools the seat runs (and any daemon it starts) would follow the seat's own tmux server.
-    const terminal = ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
-      "LC_COLLATE", "LC_NUMERIC", "LC_TIME", "LC_MONETARY"]
-      .map(key => `\${${key}:+"${key}=$${key}"}`);
+    const terminal = [...PANE_TERMINAL_KEYS, ...PANE_SESSION_KEYS].map(key => `\${${key}:+"${key}=$${key}"}`);
     return Object.freeze({ assertCurrent, configDir: context.configDir, executable: context.executable, command: (args: readonly string[], launchEnv: Readonly<Record<string, string>> = {}) => {
       assertCurrent();
       const launch = Object.entries(launchEnv).map(([key, value]) => shellQuote(`${key}=${value}`));

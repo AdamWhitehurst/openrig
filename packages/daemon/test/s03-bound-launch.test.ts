@@ -199,6 +199,52 @@ else console.log(JSON.stringify(Object.fromEntries(['TMUX', 'TERM_PROGRAM', 'TER
     // An empty or absent variable stays absent; TMUX and TMUX_PANE never arrive.
     expect(JSON.parse(stdout)).toEqual(label === "present" ? programEnv : {});
   });
+  // The names Claude needs for its external-editor action (Ctrl+G) and for image paste, which shells out to
+  // `xclip || wl-paste`. The pane supplies the values, so a person's editor and display session reach the seat
+  // without a per-spec value.
+  const sessionNames = ["EDITOR", "VISUAL", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "DISPLAY", "XAUTHORITY"];
+  // Present in the pane on purpose: they must stay out. The bus and desktop names reach services (keyring,
+  // notifications, xdg-open) that nothing in the editor or paste path uses; SSH_AUTH_SOCK is a credential channel.
+  const withheldNames = ["DBUS_SESSION_BUS_ADDRESS", "XDG_SESSION_TYPE", "XDG_CURRENT_DESKTOP", "SSH_AUTH_SOCK", "TMUX", "TMUX_PANE"];
+  it.each([
+    ["present", Object.fromEntries(sessionNames.map(key => [key, `/pane/${key}`]))],
+    ["absent", {}],
+    ["empty", Object.fromEntries(sessionNames.map(key => [key, ""]))],
+  ])("hands Claude the pane's editor and display session variables when they are %s", async (label, sessionEnv) => {
+    const f = fixture();
+    writeFileSync(f.executable, `#!${process.execPath}\n
+if (process.argv.includes('--help')) console.log(${JSON.stringify(help)});
+else console.log(JSON.stringify(Object.fromEntries(${JSON.stringify([...sessionNames, ...withheldNames])}
+  .filter(k => process.env[k] !== undefined).map(k => [k, process.env[k]]))));
+`);
+    const native = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    vi.mocked(execFile).mockImplementation(native.execFile);
+    const prepared = await f.managed.prepare({ nodeId: "node", session: "seat", pane: "%1" }, "auto");
+    const command = prepared.command(["--permission-mode", "auto"]);
+    const paneEnv: Record<string, string> = { ...f.env, ...Object.fromEntries(withheldNames.map(key => [key, `/pane/${key}`])), ...sessionEnv };
+    // Some shells set these themselves; model the absent case before the command expands them.
+    const paneCommand = label === "absent" ? `unset ${[...sessionNames, ...withheldNames].join(" ")}; ${command}` : command;
+    const stdout = await new Promise<string>((resolve, reject) => {
+      native.execFile("/bin/sh", ["-c", paneCommand], { encoding: "utf8", timeout: 3000, env: paneEnv },
+        (error, out) => error ? reject(error) : resolve(out));
+    });
+    // An empty or absent variable stays absent; the withheld names never arrive.
+    expect(JSON.parse(stdout)).toEqual(label === "present" ? sessionEnv : {});
+  });
+  it.each(["fresh", "resume", "fork", "legacy"])("names the editor and display session variables on a %s launch", async kind => {
+    const f = fixture();
+    vi.spyOn(f.adapter as any, "verifyResumeLaunch").mockResolvedValue({ ok: true });
+    const resume = new ClaudeResumeAdapter(f.tmux, { claudeManagedLaunch: f.managed });
+    vi.spyOn(resume as any, "verifyResume").mockResolvedValue({ ok: true });
+    const token = "history's id";
+    const result = kind === "legacy" ? await resume.resume("seat", "claude_id", token, f.cwd, "floor", f.binding.model, "auto", "node")
+      : await f.adapter.launchHarness(f.binding, { name: "seat", ...(kind === "resume" ? { resumeToken: token } : {}),
+        ...(kind === "fork" ? { forkSource: { kind: "native_id" as const, value: token } } : {}) });
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true });
+    const cmd = f.calls[0]!;
+    for (const key of sessionNames) expect(cmd).toContain(`\${${key}:+"${key}=$${key}"}`);
+    for (const key of withheldNames) expect(cmd).not.toContain(key);
+  });
   it("detects unset config becoming explicit even when the storage directory stays the same", async () => {
     const f = fixture(); delete f.env.CLAUDE_CONFIG_DIR;
     const prepared = await f.managed.prepare({ nodeId: "node", session: "seat" }, "auto");
