@@ -24,6 +24,19 @@ interface TargetSnapshot {
   session: string | null; pane: string | null; generation: string | null;
 }
 
+/** The kernel runs a file as a script only when its first two bytes are `#!`. A managed launch's frozen executable is
+ *  then not the process that ends up running, so its path can't prove the launched Claude. Nothing past those two bytes
+ *  is read; an unreadable, empty or one-byte file is not a script. */
+export function fileStartsWithShebang(file: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = openSync(file, "r");
+    const head = Buffer.alloc(2);
+    return readSync(fd, head, 0, 2, 0) === 2 && head[0] === 0x23 && head[1] === 0x21;
+  } catch { return false; }
+  finally { if (fd !== undefined) try { closeSync(fd); } catch { /* nothing to release */ } }
+}
+
 /** Dynamic choices use the managed launch environment, not an interactive shell's
  * aliases or startup files. No cache and no persisted environment/credentials.
  * The help child has only the capability environment. Launch adds the existing
@@ -119,22 +132,11 @@ export class ClaudeManagedLaunch {
       executable = realpathSync(candidate); break;
     }
     if (!executable) throw new Error("Claude managed launch executable is unavailable on the intended PATH; no fallback was selected.");
-    // The kernel runs a file as a script only when its first two bytes are `#!`. The frozen executable is then not the
-    // process that ends up running, so its path can't prove the launched Claude. Nothing in the file is read past that.
-    const startsWithShebang = (file: string) => {
-      let fd: number | undefined;
-      try {
-        fd = openSync(file, "r");
-        const head = Buffer.alloc(2);
-        return readSync(fd, head, 0, 2, 0) === 2 && head[0] === 0x23 && head[1] === 0x21;
-      } catch { return false; }
-      finally { if (fd !== undefined) try { closeSync(fd); } catch { /* nothing to release */ } }
-    };
     const identity = (file: string) => {
       const s = statSync(file);
       return [realpathSync(file), s.dev, s.ino, s.mode, s.size, s.mtimeMs, s.ctimeMs];
     };
-    return Object.freeze({ env: Object.freeze(env), configDir, executable, executableIsScript: startsWithShebang(executable),
+    return Object.freeze({ env: Object.freeze(env), configDir, executable, executableIsScript: fileStartsWithShebang(executable),
       fileIdentity: Object.freeze(identity(executable)), cwdIdentity: Object.freeze(identity(cwd).slice(0, 3)) });
   }
 

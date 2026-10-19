@@ -1,19 +1,18 @@
 // #1477 section 1: a managed launch says whether the executable it froze is a `#!` script, so the
 // proof of the launched process can allow for a wrapper that exec's the real binary. Drives the real
 // ClaudeManagedLaunch.prepare() against private fake executables; no provider, tmux or daemon.
-import { afterEach, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { ClaudeManagedLaunch } from "../src/domain/claude-managed-launch.js";
+import { ClaudeManagedLaunch, fileStartsWithShebang } from "../src/domain/claude-managed-launch.js";
 
 const HELP = '  --permission-mode <mode>   Permission mode to use for the session (choices: "acceptEdits", "auto", "default", "plan")';
 const open: Database.Database[] = [];
 afterEach(() => { for (const db of open.splice(0)) db.close(); });
 
-// `file` is the exact bytes of `claude` on the daemon's PATH. A file with no #! line still runs (the
-// shell takes it), so it stands in for anything that is not a script without needing a real binary.
+// `file` is the exact bytes of `claude` on the daemon's PATH; it must be a script, which runs on every platform.
 async function prepared(file: string, link?: boolean) {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "claude-script-launch-")));
   const cwd = path.join(root, "seat"); const bin = path.join(root, "bin");
@@ -44,9 +43,30 @@ it("reports it through a symlink, whose realpath is the frozen executable", asyn
   expect(managed.executableIsScript).toBe(true);
 });
 
-it("does not report a file that does not start with #!", async () => {
-  // A leading blank line or space is not a shebang; the kernel only reads one at byte 0.
-  expect((await prepared(`${printsHelp}`)).managed.executableIsScript).toBe(false);
-  expect((await prepared(`\n#!/bin/sh\n${printsHelp}`)).managed.executableIsScript).toBe(false);
-  expect((await prepared(` #!/bin/sh\n${printsHelp}`)).managed.executableIsScript).toBe(false);
+// Not through prepare(): it runs `--help` on the file first, and a file with no #! at byte 0 can't be exec'd on every
+// platform (Linux's execvp hands it to /bin/sh, macOS returns ENOEXEC), so such a fixture would pass only on some hosts.
+// prepare() reports exactly this function's answer for the file it froze.
+describe("fileStartsWithShebang", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "claude-shebang-"));
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+  const check = (bytes: string | Buffer) => { const file = path.join(dir, `f${Math.random().toString(36).slice(2)}`); writeFileSync(file, bytes); return fileStartsWithShebang(file); };
+
+  it("is true only for #! at byte 0", () => {
+    expect(check("#!/bin/sh\n")).toBe(true);
+    expect(check("#!")).toBe(true);
+    expect(check("#!/usr/bin/env node\n")).toBe(true);
+  });
+  it.each([
+    ["a leading newline", "\n#!/bin/sh\n"],
+    ["a leading space", " #!/bin/sh\n"],
+    ["no #! line", "printf help\n"],
+    ["a one-byte file", "#"],
+    ["an empty file", ""],
+    ["an ELF binary", Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01])],
+    ["a Mach-O binary", Buffer.from([0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0x00])],
+  ] as const)("is false for %s", (_name, bytes) => { expect(check(bytes as string | Buffer)).toBe(false); });
+  it("is false for a missing path and a directory", () => {
+    expect(fileStartsWithShebang(path.join(dir, "missing"))).toBe(false);
+    expect(fileStartsWithShebang(dir)).toBe(false);
+  });
 });
