@@ -95,6 +95,7 @@ export async function runExistingRigRestore(
     snapshotSelection,
     onSessionLaunched: opts.onSessionLaunched,
     automatic: opts.automatic,
+    preserveStoppedInitial: !opts.automatic,
   });
   return { snapshot, capturedCurrentState, result };
 }

@@ -120,7 +120,7 @@ async function restoreByRigId(rigId: string, rigName: string | null, deps: Retur
   // snapshot capture (itself a mutation) is reported as would-happen, never
   // performed.
   if (plan) {
-    return c.json(buildRestorePlanPreview(rig, choice.snapshot ?? null, collectPreviewSessionRows(snapshotRepo.db, rig, choice.snapshot ?? null), freshLogicalIds, Date.now(), readFreshOccupantRelations(snapshotRepo.db, rig.rig.id)), 200);
+    return c.json(buildRestorePlanPreview(rig, choice.snapshot ?? null, collectPreviewSessionRows(snapshotRepo.db, rig, choice.snapshot ?? null, true), freshLogicalIds, Date.now(), readFreshOccupantRelations(snapshotRepo.db, rig.rig.id)), 200);
   }
 
   const fs = await import("node:fs");

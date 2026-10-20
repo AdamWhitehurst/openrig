@@ -691,7 +691,7 @@ rigsRoutes.post("/:id/up", async (c) => {
   // OPR.0.3.4.4 — read-only plan gate BEFORE the auto-rehydrate capture
   // (the capture is itself a mutation) and before restoreOrch.restore().
   if (plan) {
-    return c.json(buildRestorePlanPreview(rig, snapshot ?? null, collectPreviewSessionRows(repo.db, rig, snapshot ?? null), undefined, Date.now(), readFreshOccupantRelations(repo.db, rig.rig.id)), 200);
+    return c.json(buildRestorePlanPreview(rig, snapshot ?? null, collectPreviewSessionRows(repo.db, rig, snapshot ?? null, true), freshLogicalIds, Date.now(), readFreshOccupantRelations(repo.db, rig.rig.id)), 200);
   }
 
   if (!snapshot) {
@@ -716,6 +716,7 @@ rigsRoutes.post("/:id/up", async (c) => {
     adapters: adapters ?? {},
     fsOps: { exists: (p: string) => fs.existsSync(p) },
     freshLogicalIds,
+    preserveStoppedInitial: true,
     snapshotSelection,
   });
   return renderExplorerRestore(c, repo, rig.rig.name, rigId, snapshot, capturedCurrentState, staleSnapshot, result, false);
