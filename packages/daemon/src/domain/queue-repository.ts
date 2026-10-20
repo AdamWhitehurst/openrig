@@ -10,6 +10,7 @@ import { WAKE_INTENT_PREFIX, type OutboxHandler, type OutboxEntry } from "./outb
 import { derivePickup, type PickupReceipt } from "./queue-pickup.js";
 import { lastMeaningfulTransition, readWaitingView, type WaitingView, type WaitingActivityReader } from "./queue-waiting.js";
 import { wrapPaneEnvelope } from "../lib/pane-envelope.js";
+import type { InputBoxEvidence } from "./session-transport.js";
 import { renderQueueHandoffNudge } from "./queue-nudge-text.js";
 import { getSelfHostId } from "./hosts/fanout-contract.js";
 import { parseSessionName, isHumanSeatSessionRef } from "./session-name.js";
@@ -216,6 +217,10 @@ export interface QueueItem {
   lastNudgeResult: string | null;
   /** #165: the wake send's result exactly as recorded, never rewritten by a claim. */
   lastNudgeWireResult: string | null;
+  /** #1278: the input-box reading the transport returned for the latest wake attempt
+   *  (transport.verify_input_box). Diagnostic only, never a delivery verdict; null when
+   *  that attempt had no reading. */
+  lastNudgeInputBox: InputBoxEvidence | null;
   lastHeartbeat: string | null;
   resolution: string | null;
   /** PL-007 Workspace Primitive — typed repo scope for the qitem. Validated
@@ -254,6 +259,7 @@ interface QueueItemRow {
   claimed_at: string | null;
   last_nudge_attempt: string | null;
   last_nudge_result: string | null;
+  last_nudge_input_box?: string | null;
   last_heartbeat: string | null;
   resolution: string | null;
   target_repo: string | null;
@@ -279,7 +285,40 @@ export interface QueueNudgeTransport {
     // measure the wait for a handoff nudge too (the real impl is SessionTransport, which accepts it).
     text: string,
     opts?: { verify?: boolean; stampISO?: string; actorSession?: string; committedOutboxIds?: string[]; deliveryId?: string; auditPointer?: string; queueWake?: boolean }
-  ): Promise<{ ok: boolean; verified?: boolean; error?: string; reason?: string; outcome?: string; delivery?: { state: string } }>;
+  ): Promise<{ ok: boolean; verified?: boolean; error?: string; reason?: string; outcome?: string; delivery?: { state: string }; inputBox?: InputBoxEvidence }>;
+}
+
+/** #1278: the result of one wake attempt — its classification, its recorded result, and the
+ *  input-box reading the transport returned for it, when there was one. */
+type WakeAttemptOutcome = {
+  classified: "verified" | "indeterminate" | "failed" | "retained";
+  nudgeResult: string;
+  inputBox?: InputBoxEvidence;
+};
+
+/** #1278: reject incomplete or invalid readings and keep only the four diagnostic fields. */
+function inputBoxReading(inputBox: InputBoxEvidence | undefined): InputBoxEvidence | undefined {
+  if (!inputBox || typeof inputBox !== "object") return undefined;
+  const { seat, before, after, sameProcess } = inputBox;
+  if (!["idle", "not-idle", "unknown", "unchecked"].includes(seat) || typeof sameProcess !== "boolean") return undefined;
+  const readings = ["exact", "ambiguous", "empty", "queued", "hidden", "other", "unrecognized", "unavailable", "unchecked"];
+  if (!readings.includes(before) || !readings.includes(after)) return undefined;
+  return { seat, before, after, sameProcess };
+}
+
+/** #1278: read a stored reading back; an absent or unreadable value reads unknown (null). The
+ *  reading carries its attempt's timestamp (`at`), and reads unknown unless that is still the row's
+ *  latest attempt: an older daemon records an attempt without touching this column, so a reading
+ *  left behind by an earlier attempt must not read as the latest one's. */
+function parseNudgeInputBox(stored: string | null | undefined, lastAttempt: string | null | undefined): InputBoxEvidence | null {
+  if (!stored || !lastAttempt) return null;
+  try {
+    const parsed = JSON.parse(stored) as InputBoxEvidence & { at?: unknown };
+    if (parsed?.at !== lastAttempt) return null;
+    return inputBoxReading(parsed) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export interface QueueCreateInput {
@@ -605,6 +644,7 @@ function detectTable(db: Database.Database, tableName: string): boolean {
 // and named in fieldsElided, never backfilled as empty.
 const COMPACT_ELIDED_FIELDS = [
   "body", "evidenceRef", "humanDetail", "waiting", "chainOfRecord", "replyTo", "humanQuestions", "humanAnswers",
+  "lastNudgeInputBox",
 ] as const;
 
 /** A compact listing row: the elided fields are absent, not empty, and `fieldsElided` names them. */
@@ -818,6 +858,8 @@ export class QueueRepository {
   private readonly hasReplyToColumn: boolean;
   private readonly hasHumanQuestionsColumn: boolean;
   private readonly hasEvidenceRefColumn: boolean;
+  /** #1278 — migration 116; older fixtures without it record no reading. */
+  private readonly hasNudgeInputBoxColumn: boolean;
   private readonly hasMintingGenColumn: boolean;
   private readonly hasClaimedGenColumn: boolean;
   private readonly hasQueueTransitionsTable: boolean;
@@ -883,6 +925,7 @@ export class QueueRepository {
     this.hasReplyToColumn = detectQueueColumn(db, "reply_to");
     this.hasHumanQuestionsColumn = detectQueueColumn(db, "human_questions");
     this.hasEvidenceRefColumn = detectQueueColumn(db, "evidence_ref");
+    this.hasNudgeInputBoxColumn = detectQueueColumn(db, "last_nudge_input_box");
     this.hasQueueTransitionsTable = detectTable(db, "queue_transitions");
     const transitionColumns = this.hasQueueTransitionsTable
       ? new Set((db.prepare("PRAGMA table_info(queue_transitions)").all() as Array<{ name: string }>).map((column) => column.name))
@@ -964,17 +1007,18 @@ export class QueueRepository {
     return expected === latest?.transition_id;
   }
 
-  private classifyWakeResult(res: Awaited<ReturnType<QueueNudgeTransport["send"]>>): {
-    classified: "verified" | "indeterminate" | "failed" | "retained"; nudgeResult: string;
-  } {
+  private classifyWakeResult(res: Awaited<ReturnType<QueueNudgeTransport["send"]>>): WakeAttemptOutcome {
+    // #1278: the reading rides along unchanged; it never alters the classification.
+    const inputBox = inputBoxReading(res.inputBox);
+    const reading = inputBox ? { inputBox } : {};
     if (res.outcome === "retained") return { classified: "retained", nudgeResult: res.reason?.startsWith("draft_")
-      ? "retained:draft_aware" : "retained:typing_guard" };
-    if (res.ok) return res.verified ? { classified: "verified", nudgeResult: "verified" } : { classified: "indeterminate", nudgeResult: "delivered-ack-pending" };
+      ? "retained:draft_aware" : "retained:typing_guard", ...reading };
+    if (res.ok) return res.verified ? { classified: "verified", nudgeResult: "verified", ...reading } : { classified: "indeterminate", nudgeResult: "delivered-ack-pending", ...reading };
     const detail = res.error ?? res.reason ?? "unknown";
     if (res.delivery?.state === "indeterminate" || res.delivery?.state === "sending" || isWakeTimeoutSignal(res.reason) || isWakeTimeoutSignal(res.error)) {
-      return { classified: "indeterminate", nudgeResult: `indeterminate:${detail}` };
+      return { classified: "indeterminate", nudgeResult: `indeterminate:${detail}`, ...reading };
     }
-    return { classified: "failed", nudgeResult: `failed:${detail}` };
+    return { classified: "failed", nudgeResult: `failed:${detail}`, ...reading };
   }
 
   /**
@@ -1261,7 +1305,8 @@ export class QueueRepository {
             ?.slice(AUTO_UNPARK_BLOCKER_TAG_PREFIX.length)
         : undefined;
       const wakeEvent = this.db.transaction(() => {
-        this.recordNudgeAttempt(qitemId, outcome.nudgeResult);
+        // #1278: a coalesced wake is one send, so every row it woke gets that send's reading.
+        this.recordNudgeAttempt(qitemId, outcome.nudgeResult, outcome.inputBox);
         this.outbox!.finalizeDelivery(intent.outboxId, finalState);
         if (!blockerRef) return null;
 
@@ -1422,7 +1467,7 @@ export class QueueRepository {
     if (nudgeOpt === false) return;
     if (!this.transport) return;
     const outcome = await this.performWakeSend(qitemId, destinationSession, sourceSession, bodyOverride);
-    this.recordNudgeAttempt(qitemId, outcome.nudgeResult);
+    this.recordNudgeAttempt(qitemId, outcome.nudgeResult, outcome.inputBox);
   }
 
   /** Boot recovery must respect an existing intent's claim and terminal outcome.
@@ -1456,7 +1501,7 @@ export class QueueRepository {
     bodyOverride?: string,
     prebuiltText?: string,
     committedOutboxIds?: string[],
-  ): Promise<{ classified: "verified" | "indeterminate" | "failed" | "retained"; nudgeResult: string }> {
+  ): Promise<WakeAttemptOutcome> {
     // DEFECT FIX qitem-20260827065907-b9ae334c (S1-class, 3 live specimens): a virtual
     // @external destination has NO pane — the queue row ITSELF is the gateway
     // subsystem's input (the Slack connector polls human-destined rows and its own
@@ -4077,8 +4122,24 @@ export class QueueRepository {
    *  never-posted (the connector sweep cadence bounds normal posting latency). */
   static readonly NEVER_POSTED_WINDOW_MS = 120_000;
 
-  recordNudgeAttempt(qitemId: string, result: string): void {
+  /**
+   * Record one wake attempt. #1278: `inputBox` is that attempt's input-box reading, when the
+   * transport returned one. It is written with the attempt every time, so an attempt without a
+   * reading clears an earlier attempt's reading rather than leaving it to read as current.
+   */
+  recordNudgeAttempt(qitemId: string, result: string, inputBox?: InputBoxEvidence): void {
     const ts = new Date().toISOString();
+    if (this.hasNudgeInputBoxColumn) {
+      const reading = inputBoxReading(inputBox);
+      this.db
+        .prepare(
+          `UPDATE queue_items
+             SET last_nudge_attempt = ?, last_nudge_result = ?, last_nudge_input_box = ?
+           WHERE qitem_id = ?`
+        )
+        .run(ts, result, reading ? JSON.stringify({ ...reading, at: ts }) : null, qitemId);
+      return;
+    }
     this.db
       .prepare(
         `UPDATE queue_items
@@ -4394,6 +4455,8 @@ export class QueueRepository {
       lastNudgeAttempt: row.last_nudge_attempt,
       lastNudgeResult: presentedNudgeResult(row.last_nudge_result, row.claimed_at),
       lastNudgeWireResult: row.last_nudge_result,
+      // #1278: absent before migration 116 and on compact rows (elided there), so null.
+      lastNudgeInputBox: parseNudgeInputBox(row.last_nudge_input_box, row.last_nudge_attempt),
       lastHeartbeat: row.last_heartbeat,
       resolution: row.resolution,
       // PL-007: target_repo present only when migration 038 has applied;
