@@ -153,6 +153,7 @@ describe("SettingsStore (User Settings v0)", () => {
       "snapshots.periodic.retention_keep",
       // OPR.0.4.6.02 S1 — inner-tmux status-bar launch default (static bool).
       "terminal.status_bar",
+      "terminal.inherit_tmux_environment",
       // Slice 15 (OPR.0.7.0.15) — compact command-output defaults switch.
       "output.compact",
       // Slice 15 P5 — the whoami peer bound under output.compact.
@@ -165,6 +166,7 @@ describe("SettingsStore (User Settings v0)", () => {
       "usage.pi_cost_facts",
       "usage.pi_openrouter_charge",
       "transport.verify_input_box",
+      "transport.local_user_guard",
       // OPR.0.4.6.FS-1 W2 — queue-retention maintenance knobs.
       "retention.enabled",
       "retention.transitions_days",
@@ -375,6 +377,17 @@ describe("SettingsStore (User Settings v0)", () => {
     vi.unstubAllEnvs();
     store.reset("bundle.services_enabled");
     expect(store.resolveOne("bundle.services_enabled")).toMatchObject({ value: false, source: "default" });
+  });
+
+  it("local user guard is opt-in and resolves the file/env twins", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("transport.local_user_guard")).toMatchObject({ value: false, source: "default" });
+    store.set("transport.local_user_guard", "true");
+    expect(store.resolveOne("transport.local_user_guard")).toMatchObject({ value: true, source: "file" });
+    try {
+      process.env.OPENRIG_TRANSPORT_LOCAL_USER_GUARD = "false";
+      expect(store.resolveOne("transport.local_user_guard")).toMatchObject({ value: false, source: "env" });
+    } finally { delete process.env.OPENRIG_TRANSPORT_LOCAL_USER_GUARD; }
   });
 
   it("transport.verify_input_box is off by default and resolves file, then env", () => {

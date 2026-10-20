@@ -3079,10 +3079,13 @@ describe("startup readiness reconciliation on session interaction (#7)", () => {
         expect(await reconcile(ids.session)).toBe("ready");
       });
 
-      it("promotes a fresh launch (null request); an older event without the fields keeps the reconcile's existing hold", async () => {
+      it("promotes a fresh launch (null request)", async () => {
         const fresh = seedClaude("attention_required");
         reseed(fresh, { requestedResumeToken: null, requestedResumeType: null });
         expect(await reconcile(fresh.session)).toBe("ready");
+      });
+
+      it("keeps the reconcile's existing hold for an older event without the request fields", async () => {
         const older = seedClaude("attention_required");
         db.prepare("DELETE FROM events WHERE type = 'node.startup_failed' AND node_id = ?").run(older.node.id);
         db.prepare("INSERT INTO events (rig_id, node_id, type, payload) VALUES (?, ?, 'node.startup_failed', ?)").run(older.rig.id, older.node.id,

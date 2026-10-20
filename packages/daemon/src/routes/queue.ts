@@ -1,3 +1,4 @@
+import type { SessionRegistry } from "../domain/session-registry.js";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { EventBus } from "../domain/event-bus.js";
@@ -20,7 +21,7 @@ import { loadHostRegistry, resolveHost } from "../domain/hosts/hosts-registry-re
 import { getSelfHostId, resolvesToLocalHost } from "../domain/hosts/fanout-contract.js";
 import { remoteJsonRequest } from "../domain/hosts/remote-daemon-http.js";
 import type { SettingsStore } from "../domain/user-settings/settings-store.js";
-import { deriveCurrentWork, deriveRole, deriveWorkCandidates, type RoleOrientation } from "../domain/current-work.js";
+import { deriveCurrentWork, deriveCurrentWorkChoice, deriveRole, deriveWorkCandidates, type RoleOrientation } from "../domain/current-work.js";
 import type { WhoamiService } from "../domain/whoami-service.js";
 import type Database from "better-sqlite3";
 import type { HumanQuestion } from "../domain/human-questions.js";
@@ -108,7 +109,12 @@ export function queueRoutes(): Hono {
     const parsedSource = parseSessionName(sourceSession);
     if (parsedSource.kind !== "canonical") return { ok: true };
     const rigName = parsedSource.rig;
-    const rigs = rigRepo.findRigsByName(rigName);
+    let rigs = rigRepo.findRigsByName(rigName);
+    if (rigs.length > 1) {
+      // An archived rig of the same name counts only when no active one has it
+      const activeRigs = rigRepo.findUnarchivedRigsByName(rigName);
+      if (activeRigs.length > 0) rigs = activeRigs;
+    }
     if (rigs.length === 0) return { ok: true };
     const rigId = rigs[0]!.id;
     const ws = rigRepo.getRigWorkspace(rigId);
@@ -878,6 +884,14 @@ export function queueRoutes(): Hono {
     // the unbounded in-progress set, which makes it independent of recentLimit.
     const inProgress = repo.listInProgressForDestination(session);
     const derived = deriveCurrentWork(inProgress, missionsRoot);
+    const lookups = {
+      getRow: (qitemId: string) => repo.getById(qitemId) ?? null,
+      continuationOf: (qitemId: string) => repo.currentParkContinuation(qitemId),
+    };
+    // When no single work node is settled, the plain answer names every in-progress
+    // candidate and asks the agent to choose, rather than a count alone.
+    const choice = deriveCurrentWorkChoice(derived, inProgress, missionsRoot, lookups);
+    const choiceField = choice ? { currentWorkChoice: choice } : {};
     let role: RoleOrientation = { state: "unknown", reason: "calling node unavailable", files: [] };
     try {
       const identity = (c.get("whoamiService" as never) as WhoamiService | undefined)
@@ -897,16 +911,13 @@ export function queueRoutes(): Hono {
       const workCandidates = deriveWorkCandidates(
         [...inProgress, ...held.slice(0, WORK_CANDIDATE_LIST_LIMIT), ...next.slice(0, WORK_CANDIDATE_LIST_LIMIT)],
         missionsRoot,
-        {
-          getRow: (qitemId) => repo.getById(qitemId) ?? null,
-          continuationOf: (qitemId) => repo.currentParkContinuation(qitemId),
-        },
+        lookups,
       );
-      return c.json({ ...position, ...derived, role,
+      return c.json({ ...position, ...derived, ...choiceField, role,
         // heldAndNextTruncated stays for trace scripts that predate the per-list flags.
         workCandidates: { ...workCandidates, heldTruncated, nextTruncated, heldAndNextTruncated: heldTruncated || nextTruncated } });
     }
-    return c.json({ ...position, ...derived, role });
+    return c.json({ ...position, ...derived, ...choiceField, role });
   });
 
   // GET /list — list with filters. MUST precede /:qitemId so the literal path wins.
@@ -1276,7 +1287,8 @@ export function queueRoutes(): Hono {
     if (!senderSession) return c.json({ error: "senderSession is required" }, 400);
     const parsed = queryLimit(c);
     if (!parsed.ok) return parsed.response;
-    return c.json(getOutbox(c).listForSender(senderSession, parsed.limit));
+    const sessions = c.get("sessionRegistry" as never) as SessionRegistry | undefined;
+    return c.json(getOutbox(c).listForSender(senderSession, parsed.limit, sessions?.sessionAddresses(senderSession)));
   });
 
   return app;

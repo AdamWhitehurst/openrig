@@ -61,6 +61,8 @@ export interface BootstrapStageResult {
 
 /** Full bootstrap result */
 export interface BootstrapResult {
+  /** A started launch failed to remove one-off env from tmux session state. */
+  code?: string;
   runId: string;
   status: BootstrapStatus;
   stages: BootstrapStageResult[];
@@ -635,10 +637,15 @@ export class BootstrapOrchestrator {
     }
 
     const nonInterruptive = opts.nonInterruptive ?? (new SettingsStore().resolveOne("launch.non_interruptive").value === true);
-    const instantiateOutcome = await this.deps.rigInstantiator.instantiate(spec, { nonInterruptive });
+    const instantiateOutcome = await this.deps.rigInstantiator.instantiate(spec, { nonInterruptive, ...(opts.envOverride ? { env: opts.envOverride } : {}) });
     if ((instantiateOutcome.ok || "rigId" in instantiateOutcome) && (nonInterruptive || opts.nonInterruptive === false)) warnings.push(nonInterruptiveSummary(nonInterruptive));
 
-    this.deps.bootstrapRepo.journalAction(run.id, seqCounter++, "rig_import", null, spec.name, instantiateOutcome.ok ? "completed" : "failed", {
+    const envCleanupErrors = instantiateOutcome.ok ? instantiateOutcome.result.envCleanupErrors
+      : instantiateOutcome.code === "instantiate_error" ? instantiateOutcome.envCleanupErrors : undefined;
+    const cleanupFailed = Boolean(envCleanupErrors?.length);
+    if (envCleanupErrors) errors.push(...envCleanupErrors);
+
+    this.deps.bootstrapRepo.journalAction(run.id, seqCounter++, "rig_import", null, spec.name, instantiateOutcome.ok && !cleanupFailed ? "completed" : "failed", {
       detailJson: JSON.stringify(instantiateOutcome),
     });
 
@@ -647,16 +654,16 @@ export class BootstrapOrchestrator {
       stages.push({ stage: "import_rig", status: "failed", detail: instantiateOutcome });
       const finalStatus: BootstrapStatus = hasExecFailures || packageInstallFailed ? "partial" : "failed";
       this.deps.bootstrapRepo.updateRunStatus(run.id, finalStatus);
-      return { runId: run.id, status: finalStatus, stages, errors, warnings };
+      return { runId: run.id, status: finalStatus, stages, errors, warnings, ...(cleanupFailed ? { code: "seat_env_cleanup_failed" as const } : {}) };
     }
 
-    stages.push({ stage: "import_rig", status: "ok", detail: instantiateOutcome.result });
+    stages.push({ stage: "import_rig", status: cleanupFailed ? "failed" : "ok", detail: instantiateOutcome.result });
     if (instantiateOutcome.result.warnings?.length) {
       warnings.push(...instantiateOutcome.result.warnings);
     }
 
     // --- DONE ---
-    const finalStatus: BootstrapStatus = hasExecFailures || packageInstallFailed ? "partial" : "completed";
+    const finalStatus: BootstrapStatus = hasExecFailures || packageInstallFailed || cleanupFailed ? "partial" : "completed";
     this.deps.bootstrapRepo.updateRunStatus(run.id, finalStatus, { rigId: instantiateOutcome.result.rigId });
 
     return {
@@ -664,6 +671,7 @@ export class BootstrapOrchestrator {
       status: finalStatus,
       stages,
       rigId: instantiateOutcome.result.rigId,
+      ...(cleanupFailed ? { code: "seat_env_cleanup_failed" as const } : {}),
       errors,
       warnings,
     };
@@ -689,7 +697,7 @@ export class BootstrapOrchestrator {
       // Plan mode: validate + preflight only
       const { rigPreflight } = await import("./rigspec-preflight.js");
       const { RigSpecCodec: PodCodec } = await import("./rigspec-codec.js");
-      const { RigSpecSchema: PodSchema } = await import("./rigspec-schema.js");
+      const { RigSpecSchema: PodSchema, sessionNameCollisions } = await import("./rigspec-schema.js");
 
       try {
         const raw = PodCodec.parse(rigSpecYaml);
@@ -727,7 +735,7 @@ export class BootstrapOrchestrator {
           status: preflight.ready ? "planned" : "failed",
           stages,
           errors: preflight.errors,
-          warnings: [...warnings, ...preflight.warnings],
+          warnings: [...warnings, ...sessionNameCollisions(raw), ...preflight.warnings],
         };
       } catch (err) {
         stages.push({ stage: "resolve_spec", status: "failed", detail: { error: (err as Error).message } });
@@ -807,10 +815,13 @@ export class BootstrapOrchestrator {
       const outWarnings = (outcome as { warnings?: string[] }).warnings ?? [];
       stages.push({ stage: "import_rig", status: "failed", detail: { code: outcome.code } });
       this.deps.bootstrapRepo.updateRunStatus(run.id, "failed");
-      return withRouting({ runId: run.id, status: "failed", stages, errors: outErrors, warnings: [...warnings, ...outWarnings] });
+      return withRouting({ runId: run.id, status: "failed", stages, errors: outErrors, warnings: [...warnings, ...outWarnings],
+        ...(outcome.code === "instantiate_error" && outcome.envCleanupErrors?.length ? { code: "seat_env_cleanup_failed" as const } : {}),
+      });
     }
 
     const result = outcome.result;
+    const cleanupFailed = Boolean(result.envCleanupErrors?.length);
     const anyFailed = result.nodes.some((n) => n.status === "failed");
     const anyAttention = result.nodes.some((n) => n.status === "attention_required");
 
@@ -865,6 +876,7 @@ export class BootstrapOrchestrator {
       status: finalStatus,
       stages,
       rigId: result.rigId,
+      ...(cleanupFailed ? { code: "seat_env_cleanup_failed" as const } : {}),
       errors: result.nodes.filter((n) => n.error).map((n) => n.error!),
       warnings,
     });

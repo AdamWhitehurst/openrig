@@ -4,7 +4,7 @@ import path from "node:path";
 import net from "node:net";
 import { execSync } from "node:child_process";
 import { resolveDaemonPath } from "../daemon-lifecycle.js";
-import { formatDaemonHostForUrl } from "../client.js";
+import { DaemonClient, ForeignLocalDaemonError, formatDaemonHostForUrl } from "../client.js";
 import { ConfigStore } from "../config-store.js";
 import { buildWritableHomeCheck } from "../system-preflight.js";
 import {
@@ -313,7 +313,12 @@ async function buildSpecConformanceCheck(deps: DoctorDeps): Promise<DoctorCheck>
     return { name, status: "fail", message: `Rig spec at ${deps.specPath} declares no name or no pods.` };
   }
 
-  const liveIds = deps.fetchLiveLogicalIds ? await deps.fetchLiveLogicalIds(rigName) : null;
+  let liveIds: string[] | null;
+  try { liveIds = deps.fetchLiveLogicalIds ? await deps.fetchLiveLogicalIds(rigName) : null; }
+  catch (error) {
+    if (error instanceof ForeignLocalDaemonError) return { name, status: "fail", message: error.message };
+    throw error;
+  }
   if (liveIds === null) {
     return {
       name,
@@ -389,6 +394,26 @@ function readTmuxMouseMode(deps: DoctorDeps): "on" | "off" | null {
   }
 }
 
+/** Raw topology reads retain their existing headers; the owner policy is shared with the client. */
+export async function readLiveLogicalIds(base: string, rigName: string, ownerClient = new DaemonClient(base)): Promise<string[] | null> {
+  try {
+    await ownerClient.assertLocalOwner();
+    const rigsRes = await fetch(`${base}/api/rigs`);
+    if (!rigsRes.ok) return null;
+    const rigs = (await rigsRes.json()) as Array<{ id?: string; name?: string }>;
+    const rig = rigs.find((r) => r.name === rigName);
+    if (!rig?.id) return null;
+    await ownerClient.assertLocalOwner();
+    const nodesRes = await fetch(`${base}/api/rigs/${rig.id}/nodes`);
+    if (!nodesRes.ok) return null;
+    const nodes = (await nodesRes.json()) as Array<{ logicalId?: string | null }>;
+    return nodes.map((n) => n.logicalId ?? "");
+  } catch (error) {
+    if (error instanceof ForeignLocalDaemonError) throw error;
+    return null;
+  }
+}
+
 export function doctorCommand(depsOverride?: DoctorDeps): Command {
   const cmd = new Command("doctor")
     .description("Check installation, provider authentication, writable paths, port/daemon and conditional cmux control")
@@ -408,22 +433,15 @@ export function doctorCommand(depsOverride?: DoctorDeps): Command {
         mkdirp: (dirPath: string) => mkdirSync(dirPath, { recursive: true }),
         checkWritable: (dirPath: string) => accessSync(dirPath, constants.W_OK),
         specPath: opts.spec ? path.resolve(opts.spec) : undefined,
-        // Returns null on ANY failure to read the live side. The conformance check treats null as
+        // Returns null when the live side is unavailable; a known foreign owner is reported. The conformance check treats null as
         // "unknown" and skips — an unreachable daemon must never read as a matching topology.
         fetchLiveLogicalIds: async (rigName: string): Promise<string[] | null> => {
           try {
             const cfg = new ConfigStore().resolve();
             const base = `http://${formatDaemonHostForUrl(cfg.daemon.host ?? "127.0.0.1")}:${cfg.daemon.port ?? DEFAULT_PORT}`;
-            const rigsRes = await fetch(`${base}/api/rigs`);
-            if (!rigsRes.ok) return null;
-            const rigs = (await rigsRes.json()) as Array<{ id?: string; name?: string }>;
-            const rig = rigs.find((r) => r.name === rigName);
-            if (!rig?.id) return null;
-            const nodesRes = await fetch(`${base}/api/rigs/${rig.id}/nodes`);
-            if (!nodesRes.ok) return null;
-            const nodes = (await nodesRes.json()) as Array<{ logicalId?: string | null }>;
-            return nodes.map((n) => n.logicalId ?? "");
-          } catch {
+            return await readLiveLogicalIds(base, rigName);
+          } catch (error) {
+            if (error instanceof ForeignLocalDaemonError) throw error;
             return null;
           }
         },

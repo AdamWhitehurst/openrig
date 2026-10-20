@@ -1,3 +1,4 @@
+import { physicalSessionName } from "./session-registry.js";
 import fs from "node:fs";
 import type { CaptureObserver, ObservedBinding } from "./capture-observer.js";
 import type Database from "better-sqlite3";
@@ -5,6 +6,7 @@ import { decodeTime } from "ulid";
 import { resolveActiveOccupantRow } from "./active-occupant.js";
 import type { NodeInventoryEntry, NodeDetailEntry, NodeDetailPeer, NodeDetailEdge, NodeDetailCompactSpec, NodeRestoreOutcome, NodeOriented, NodeLifecycleState, Binding, RestoreResult, NodeRecoveryGuidance, Snapshot, WorkspaceSpec, SeatIdentityVerdict, SeatIdentityVerdictKind, AgentActivity, SeatActivity } from "./types.js";
 import { identityVerdictConfirmsSessionMissing, identityVerdictDownranksRunning } from "./types.js";
+import { resolveSeatEffort } from "./seat-effort.js";
 import { SeatIdentityStore } from "./seat-identity-store.js";
 import { buildOrientedMap } from "./startup-proof.js";
 import type { RuntimeAdapter } from "./runtime-adapter.js";
@@ -40,6 +42,8 @@ interface InventoryRow {
   role: string | null;
   runtime: string | null;
   model: string | null;
+  effort: string | null;
+  effort_choice: string | null;
   codex_config_profile: string | null;
   agent_ref: string | null;
   profile: string | null;
@@ -589,11 +593,12 @@ export function getNodeInventory(db: Database.Database, rigId: string): NodeInve
 function runInventoryRowQuery(db: Database.Database, whereClause: string, orderClause: string, params: readonly string[]): InventoryRow[] {
   // Join nodes with newest session (max ULID = max session.id string comparison)
   // and the rig name
-  const hasCodexConfigProfile = db.prepare("PRAGMA table_info(nodes)").all()
-    .some((row) => (row as { name?: string }).name === "codex_config_profile");
-  const codexConfigProfileSelect = hasCodexConfigProfile
-    ? "n.codex_config_profile"
-    : "NULL";
+  // Older databases predate some node columns. Select NULL for a missing one so
+  // the projection keeps its pre-column behaviour instead of failing the read.
+  const nodeColumns = new Set(db.prepare("PRAGMA table_info(nodes)").all()
+    .map((row) => (row as { name?: string }).name));
+  const nodeColumnOrNull = (name: string) => nodeColumns.has(name) ? `n.${name}` : "NULL";
+  const codexConfigProfileSelect = nodeColumnOrNull("codex_config_profile");
   const stmt = db.prepare(`
     SELECT
       n.id as node_id,
@@ -605,6 +610,8 @@ function runInventoryRowQuery(db: Database.Database, whereClause: string, orderC
       n.role,
       n.runtime,
       n.model,
+      ${nodeColumnOrNull("effort")} as effort,
+      ${nodeColumnOrNull("effort_choice")} as effort_choice,
       ${codexConfigProfileSelect} as codex_config_profile,
       n.agent_ref,
       n.profile,
@@ -691,6 +698,7 @@ function buildInventoryEntry(
   ctx: InventoryBuildContext,
 ): NodeInventoryEntry {
   const { usableSnapshot, workspaceSpec, identityVerdicts, restoreOutcomes, orienteds, codexDaemonOptOuts } = ctx;
+  const effortResolution = resolveSeatEffort({ effort: row.effort, effortChoice: row.effort_choice });
   // FS-1 W1.3 S1 — O(1) lookup into the once-per-rig restore-outcome map
   // (byte-identical to the prior per-node deriveRestoreOutcome; "n-a" when a node
   // is referenced by no restore event, matching the prior fall-through).
@@ -769,6 +777,10 @@ function buildInventoryEntry(
     latestError: row.startup_status === "ready" ? null : getLatestError(db, row.rig_id, row.node_id),
     // Extended fields
     model: row.model,
+    // Configured launch effort only; an observed level is reported by the
+    // seat-effort route, which reads the running process and native transcript.
+    effort: effortResolution.effective,
+    effortSource: effortResolution.source,
     agentRef: row.agent_ref,
     profile: row.profile,
     codexConfigProfile: row.codex_config_profile,
@@ -1292,11 +1304,13 @@ export function readAssignedWorkBySession(db: Database.Database): Map<string, As
   }>;
   const out = new Map<string, AssignedWorkCounts>();
   for (const r of rows) {
-    out.set(r.destination_session, {
-      assignedWorkCount: r.assigned_count,
-      pendingWorkCount: r.pending_count,
-      inProgressWorkCount: r.in_progress_count,
-      blockedWorkCount: r.blocked_count,
+    const address = physicalSessionName(db, r.destination_session);
+    const prior = out.get(address);
+    out.set(address, {
+      assignedWorkCount: (prior?.assignedWorkCount ?? 0) + r.assigned_count,
+      pendingWorkCount: (prior?.pendingWorkCount ?? 0) + r.pending_count,
+      inProgressWorkCount: (prior?.inProgressWorkCount ?? 0) + r.in_progress_count,
+      blockedWorkCount: (prior?.blockedWorkCount ?? 0) + r.blocked_count,
     });
   }
   return out;

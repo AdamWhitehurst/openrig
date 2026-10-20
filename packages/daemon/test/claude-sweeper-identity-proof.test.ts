@@ -60,6 +60,14 @@ describe("a banner-less auto-mode Claude with no launch record", () => {
     expect(await adapter.checkReady(real, { resumeToken: token })).toMatchObject(unproved);
   });
 
+  // #1553's "absent" reading (a readable process list with no Claude in it) belongs to a fresh in-place launch's own record.
+  // Here it is not proof: the no-launch proof needs a process that names the exact conversation.
+  it("is not proved by a readable process list with no Claude in it", async () => {
+    const { adapter, listProcesses } = seat();
+    listProcesses.mockImplementation(async () => rowsWith().slice(0, 2));
+    expect(await adapter.checkReady(real, { resumeToken: token })).toMatchObject(unproved);
+  });
+
   it("keeps today's result when a launch record exists for a different launch", async () => {
     const { adapter } = seat();
     await adapter.launchHarness({ ...real, id: "another-binding" }, { name });

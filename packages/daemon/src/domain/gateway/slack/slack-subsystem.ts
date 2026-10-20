@@ -12,7 +12,7 @@
 // the relay's history IS the subsystem's history — enabling the subsystem replays nothing the
 // relay already delivered (the enable-time backlog rule survives the cutover by construction).
 
-import { ChannelRecovery } from "./channel-recovery.js";
+import { SlackRecovery, ownedRecoveryChannels } from "./slack-recovery.js";
 import { channelStateDigest } from "../channel-operations.js";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -23,7 +23,7 @@ import { downloadPrivateFile, isSlackHost, lookupBotApp, postChatMessage } from 
 import { botInboxProblems } from "./bot-inbox.js";
 import { loadConfig } from "./config.js";
 import { resolveSecret } from "./secrets.js";
-import { SeenStore, DeadLetterStore, InboundReceiptStore } from "./state-store.js";
+import { SeenStore, DeadLetterStore, InboundReceiptStore, slackMicros } from "./state-store.js";
 import { makeQueuePorts } from "./queue-access.js";
 import { SlackOutboundDriver, OUTBOUND_OP, type OutboundPostPayload } from "./outbound-driver.js";
 import { abortableSleep, subsystemSlackDeliver } from "./slack-delivery.js";
@@ -34,7 +34,7 @@ import { makeThreadRouteResolver } from "./thread-routing.js";
 import { resolveInboundChannelDestination, resolveOutboundChannel, unsupportedChannelMapFields } from "./channel-map.js";
 import { resolveRigRepresentative } from "../../queue-owner.js";
 import { getSelfHostId } from "../../hosts/fanout-contract.js";
-import { forwardChannelProblems, makeEnvelopeForwarder } from "./forwarding.js";
+import { envelopeChannel, forwardChannelProblems, makeEnvelopeForwarder } from "./forwarding.js";
 import type { HostRegistryLoadResult } from "../../hosts/hosts-registry-reader.js";
 import { startSocketInbound, type SocketInboundHandle, type WsLike } from "./socket-inbound.js";
 import { loadHumanRegistry, resolveSlackHandle } from "../human-registry.js";
@@ -42,6 +42,7 @@ import { hasLiveHumanGate, isBlockerLive, type QueueRepository } from "../../que
 import { formatReplyToChoice, REPLY_TO_CHOICE_ACTOR, REPLY_TO_CHAIN_LIMIT, type ReplyToChoice } from "../../reply-to-choice.js";
 import { parseSessionName } from "../../session-name.js";
 import type { FetchImpl } from "./slack-api.js";
+import { isHumanSeatSession } from "../../human-route-enforcer.js";
 import { ownerNotificationLevelAtLeast } from "../../queue-transition-log.js";
 // OPR.0.5.6.1 — the delivery rules engine: ONE decision per message replaces
 // the two dial-reads (the S14 default-decision stub). The legacy dial path
@@ -74,7 +75,7 @@ export interface SlackWireOpts {
   inboundRetryIntervalMs?: number;
   inboundMaxConnects?: number;
   registry?: RegistrySurface;
-  resolveHumanReply?: (input: { qitemId: string; actorSession: string; decision: string }) => Promise<"resolved" | "already-resolved" | "not-applicable">;
+  resolveHumanReply?: (input: { qitemId: string; actorSession: string; decision: string; messageTs?: string }) => Promise<"resolved" | "resolved-uncertain" | "already-resolved" | "not-applicable">;
 }
 
 interface HumanReplyActionPort {
@@ -87,13 +88,39 @@ interface HumanReplyActionPort {
 export function makeHumanReplyResolver(
   queueRepo: QueueRepository,
   contract: HumanReplyActionPort | undefined,
+  home?: string,
 ): NonNullable<SlackWireOpts["resolveHumanReply"]> {
   return async (input) => {
-    if (queueRepo.getById(input.qitemId)?.humanIntent === "update") return "not-applicable";
+    const source = queueRepo.getById(input.qitemId);
+    if (source?.humanIntent === "update") return "not-applicable";
     if (!contract) return "not-applicable";
+    const uncertainDecision = `${input.decision}\n\n---\nOpenRig timing context (Slack reply ${JSON.stringify([input.actorSession, input.messageTs ?? null])}): This reply resumed the question, but its ordering against the posted question could not be confirmed. Resuming is not approval; read the person's words in context.`;
+    // An acknowledgement retry must not resolve again. Match this reply's durable
+    // context, not an older episode's generic resolved marker.
+    if (slackMicros(input.messageTs) !== null && queueRepo.transitionLog.listForQitem(input.qitemId)
+      .some((transition) => transition.ownerNotificationKind === "human-decision-resolved" && transition.transitionNote === uncertainDecision)) {
+      return "resolved-uncertain";
+    }
+    let uncertain = false;
+    if (source?.state === "blocked" && isHumanSeatSession(source.blockedOn)) {
+      const episode = queueRepo.transitionLog.listForQitem(input.qitemId)
+        .filter((transition) => transition.ownerNotificationKind === "human-required").at(-1);
+      if (!episode) return "not-applicable";
+      const key = `${input.qitemId}:${episode.transitionId}`;
+      const receipt = queueRepo.transitionLog.getOwnerNotificationReceipt(input.qitemId, key);
+      // A final receipt attests delivery even when reconciliation lost its timestamp.
+      // Without one, ONLY a unique exact current-episode primary proves anything.
+      const primary = !receipt && home ? pendingPrimaryReceipt(home, input.qitemId, key) : null;
+      if (!receipt && !primary) return "not-applicable";
+      const posted = slackMicros(receipt?.messageTs ?? primary?.messageTs);
+      const replied = slackMicros(input.messageTs);
+      if (posted !== null && replied !== null && replied <= posted) return "not-applicable";
+      uncertain = Boolean(receipt?.digest) || posted === null || replied === null;
+    }
+
     try {
-      await contract.act({ verb: "resolve", ...input });
-      return "resolved";
+      await contract.act({ verb: "resolve", ...input, decision: uncertain ? uncertainDecision : input.decision });
+      return uncertain ? "resolved-uncertain" : "resolved";
     } catch (error) {
       if ((error as { code?: string }).code !== "qitem_not_leg1_parked") throw error;
       const alreadyResolved = queueRepo.transitionLog.listForQitem(input.qitemId)
@@ -108,6 +135,24 @@ export function makeHumanReplyResolver(
       return queueRepo.resolveDirectHumanReply(input) ? "resolved" : "not-applicable";
     }
   };
+}
+
+/** Read positive multipart evidence without changing final receipt/ack ownership. */
+function pendingPrimaryReceipt(home: string, qitemId: string, notificationKey: string): { messageTs: string } | null {
+  const pending = new DispatchBuffer(home).pending().filter((decision) => {
+    const p = decision.payload as Partial<OutboundPostPayload> | null;
+    return decision.op === OUTBOUND_OP && p?.qitemId === qitemId
+      && p.notificationKey === notificationKey && p.ownerNotificationKind === "human-required";
+  });
+  if (pending.length !== 1) return null;
+  const prefix = `${pending[0]!.decisionId}::primary-receipt::`;
+  const records = [...new SeenStore(path.join(stateDir(home), "slack-attempted-decisions.jsonl")).load()]
+    .filter((id) => id.startsWith(prefix));
+  if (records.length !== 1) return null;
+  try {
+    const receipt = JSON.parse(Buffer.from(records[0]!.slice(prefix.length), "base64url").toString("utf8"));
+    return slackMicros(receipt?.messageTs) !== null ? { messageTs: receipt.messageTs } : null;
+  } catch { return null; }
 }
 
 /**
@@ -700,7 +745,18 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   const stops: Array<() => void> = [];
   const starts: Array<() => void> = [];
   let inboundHandle: SocketInboundHandle | undefined;
-  let recovery: ChannelRecovery | undefined;
+  let recovery: SlackRecovery | undefined;
+  // Recovery covers the channels this machine owns and the threads tracked in them. The configured
+  // default channel keeps its established seed; a channel newly recovered starts at adoption.
+  const buildRecovery = (router: InboundRouter, seedDefault: boolean, relayed = false): SlackRecovery => new SlackRecovery({
+    channels: ownedRecoveryChannels(cfg).map((channel) => (seedDefault && channel === cfg.channel ? { channel } : { channel, seed: "adoption" as const })),
+    token: bot,
+    stateDir: stateDir(opts.home),
+    router,
+    trackedThreads: (channels, closedSince) => threadMap.trackedForRecovery(channels, closedSince),
+    fetchImpl: opts.fetchImpl,
+    ...(relayed ? { relayed: true } : {}),
+  });
 
   if (outboundReady) {
     const driver = new SlackOutboundDriver({
@@ -828,25 +884,36 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       log(`slack bot inbox OFF: ${!bot ? "SLACK_BOT_TOKEN unresolved (bots.info needs it)" : botInboxProblems(cfg).join("; ")}`);
     }
     // An envelope the hub relayed is handled here and never relayed again.
-    acceptForwarded = (env) => { relayedReceived++; return handleEnvelope(env, () => {}, built, log, undefined, { relayed: true }); };
+    acceptForwarded = (env) => {
+      relayedReceived++;
+      // A relayed event adopts its channel for recovery, from this local receipt time (only a channel configured here).
+      if (!inboundReady) recovery?.adoptRelayed(envelopeChannel(env), Date.now());
+      return handleEnvelope(env, () => {}, built, log, undefined, { relayed: true });
+    };
     if (!inboundReady) {
       // No socket here, so no socket-driven retry: drain this machine's own retained events on the
-      // same five-minute cadence the socket uses, once services start.
+      // same five-minute cadence the socket uses, once services start. The hub relays this machine's
+      // channels' live events; each configured channel the hub has relayed here is also recovered,
+      // from its first relayed event, so this machine, which owns it, gets what nobody received.
+      const relayedRecovery = (recovery = buildRecovery(built, false, true));
+      const recover = () => { void relayedRecovery.run().catch(() => log("channel recovery failed; checkpoint retained")); };
       let retryTimer: ReturnType<typeof setInterval> | undefined;
       starts.push(() => {
+        relayedRecovery.initialize(); // channels adopted before a restart resume from their saved coverage
         retryTimer = setInterval(() => {
+          recover();
           void built.retryDeadLetters().catch((e) => log(`slack dead-letter retry failed: ${(e as Error).message}`));
         }, opts.inboundRetryIntervalMs ?? 5 * 60 * 1000);
         retryTimer.unref?.();
       });
-      stops.push(() => { if (retryTimer) clearInterval(retryTimer); });
+      stops.push(() => { relayedRecovery.stop(); if (retryTimer) clearInterval(retryTimer); });
     }
   }
 
   if (inboundReady && router) {
     const socketRouter = router;
     const receipts = new InboundReceiptStore(path.join(stateDir(opts.home), "slack-inbound-receipts.jsonl"));
-    recovery = new ChannelRecovery({ channel: cfg.channel, token: bot, stateDir: stateDir(opts.home), router: socketRouter, fetchImpl: opts.fetchImpl });
+    recovery = buildRecovery(socketRouter, true);
     starts.push(() => {
       recovery!.initialize(); // persist the once-only floor before any live events
       inboundHandle = startSocketInbound(app!, socketRouter, {

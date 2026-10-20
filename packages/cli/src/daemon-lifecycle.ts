@@ -1,7 +1,7 @@
 import path from "node:path";
 import { existsSync } from "node:fs";
 import type { ChildProcess } from "node:child_process";
-import { connectionErrorCode, formatDaemonHostForUrl } from "./client.js";
+import { DaemonClient, ForeignLocalDaemonError, connectionErrorCode, formatDaemonHostForUrl } from "./client.js";
 import { blockedConnectionGuidance, isBlockedConnectionCode } from "./daemon-reachability.js";
 import type { DaemonStartLock } from "./daemon-start-lock.js";
 import { DAEMON_STOP_WAIT_MS, DAEMON_SHUTDOWN_RECEIPT, type DaemonShutdownReceipt } from "@openrig/daemon/daemon-shutdown";
@@ -1249,6 +1249,9 @@ export interface KernelReadyResult {
   kernelState: string | null;
   variant: string | null;
   detail: string | null;
+  /** The daemon is restoring an existing kernel a reboot left down, not booting a first one:
+   *  whether that restore is still running or has returned. */
+  existingRestore?: "in_progress" | "finished";
 }
 
 export async function waitForKernelReady(
@@ -1256,11 +1259,16 @@ export async function waitForKernelReady(
   timeoutMs: number,
   pollIntervalMs = 500,
 ): Promise<KernelReadyResult> {
+  const ownerClient = new DaemonClient(baseUrl);
+  // Resolve the opt-in before starting the wait. Disabled polls retain main's request/deadline flow.
+  const checkOwner = ownerClient.localOwnerCheckEnabled();
   const deadline = Date.now() + timeoutMs;
   let last: KernelReadyResult = { ok: false, kernelState: null, variant: null, detail: null };
   while (Date.now() < deadline) {
-    const remainingMs = Math.max(1, deadline - Date.now());
     try {
+      if (checkOwner) await ownerClient.assertLocalOwner(Math.min(1000, Math.max(1, deadline - Date.now())));
+      // Once admitted, keep the final request even if an unknown owner check consumed the remainder.
+      const remainingMs = Math.max(1, deadline - Date.now());
       const res = await fetch(`${baseUrl}/api/kernel/status`, {
         signal: AbortSignal.timeout(remainingMs),
       });
@@ -1269,14 +1277,19 @@ export async function waitForKernelReady(
           kernel_state?: string;
           variant?: string | null;
           detail?: string | null;
+          existing_restore?: string;
         };
         last = {
           ok: body.kernel_state === "ready" || body.kernel_state === "partial_ready",
           kernelState: body.kernel_state ?? null,
           variant: body.variant ?? null,
           detail: body.detail ?? null,
+          ...(body.existing_restore === "in_progress" || body.existing_restore === "finished"
+            ? { existingRestore: body.existing_restore } : {}),
         };
         if (last.ok) return last;
+        // A restore of an existing kernel that has returned without a ready kernel won't change.
+        if (last.existingRestore === "finished") return last;
         // Terminal non-ready states: don't keep polling.
         if (
           body.kernel_state === "auth_blocked" ||
@@ -1288,7 +1301,8 @@ export async function waitForKernelReady(
           return last;
         }
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof ForeignLocalDaemonError) return { ...last, detail: error.message };
       // Transient fetch failure; keep polling until the deadline.
     }
     const sleepMs = Math.min(pollIntervalMs, Math.max(0, deadline - Date.now()));

@@ -145,30 +145,57 @@ function commandUsesExpectedToken(command: string, runtime: NativeRuntime, expec
   return codexConversationToken(args, "resume") === expectedToken;
 }
 
+// Interactive options can appear before or after `resume`/`fork`. Their values
+// (including a model or directory named "resume") are never positionals.
+const CODEX_OPTIONS_WITH_VALUES = new Set([
+  "-a", "--ask-for-approval", "-c", "--config", "-m", "--model",
+  "-p", "--profile", "-s", "--sandbox", "-C", "--cd", "--add-dir",
+  "--enable", "--disable", "--local-provider",
+  "--remote", "--remote-auth-token-env",
+]);
+
+// Unlike the single-value options, --image/-i consumes consecutive values until
+// another option or `--` (Codex SharedCliOptions.images: num_args = 1..).
+function codexOptionEnd(args: string[], index: number): number {
+  const arg = args[index]!;
+  if (arg === "-i" || arg === "--image") {
+    let end = index + 1;
+    while (end < args.length && !args[end]!.startsWith("-")) end += 1;
+    return end;
+  }
+  return index + (CODEX_OPTIONS_WITH_VALUES.has(arg) ? 2 : 1);
+}
+
 // undefined is another command; null is the requested command without an exact token.
 function codexConversationToken(args: string[], subcommand: "resume" | "fork"): string | null | undefined {
-  const topLevelOptionsWithValues = new Set([
-    "-a", "--ask-for-approval", "-c", "--config", "-m", "--model",
-    "-p", "--profile", "-s", "--sandbox",
-  ]);
   let resumeIndex = -1;
-  for (let index = 0; index < args.length; index += 1) {
+  for (let index = 0; index < args.length;) {
     const arg = args[index]!;
-    if (topLevelOptionsWithValues.has(arg)) { index += 1; continue; }
-    if (arg.startsWith("-")) continue;
+    if (arg === "--") break; // Everything after this is the fresh launch's prompt.
+    if (arg.startsWith("-")) { index = codexOptionEnd(args, index); continue; }
     if (arg === subcommand) resumeIndex = index;
     break;
   }
   if (resumeIndex < 0) return undefined;
   const resumeArgs = args.slice(resumeIndex + 1);
   let index = 0;
+  let conversation: string | null = null;
+  let last = false;
   while (index < resumeArgs.length) {
     const arg = resumeArgs[index]!;
-    if (arg === "--add-dir") { index += 2; continue; }
-    if (arg.startsWith("-")) { index += 1; continue; }
-    return arg;
+    if (arg === "--") { conversation ??= resumeArgs[index + 1] ?? null; break; }
+    if (arg === "--last") last = true;
+    if (arg.startsWith("-")) { index = codexOptionEnd(resumeArgs, index); continue; }
+    // ps has lost argv boundaries: after a session and the first prompt word,
+    // later option-looking words belong to the prompt. A real --last conflicts
+    // with a session plus a prompt in Codex's interactive grammar.
+    if (conversation !== null) break;
+    conversation = arg;
+    index += 1;
   }
-  return null;
+  // Both Codex finalizers treat --last's positional as the prompt. Scan past
+  // the first positional because a real --last may follow the session id.
+  return last ? null : conversation;
 }
 
 /** A `ps` command line split the way identity proof splits it. */
