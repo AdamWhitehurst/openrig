@@ -44,9 +44,10 @@ for (const shell of ["bash", "zsh", "dash", "ksh"]) {
           "const fs = require('node:fs');",
           "process.title = 'claude-fixture';",
           "process.on('SIGTERM', () => process.exit(0));",
-          "fs.writeFileSync(process.env.MARKER, JSON.stringify({pid:process.pid,ppid:process.ppid,argv:process.argv.slice(2),",
+          "fs.writeFileSync(process.env.MARKER + '.part', JSON.stringify({pid:process.pid,ppid:process.ppid,argv:process.argv.slice(2),",
           "node:process.env.OPENRIG_NODE_ID,home:process.env.OPENRIG_HOME,renderer:process.env.CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN,",
           "resume:process.env.OPENRIG_RESUME_LAUNCH,wrapper:process.env.FIXTURE_WRAPPER,config:process.env.CLAUDE_CONFIG_DIR}));",
+          "fs.renameSync(process.env.MARKER + '.part', process.env.MARKER);",
           "setInterval(() => {}, 1000);",
         ].join("\n"));
         fs.writeFileSync(fake, "#!/bin/sh\nexec " + quote(process.execPath) + " " + quote(recorder) + ' "$@"\n', { mode: 0o755 });
