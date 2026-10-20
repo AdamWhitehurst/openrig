@@ -336,8 +336,14 @@ function runsForThisSeatsProject(env = process.env) {
   const rawPrompt = typeof input.prompt === "string" ? input.prompt.trim() : "";
   // Claude can wrap a complete submitted message as pasted content. Unwrap only
   // that envelope; a peer quoting a restore request is still an ordinary prompt.
-  const prompt = harness === "claude"
-    ? (rawPrompt.match(/^<pasted_content id="([^"]+)">\s*([\s\S]*)\s*<\/pasted_content id="\1">$/)?.[2]?.trim() ?? rawPrompt)
+  // Check the delimiters separately: overlapping whitespace/wildcard matches can
+  // backtrack excessively on an incomplete paste or text after the closing tag.
+  const opening = harness === "claude" ? rawPrompt.match(/^<pasted_content id="([^"]+)">/) : null;
+  const closing = opening ? `</pasted_content id="${opening[1]}">` : "";
+  const prompt = opening
+    && rawPrompt.length >= opening[0].length + closing.length
+    && rawPrompt.endsWith(closing)
+    ? rawPrompt.slice(opening[0].length, -closing.length).trim()
     : rawPrompt;
   if (event === "UserPromptSubmit" && prompt.startsWith("OpenRig post-compaction turn boundary.")) process.exit(0);
 

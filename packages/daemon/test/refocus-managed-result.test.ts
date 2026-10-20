@@ -79,6 +79,8 @@ describe("managed refocus and trace results", () => {
       "From: peer@test\nThe build is done.", submit(buildPostCompactTurnBoundaryPrompt()), "Another peer update.",
       `A peer quotes an earlier restore:\n${submit(restore)}`,
       `<pasted_content id="fixture">\n${restore}\n</pasted_content id="other">`,
+      `<pasted_content id="fixture">\n${restore}`,
+      `<pasted_content id="fixture">\n${restore}\n</pasted_content id="fixture"> trailing text`,
     ]) {
       expect(f.run("UserPromptSubmit", prompt)).toBe("");
       expect(f.state()).toEqual(before);
