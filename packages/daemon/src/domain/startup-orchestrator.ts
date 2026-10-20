@@ -36,6 +36,23 @@ const STARTUP_SUBMIT_SETTLE_LOOKS = 25;
 // the 200 ms look. Every retry is guarded: Enter goes in only while the composer holds exactly the text we typed.
 const STARTUP_SUBMIT_RETRIES = 2;
 
+// Why a startup prompt's submission could not be confirmed, as told to the operator when the
+// proof line is held back.
+const UNCONFIRMED_STAGED = "the prompt still looked staged in the input box";
+const UNCONFIRMED_UNOBSERVABLE = "the input box could not be observed";
+const UNCONFIRMED_UNCLEAR = "the input box did not clearly show the prompt as submitted";
+const UNCONFIRMED_RETRY_REFUSED = "the guarded Enter retry did not go through";
+
+/**
+ * The proof line is held back on purpose when the startup prompt isn't confirmed submitted. Say that
+ * only this one line was skipped, so it doesn't read as the agent or the rig failing to start.
+ */
+export function startupProofHeldBackWarning(reason: string | undefined): string {
+  return "Startup proof instruction held back: only the extra line asking the agent to run its startup check "
+    + "was not sent, so nothing is typed over input that may still be in the box. The startup prompt itself was "
+    + `sent, but its submission could not be confirmed: ${reason ?? "it was not observed submitted"}.`;
+}
+
 type PendingForkContext = { parentToken: string; isRestore: boolean };
 export type PendingStartupContext = { eventSeq: number } & (
   | { mode: "fresh" }
@@ -194,6 +211,8 @@ type StartupDeliveryInput = StartupInput & {
   startupAttemptId: string; sendOrder: number; submissionDiagnostics: StartupSubmissionDiagnostic[];
   /** Claude only: whether the latest interactive send was observed submitted (a clear composer). */
   lastSubmissionConfirmed?: boolean;
+  /** Claude only: why the latest interactive send was not confirmed, in words for the operator. */
+  lastSubmissionUnconfirmedReason?: string;
 };
 
 export type StartupResult = { warnings?: string[] } & (
@@ -992,7 +1011,7 @@ export class StartupOrchestrator {
   private async sendProofInstruction(input: StartupDeliveryInput): Promise<void> {
     if (input.adapter.runtime !== "claude-code" || !input.binding.tmuxSession) return;
     if (!input.lastSubmissionConfirmed) {
-      this.recordSubmissionWarning(input, "Startup proof instruction was not sent: the startup prompt was not confirmed submitted.");
+      this.recordSubmissionWarning(input, startupProofHeldBackWarning(input.lastSubmissionUnconfirmedReason));
       return;
     }
     const failure = await this.sendInteractiveText(input, STARTUP_PROOF_INSTRUCTION_LINE, "startup_proof_instruction");
@@ -1010,6 +1029,7 @@ export class StartupOrchestrator {
     const sendOrder = ++input.sendOrder;
     const tmuxSession = input.binding.tmuxSession!;
     input.lastSubmissionConfirmed = false;
+    input.lastSubmissionUnconfirmedReason = undefined;
     const textResult = await this.tmuxAdapter.sendText(tmuxSession, text);
     if (!textResult.ok) {
       return { error: (textResult as { message?: string }).message ?? "unknown" };
@@ -1031,7 +1051,8 @@ export class StartupOrchestrator {
       if (evidence) diagnostic.observations.push({ ...evidence, phase, ...(look === undefined ? {} : { look }) });
       return evidence;
     };
-    const unverified = (reason: string): null => {
+    const unverified = (reason: string, operatorReason: string): null => {
+      input.lastSubmissionUnconfirmedReason = operatorReason;
       this.recordSubmissionWarning(input, reason);
       return null; // An unavailable observation is not a failed delivery.
     };
@@ -1040,7 +1061,7 @@ export class StartupOrchestrator {
     try {
       await this.sleep(200);
       const first = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES);
-      if (!first?.trim()) { record(first); return unverified("Startup submission capture is unavailable after Enter."); }
+      if (!first?.trim()) { record(first); return unverified("Startup submission capture is unavailable after Enter.", UNCONFIRMED_UNOBSERVABLE); }
       const { pane, state: before, looks } = await this.settleOwnPaste(tmuxSession, first, text, input.adapter.runtime);
       if (before === "clear") { input.lastSubmissionConfirmed = true; return null; }
       if (before === "unverified") {
@@ -1048,7 +1069,8 @@ export class StartupOrchestrator {
         const evidence = record(pane, looks || undefined);
         return unverified(evidence?.reason === "unrecognized_composer_boundary"
           ? "Startup submission is unverified: the current composer boundary was not recognized."
-          : "Startup submission is unverified: the current composer does not positively match the complete prompt.");
+          : "Startup submission is unverified: the current composer does not positively match the complete prompt.",
+        UNCONFIRMED_UNCLEAR);
       }
       let retry: Awaited<ReturnType<SessionTransport["send"]>>;
       let after: string | null;
@@ -1068,13 +1090,14 @@ export class StartupOrchestrator {
         phase = "after_retry";
         await this.sleep(200);
         after = await this.tmuxAdapter.capturePaneContent(tmuxSession, STARTUP_SUBMIT_CAPTURE_LINES);
-        if (!after?.trim()) { record(after); return unverified("Startup submission capture is unavailable after the guarded retry."); }
+        if (!after?.trim()) { record(after); return unverified("Startup submission capture is unavailable after the guarded retry.", UNCONFIRMED_UNOBSERVABLE); }
         observed = inspectStartupStagedText(after, text, input.adapter.runtime);
         // A refused retry is not repeated; only a retry whose Enter went in and was lost again is.
       } while (observed === "staged" && retry.ok && ++retries < STARTUP_SUBMIT_RETRIES);
       if (observed === "staged") {
         const warning = `Startup prompt still staged in ${tmuxSession}; press Enter in that pane.`;
         input.stagedSubmissionWarning = warning;
+        input.lastSubmissionUnconfirmedReason = UNCONFIRMED_STAGED;
         this.recordSubmissionWarning(input, warning);
         if (!retry.ok) this.recordSubmissionWarning(input, `Guarded retry did not submit: ${retry.error ?? retry.reason}`);
         return null;
@@ -1083,14 +1106,15 @@ export class StartupOrchestrator {
         const evidence = record(after);
         return unverified(evidence?.reason === "unrecognized_composer_boundary"
           ? "Startup submission is unverified after the guarded retry: the current composer boundary was not recognized."
-          : "Startup submission is unverified after the guarded retry: the current composer is ambiguous.");
+          : "Startup submission is unverified after the guarded retry: the current composer is ambiguous.",
+        UNCONFIRMED_UNCLEAR);
       }
-      if (!retry.ok) return unverified(`Guarded startup retry did not submit: ${retry.error ?? retry.reason}; matching staged text is no longer visible.`);
+      if (!retry.ok) return unverified(`Guarded startup retry did not submit: ${retry.error ?? retry.reason}; matching staged text is no longer visible.`, UNCONFIRMED_RETRY_REFUSED);
       input.lastSubmissionConfirmed = true;
       return null;
     } catch (error) {
       if (!diagnostic.observations.some(observation => observation.phase === phase)) record(null);
-      return unverified(`Startup submission observation is unavailable: ${(error as Error).message}`);
+      return unverified(`Startup submission observation is unavailable: ${(error as Error).message}`, UNCONFIRMED_UNOBSERVABLE);
     } finally {
       if (diagnostic.observations.length) input.submissionDiagnostics.push(diagnostic);
     }
