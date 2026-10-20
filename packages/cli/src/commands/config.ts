@@ -160,7 +160,9 @@ Precedence: CLI flag > environment variable > config file > default`)
           console.log(JSON.stringify(store.resolveWithSource(key), null, 2));
           return;
         }
-        if (opts.showSource) {
+        // `--with-source` is the parent command's flag; commander accepts it on
+        // either side of `get`, and it asks for the same line as `--show-source`.
+        if (opts.showSource || cmd.opts<{ withSource?: boolean }>().withSource) {
           const r = store.resolveWithSource(key);
           console.log(`${r.value}\t(source: ${r.source})`);
           return;
