@@ -227,14 +227,6 @@ describe("ClaudeCompactionEnforcer", () => {
     expect(second).toEqual({ triggered: true });
     expect(send.mock.calls[1]![1]).toContain("/compact");
 
-    now += 61_000;
-    const third = await enforcer.maybeAutoCompact({
-      sessionName: "claude-seat@rig",
-      runtime: "claude-code",
-      usedPercentage: 95,
-    });
-    expect(third).toEqual({ triggered: false, reason: "already_triggered_above_threshold" });
-
     const belowBoundary = await enforcer.maybeAutoCompact({
       sessionName: "claude-seat@rig",
       runtime: "claude-code",
@@ -439,6 +431,52 @@ describe("ClaudeCompactionEnforcer", () => {
     await enforcer.maybeAutoCompact({ sessionName: "claude-seat@rig", runtime: "claude-code", usedPercentage: 95 });
     void send;
     expect(await belowTick(enforcer)).toEqual({ triggered: true }); // no resolver -> gate inert -> drains
+  });
+
+  it.each(["busy", "retained"])("a fresh high sample retains the exact owed stage after %s", async kind => {
+    const { enforcer, send } = await queueStageWithGen("same-generation");
+    const highTick = () => enforcer.maybeAutoCompact({ sessionName: "claude-seat@rig", runtime: "claude-code",
+      usedPercentage: 95, transcriptPath: "/tmp/c.jsonl" });
+    const deliveredBefore = send.mock.calls.length;
+    // The initial boundary advances while high; the restore must still respect delivery admission.
+    expect(await highTick()).toEqual({ triggered: true });
+    const held = kind === "busy" ? { ok: false, reason: "wait_for_idle_timeout" } : { ok: true, outcome: "retained" };
+    send.mockResolvedValueOnce(held);
+    expect(await highTick()).toEqual({ triggered: false, reason: "send_failed" });
+    expect(send.mock.calls.at(-1)?.[1]).toContain("restoring this Claude session after compaction");
+    expect(send.mock.calls.at(-1)?.[2]).toEqual({ waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true });
+    expect(await highTick()).toEqual({ triggered: true });
+    expect(send.mock.calls.at(-1)?.[1]).toContain("restoring this Claude session after compaction");
+    expect(await highTick()).toEqual({ triggered: true });
+    expect(send.mock.calls.at(-1)?.[1]).toContain("Now audit your compaction restore");
+    expect(send.mock.calls.slice(deliveredBefore).some(call => String(call[1]).includes("preparation is now required") || String(call[1]).startsWith("/compact"))).toBe(false);
+  });
+
+  it.each(["disabled", "replacement"])("a fresh high sample preserves the pending-stage %s gate", async kind => {
+    const policy = { ...POLICY_ENABLED_AT_80 };
+    const { transport, send } = makeSessionTransport();
+    let generation = "original";
+    const enforcer = new ClaudeCompactionEnforcer(makeSettingsStore(policy), transport, {
+      resolveOccupantGeneration: () => generation,
+    });
+    const tick = () => enforcer.maybeAutoCompact({ sessionName: "claude-seat@rig", runtime: "claude-code", usedPercentage: 95 });
+    await tick(); await tick();
+    const count = send.mock.calls.length;
+    if (kind === "disabled") policy.enabled = false;
+    else generation = "replacement";
+    expect(await tick()).toEqual({ triggered: false, reason: kind === "disabled" ? "disabled" : "stale_generation" });
+    expect(send).toHaveBeenCalledTimes(count);
+  });
+
+  it.each([true, false])("high-usage manual drain keeps the operator exemption actor-gated: %s", async operatorInitiated => {
+    const { transport, send } = makeSessionTransport();
+    const enforcer = new ClaudeCompactionEnforcer(makeSettingsStore(POLICY_DISABLED), transport);
+    expect(await enforcer.triggerManualCompact({ sessionName: "manual@rig", runtime: "claude-code", usedPercentage: 95 },
+      { operatorInitiated })).toEqual({ triggered: true, stage: "compact-sent" });
+    const before = send.mock.calls.length;
+    expect(await enforcer.maybeAutoCompact({ sessionName: "manual@rig", runtime: "claude-code", usedPercentage: 95 }))
+      .toEqual(operatorInitiated ? { triggered: true } : { triggered: false, reason: "disabled" });
+    expect(send).toHaveBeenCalledTimes(before + (operatorInitiated ? 1 : 0));
   });
 
   // A pending post-compact stage drains without a usage sample (ContextMonitor calls this when the
@@ -1352,7 +1390,7 @@ describe("ClaudeCompactionEnforcer", () => {
       expect(enforcer.getManualCompactionState("b@rig")).toBeNull();
     });
 
-    it("forward-fix B1: after a manual trigger, an above-threshold auto tick past the dedup window does NOT start a second prep (dedups); the manual back-half still drains", async () => {
+    it("after a manual trigger, a fresh high tick advances the owed stage without a second preparation", async () => {
       const settings = makeSettingsStore(POLICY_ENABLED_AT_80);
       const { transport, send } = makeSessionTransport();
       const enforcer = new ClaudeCompactionEnforcer(settings, transport, {
@@ -1370,19 +1408,13 @@ describe("ClaudeCompactionEnforcer", () => {
       })).toEqual({ triggered: true, stage: "compact-sent" });
       expect(send).toHaveBeenCalledTimes(2);
 
-      // Advance PAST the short dedup window, then an ABOVE-threshold auto tick.
-      // It must dedup on triggeredAboveThreshold — NOT start a second prep.
+      // Advancing a pending stage is not a new trigger, even past the short dedup window.
       now += 61_000;
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 95,
-      })).toEqual({ triggered: false, reason: "already_triggered_above_threshold" });
-      expect(send).toHaveBeenCalledTimes(2); // no third message
-
-      // The manual restore/audit back-half still drains normally once below threshold.
-      expect(await enforcer.maybeAutoCompact({
-        sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
-      })).toEqual({ triggered: true }); // turn boundary
-      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { waitForIdleMs: expect.any(Number) });
+      })).toEqual({ triggered: true }); // owed turn boundary, not another prep
+      expect(send).toHaveBeenCalledTimes(3);
+      expect(send).toHaveBeenLastCalledWith(SEAT, expect.stringContaining("OpenRig post-compaction turn boundary"), { waitForIdleMs: expect.any(Number), readinessFromPaneOnly: true });
       expect(await enforcer.maybeAutoCompact({
         sessionName: SEAT, runtime: "claude-code", usedPercentage: 20, transcriptPath: "/tmp/claude.jsonl",
       })).toEqual({ triggered: true }); // restore

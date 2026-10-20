@@ -38,9 +38,8 @@ import * as path from "node:path";
  *   write an attempt-bound restore map. Existing polls send /compact only after
  *   atomic publication of that completed artifact, within the preparation deadline.
  * - Post-compact restore: after a successful auto-compact, the enforcer
- *   first sends a turn-boundary handshake once context usage drops below
- *   threshold, or when the latest sample is stale or unknown (a seat that
- *   takes no turn after /compact never refreshes its sample), then sends the
+ *   first sends a turn-boundary handshake when the pane is idle, independently
+ *   of trigger usage (including stale or unknown samples), then sends the
  *   restore prompt on a later polling tick.
  *   This is intentionally active because Claude hooks can provide
  *   context, but they do not create a new assistant turn by themselves.
@@ -577,11 +576,11 @@ export class ClaudeCompactionEnforcer {
     input: EnforcerInput,
     policy: ClaudeCompactionPolicy,
   ): Promise<EnforcerOutcome | null> {
-    // Without a usage sample nothing shows compaction has finished, and the newest hook can be the
-    // Stop from before /compact. Then only a live pane read may count as idle.
+    // A missing or still-high sample need not show that /compact has finished. The newest idle
+    // hook can predate it, so these drains require a live pane read to establish idle.
     const sendOpts = {
       waitForIdleMs: this.postCompactSendWaitMs,
-      ...(input.usedPercentage == null ? { readinessFromPaneOnly: true } : {}),
+      ...(input.usedPercentage == null || input.usedPercentage >= policy.thresholdPercent ? { readinessFromPaneOnly: true } : {}),
     };
     // GHOST-STAGE FIX (a) — gate the DRAIN by `enabled`. A disabled system drains NOTHING: the
     // legacy compaction-stage defect (operator-confirmed ruling 05c174e0) proved that draining a
@@ -687,7 +686,10 @@ export class ClaudeCompactionEnforcer {
         input.sessionName,
         Date.now() + this.postCompactRestoreCooldownMs,
       );
-      this.triggeredAboveThreshold.delete(input.sessionName);
+      // A high sample may now finish the audit, but must not re-arm automatic compaction.
+      if (input.usedPercentage == null || input.usedPercentage < policy.thresholdPercent) {
+        this.triggeredAboveThreshold.delete(input.sessionName);
+      }
       // OPR.0.4.3.14 — terminal manual-trigger stage (no-op for auto seats).
       this.advanceManualStage(input.sessionName, "restore-sent", "audit-sent");
       return { triggered: true };
@@ -714,9 +716,11 @@ export class ClaudeCompactionEnforcer {
     if (!isValidThresholdPercent(policy.thresholdPercent)) {
       return { triggered: false, reason: "invalid_policy" };
     }
+    // A trigger sample must not block work already owed to this occupant. Restore reads can
+    // themselves exceed a low threshold; keep the same stage, authorization and idle gates.
+    const drained = await this.drainPendingStage(input, policy);
+    if (drained) return drained;
     if (input.usedPercentage < policy.thresholdPercent) {
-      const drained = await this.drainPendingStage(input, policy);
-      if (drained) return drained;
       this.triggeredAboveThreshold.delete(input.sessionName);
       const preparation = this.pendingPreCompactPrep.get(input.sessionName);
       if (preparation?.status === "compact-sent") this.pendingPreCompactPrep.delete(input.sessionName);
@@ -725,15 +729,8 @@ export class ClaudeCompactionEnforcer {
       return { triggered: false, reason: "below_threshold" };
     }
 
-    // OPR.0.4.3.14 — the `enabled` gate moved here (from the top of the method)
-    // so it guards only the auto TRIGGER (this above-threshold path). The
-    // below-threshold back-half above now drains regardless of `enabled`,
-    // because it only advances an ALREADY-INITIATED guided sequence
-    // (`pendingPostCompactRestore` is set only after a /compact was sent — by
-    // auto above OR by the manual trigger). A disabled policy therefore still
-    // never STARTS a compaction (unchanged observable auto behavior for a
-    // constant policy), while a manual trigger's restore/audit half can finish
-    // via this single shared path even when auto-compaction is disabled.
+    // No new automatic compaction while disabled. An already-owed stage above uses
+    // drainPendingStage's existing operator-initiated manual exemption.
     if (!policy.enabled) {
       return { triggered: false, reason: "disabled" };
     }

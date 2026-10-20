@@ -123,7 +123,9 @@ for(const mapBeforeRise of [true,false])it(`threshold dip retains the same attem
  if(!mapBeforeRise){expect(compacts(f)).toHaveLength(0);expect(f.writes).toHaveLength(1);stageMap(f);await f.e.maybeAutoCompact(input);}
  await f.e.maybeAutoCompact(input);
  expect(f.e.getPreparationState(seat)).toMatchObject({attemptId:original.attemptId,deadlineAt:original.deadlineAt,status:'compact-sent'});
- expect(f.writes.filter(t=>!t.startsWith('/compact'))).toHaveLength(1);expect(compacts(f)).toHaveLength(1);
+ // A high tick now delivers the owed boundary; it must not create another preparation/map.
+ expect(f.writes.filter(t=>t.includes('automatic compaction preparation is now required'))).toHaveLength(1);
+ expect(f.writes.at(-1)).toContain('OpenRig post-compaction turn boundary.');expect(compacts(f)).toHaveLength(1);
 });
 for(const boundary of ['writeFile','load-buffer','key-list'])it(`actual tmux adapter checks cancellation after ${boundary} await`,async()=>{
  const f=fixture();await f.e.maybeAutoCompact(input);stageMap(f);
