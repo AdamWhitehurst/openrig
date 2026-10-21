@@ -879,9 +879,15 @@ export class WorkflowRuntime {
   }
 
   async project(input: ProjectStepInput): Promise<ProjectStepResult> {
+    const owner = this.queueRepo.getById(input.currentPacketId)?.destinationSession;
     const result = await this.projector.project(input);
     this.reconcileStuckExceptions(input.instanceId);
-    return result;
+    // A known caller projecting another seat's packet is told so in the response. Nothing is refused and the owner isn't
+    // notified: delegated work stays one call. A claimed or unknown-origin caller isn't a mismatch.
+    const known = input.identityProvenance === "transport:v1" || input.identityProvenance === "relay:v1";
+    if (!known || !owner || owner === input.actorSession) return result;
+    return { ...result, advisories: [...(result.advisories ?? []),
+      `recorded ${input.actorSession} as the agent that projected packet ${input.currentPacketId}, which is owned by ${owner}`] };
   }
 
   /** Recheck each recorded overdue packet, never a sibling's verdict. The
@@ -994,7 +1000,7 @@ export class WorkflowRuntime {
     return { instance, frontier, failures, unknowns, boundaryObligations: lifecycleObligations(this.db, instanceId, instance.lifecycleBinding, spec?.steps ?? [], instance.currentFrontier) };
   }
 
-  async abort(input: { instanceId: string; reason: string; actorSession: string }): Promise<{
+  async abort(input: { instanceId: string; reason: string; actorSession: string; identityProvenance?: string | null }): Promise<{
     instanceId: string;
     closedPacketIds: string[];
     status: "aborted";
@@ -1021,6 +1027,7 @@ export class WorkflowRuntime {
         const closed = this.queueRepo.updateWithinTransaction({
           qitemId: packetId,
           actorSession: input.actorSession,
+          identityProvenance: input.identityProvenance ?? null,
           viaWorkflowVerb: true,
           state: "canceled",
           transitionNote: `workflow abort by ${input.actorSession}: ${input.reason}`,
@@ -1094,6 +1101,7 @@ export class WorkflowRuntime {
     occurrenceId?: string;
     decision?: string;
     actorSession: string;
+    identityProvenance?: string | null;
   }): Promise<{
     instanceId: string;
     stepId: string;
@@ -1184,6 +1192,7 @@ export class WorkflowRuntime {
       const created = this.queueRepo.createWithinTransaction({
         qitemId: redrivePacketId,
         sourceSession: input.actorSession,
+        identityProvenance: input.identityProvenance ?? null,
         destinationSession: owner,
         body: withWorkflowContinuation({
           binding: instance.lifecycleBinding,
@@ -1220,7 +1229,7 @@ export class WorkflowRuntime {
         created.qitemId,
         input.actorSession,
         created.destinationSession,
-        null,
+        input.identityProvenance ?? null,
         created.nudge,
       );
 
@@ -1317,7 +1326,7 @@ export class WorkflowRuntime {
     instanceId: string,
     failedPacketId: string,
     stepId: string,
-    input: { actorSession: string; decision?: string },
+    input: { actorSession: string; decision?: string; identityProvenance?: string | null },
     register: (event: PersistedEvent) => void,
   ): number {
     const openItems = this.db.prepare(
@@ -1331,6 +1340,7 @@ export class WorkflowRuntime {
       const closed = this.queueRepo.updateWithinTransaction({
         qitemId: row.qitem_id,
         actorSession: input.actorSession,
+        identityProvenance: input.identityProvenance ?? null,
         state: "done",
         closureReason: "no-follow-on",
         transitionNote: `workflow resume: occurrence resolved by ${input.actorSession} redriving step ${stepId}${input.decision ? ` — ${input.decision}` : ""}`,
@@ -1345,6 +1355,7 @@ export class WorkflowRuntime {
     occurrenceId?: string;
     decision?: string;
     actorSession: string;
+    identityProvenance?: string | null;
   }): Promise<{
     instanceId: string;
     stepId: string;
@@ -1411,6 +1422,7 @@ export class WorkflowRuntime {
       const created = this.queueRepo.createWithinTransaction({
         qitemId: redrivePacketId,
         sourceSession: input.actorSession,
+        identityProvenance: input.identityProvenance ?? null,
         destinationSession: owner,
         body: withWorkflowContinuation({
           binding: instance.lifecycleBinding,
@@ -1428,7 +1440,7 @@ export class WorkflowRuntime {
         chainOfRecord: [occurrence.failedPacketId],
       });
       register(created.persistedEvent);
-      this.queueRepo.stageWakeIntent(created.qitemId, input.actorSession, created.destinationSession, null, created.nudge);
+      this.queueRepo.stageWakeIntent(created.qitemId, input.actorSession, created.destinationSession, input.identityProvenance ?? null, created.nudge);
       this.instanceStore.bindFrontierPacket({
         instanceId: instance.instanceId,
         packetId: created.qitemId,
@@ -1467,6 +1479,7 @@ export class WorkflowRuntime {
     packetId?: string;
     toSession: string;
     actorSession: string;
+    identityProvenance?: string | null;
     reason?: string;
   }): Promise<{
     instanceId: string;
@@ -1565,6 +1578,7 @@ export class WorkflowRuntime {
       const closed = this.queueRepo.updateWithinTransaction({
         qitemId: oldPacketId,
         actorSession: input.actorSession,
+        identityProvenance: input.identityProvenance ?? null,
         viaWorkflowVerb: true,
         state: "handed-off",
         closureReason: "handed_off_to",
@@ -1589,6 +1603,7 @@ export class WorkflowRuntime {
       const created = this.queueRepo.createWithinTransaction({
         qitemId: routedPacketId,
         sourceSession: input.actorSession,
+        identityProvenance: input.identityProvenance ?? null,
         destinationSession: input.toSession,
         body: withWorkflowContinuation({
           binding: instance.lifecycleBinding,
@@ -1632,7 +1647,7 @@ export class WorkflowRuntime {
         created.qitemId,
         input.actorSession,
         created.destinationSession,
-        null,
+        input.identityProvenance ?? null,
         created.nudge,
       );
 
@@ -1650,6 +1665,7 @@ export class WorkflowRuntime {
         const reparked = this.queueRepo.updateWithinTransaction({
           qitemId: created.qitemId,
           actorSession: input.actorSession,
+          identityProvenance: input.identityProvenance ?? null,
           state: "blocked",
           closureReason: "blocked_on",
           closureTarget: oldPacket.blockedOn,
