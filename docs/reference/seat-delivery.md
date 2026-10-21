@@ -125,3 +125,14 @@ retained outcomes, restart without replay, unchanged IDs/bodies, trailing spaces
 numbered bodies, real-menu refusals and multi-placeholder ownership. Native tests
 use private real tmux panes with scripted editable composers. These verify the
 transport mechanics; they are not live Claude/Codex provider sessions.
+
+## Watchdog reminders
+
+A currently due watchdog reminder makes a new delivery attempt, including after an interrupted attempt or job
+accounting. Historical outbox receipts do not suppress a lone reminder or prevent it from joining a digest. The
+message tells its recipient that delivery may repeat after an unconfirmed attempt. Its job history records the
+current transport result; an unknown write is not proof that nothing arrived.
+
+The transport still protects approval/question prompts, human drafts and recipient identity. Scheduler timing,
+current parked-row eligibility and stop checks still apply. This changes message retries, not the idempotence of
+structured continuity actions such as creating a cutover baton.

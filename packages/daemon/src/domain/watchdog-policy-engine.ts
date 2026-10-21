@@ -58,15 +58,12 @@ export interface DeliveryOutcome {
   error?: string;
   /** Structured continuity custody was durably created or identified. */
   continuityActionCompleted?: boolean;
-  /** The message a lone send bound, without the scheduler header. On recovery that's the occurrence's earlier body,
-   *  not the text composed now. */
+  /** The text reported by a delivery implementation, without its scheduler header. */
   sentMessage?: string;
 }
 
 export interface WatchdogDeliverySource {
   occurrenceId?: string;
-  /** Pre-cadence identity: an unfinished old-format receipt may still own this attempt. */
-  legacyOccurrenceId?: string;
   jobId: string;
   policy: string;
   /** A digest's members, when one send carries several reminders: each job and the occurrence it was due for. */
@@ -135,12 +132,6 @@ interface WatchdogPolicyEngineDeps {
   /** The parked row a due reminder is about, when it may share one message with other reminders due for the same
    *  seat in the same scheduler pass. Null, or absent, keeps the reminder's own send. */
   resolveDigestEntry?: (input: { jobId: string; message: string }) => ParkReminderEntry | null;
-  /** The recorded outcome when a due occurrence was already attempted inside an earlier digest, so it is accounted
-   *  from that attempt and never sent again; null when it wasn't. */
-  priorDigestAttempt?: (occurrenceId: string) => DeliveryOutcome | null;
-  /** Whether a due occurrence already has a delivery record of any kind, alone or in a digest. Such an occurrence
-   *  goes only through its own delivery id, which reads its earlier receipt back and never joins a new digest. */
-  occurrenceAttempted?: (occurrenceId: string) => boolean;
 }
 
 /** The parked row an ordinary park reminder is about, with the current park's recorded continuation for its preview. */
@@ -248,8 +239,6 @@ export class WatchdogPolicyEngine {
   private readonly resolveQueueWait?: WatchdogPolicyEngineDeps["resolveQueueWait"];
   private readonly onWakeAttempt?: (attempt: { jobId: string; deliveryStatus: string }) => void;
   private readonly resolveDigestEntry?: WatchdogPolicyEngineDeps["resolveDigestEntry"];
-  private readonly priorDigestAttempt?: WatchdogPolicyEngineDeps["priorDigestAttempt"];
-  private readonly occurrenceAttempted?: WatchdogPolicyEngineDeps["occurrenceAttempted"];
 
   constructor(deps: WatchdogPolicyEngineDeps) {
     this.jobsRepo = deps.jobsRepo;
@@ -261,8 +250,6 @@ export class WatchdogPolicyEngine {
     this.onWakeAttempt = deps.onWakeAttempt;
     this.resolveQueueWait = deps.resolveQueueWait;
     this.resolveDigestEntry = deps.resolveDigestEntry;
-    this.priorDigestAttempt = deps.priorDigestAttempt;
-    this.occurrenceAttempted = deps.occurrenceAttempted;
     this.parseSpec = deps.parseSpec ?? parseWatchdogSpec;
     this.now = deps.now ?? (() => new Date());
     this.policies = new Map();
@@ -551,10 +538,7 @@ export class WatchdogPolicyEngine {
 
     const occurrence = [job.jobId, occupantGeneration, outcome.conditionReceipt ?? (job.policy === "periodic-reminder" ? job.lastFireAt : outcome.message)];
     const recurring = outcome.conditionReceipt === undefined && job.policy !== "periodic-reminder" && job.policy !== "context-usage-threshold";
-    const legacyOccurrenceId = recurring ? createHash("sha256").update(JSON.stringify(occurrence)).digest("hex") : undefined;
-    // A recurring policy may send identical text on later cadences. Once an
-    // attempt is accounted, its next fire needs a new delivery identity. Keep
-    // first-fire IDs and generation-bound threshold IDs stable for recovery.
+    // Identify cadences for digest grouping and history, not transport deduplication.
     if (recurring && job.lastFireAt !== null) {
       occurrence.push(job.lastFireAt);
     }
@@ -584,7 +568,7 @@ export class WatchdogPolicyEngine {
         message,
         ...(continuityAction ? { continuityAction } : {}),
       },
-      { jobId: job.jobId, policy: job.policy, occurrenceId, ...(legacyOccurrenceId ? { legacyOccurrenceId } : {}) },
+      { jobId: job.jobId, policy: job.policy, occurrenceId },
     );
     if (
       isContextUsageThreshold &&
@@ -648,13 +632,8 @@ export class WatchdogPolicyEngine {
     }
   }
 
-  /**
-   * One seat's held reminders. Before every transport call the remaining members are re-checked against current
-   * state, with nothing awaited in between: a retired or ended one is dropped, one an earlier digest attempted is
-   * accounted from that attempt, and one that is no longer eligible, or already has a delivery record of its own, goes
-   * alone through its own delivery id. Only then are the rest sent as one digest. A stop is honoured before each call;
-   * the call in flight finishes and is accounted, and every member not yet sent stays due.
-   */
+  /** Re-check current job/park state before each call. Group current reminders; a receipt never replaces delivery.
+   * A stop leaves every unstarted member due, while the call already in flight finishes and is accounted. */
   private async deliverHeldGroup(seat: string, group: HeldReminder[], shouldStop: () => boolean): Promise<void> {
     const finished = new Set<HeldReminder>();
     for (;;) {
@@ -667,16 +646,8 @@ export class WatchdogPolicyEngine {
           finished.add(held);
           continue;
         }
-        const prior = this.priorDigestAttempt?.(held.occurrenceId);
-        if (prior) {
-          // Attempted inside an earlier digest whose accounting didn't finish: account it from that attempt.
-          this.recordAttempt({ ...held, deliverySchedule: this.jobsRepo.getByIdOrThrow(held.job.jobId), delivery: prior, isContextUsageThreshold: false });
-          finished.add(held);
-          continue;
-        }
-        // The current entry gives a lone send its preview; only an occurrence with no delivery record may join a digest.
         const current = this.resolveDigestEntry?.({ jobId: held.job.jobId, message: held.outcome.message }) ?? null;
-        if (current && !this.occurrenceAttempted?.(held.occurrenceId)) digest.push({ ...held, entry: current });
+        if (current) digest.push({ ...held, entry: current });
         else alone ??= { held, entry: current };
       }
       if (alone) {
@@ -704,8 +675,6 @@ export class WatchdogPolicyEngine {
       ...lines,
       ...(digest.some(({ entry }) => entry.continuation?.trim()) ? [PARK_WAKE_GUIDANCE] : []),
     ].join("\n");
-    // A digest whose members can't all be bound throws here, before any input, and leaves every member unaccounted
-    // and due.
     const delivery = await this.deliver(
       { targetSession: seat, message },
       { jobId: digestId, policy: "periodic-reminder", occurrenceId: digestId, members },

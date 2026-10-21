@@ -137,16 +137,16 @@ describe("due parked-row reminders for one seat", () => {
     due(later!.jobId);
     await deps.watchdogScheduler!.runTickNow();
     expect(sends).toHaveLength(2);
-    expect(sends[1]!.text).toBe(`[OpenRig watchdog scheduler · policy: periodic-reminder · job: ${later!.jobId}]\n`
+    expect(sends[1]!.text).toBe(`[OpenRig watchdog scheduler · policy: periodic-reminder · job: ${later!.jobId}]\nDelivery may repeat after an unconfirmed attempt.\n`
       + `Wake timer fired for parked qitem ${later!.qitemId}. Resume the recorded continuation and update the row.`);
   });
 
-  it("sends a lone reminder exactly as before", async () => {
+  it("sends a lone reminder with repeat-delivery context", async () => {
     const owner = seat();
     const only = await park(owner, "alone");
     due(only.jobId);
     await deps.watchdogScheduler!.runTickNow();
-    expect(sends).toEqual([{ session: owner, text: `[OpenRig watchdog scheduler · policy: periodic-reminder · job: ${only.jobId}]\n`
+    expect(sends).toEqual([{ session: owner, text: `[OpenRig watchdog scheduler · policy: periodic-reminder · job: ${only.jobId}]\nDelivery may repeat after an unconfirmed attempt.\n`
       + `Wake timer fired for parked qitem ${only.qitemId}. Resume the recorded continuation and update the row.` }]);
     expect(disposition(only.jobId, only.qitemId)).toMatchObject({ state: "terminal", terminalReason: "park_timer_fired_once", deliveryStatus: "ok" });
   });
@@ -204,7 +204,7 @@ describe("due parked-row reminders for one seat", () => {
     expect(sends.filter((s) => s.session === owner)).toHaveLength(1);
   });
 
-  it("never sends an attempted reminder again after its digest's accounting was cut short, and still wakes a new one", async () => {
+  it("retries current reminders after interrupted digest accounting and includes a newly due one", async () => {
     const owner = seat();
     const [a, b, c] = [await park(owner, "a"), await park(owner, "b"), await park(owner, "c")];
     due(a!.jobId);
@@ -226,13 +226,13 @@ describe("due parked-row reminders for one seat", () => {
     });
     due(c!.jobId);
     await again.deps.watchdogScheduler!.runTickNow();
-    // Only C is sent, alone; A and B are accounted from the earlier attempt, never sent again.
-    expect(later).toEqual([{ session: owner, text: `[OpenRig watchdog scheduler · policy: periodic-reminder · job: ${c!.jobId}]\n`
-      + `Wake timer fired for parked qitem ${c!.qitemId}. Resume the recorded continuation and update the row.` }]);
-    for (const r of [a!, b!]) {
+    expect(later).toHaveLength(1);
+    expect(later[0]!.session).toBe(owner);
+    expect(later[0]!.text).toContain("Delivery may repeat after an unconfirmed attempt.");
+    for (const r of [a!, b!, c!]) {
+      expect(later[0]!.text).toContain(r.qitemId);
       expect(again.deps.watchdogJobsRepo!.getByIdOrThrow(r.jobId)).toMatchObject({ state: "terminal", terminalReason: "park_timer_fired_once" });
-      expect(again.deps.watchdogHistoryLog!.listForJob(r.jobId, 1)[0]).toMatchObject({ deliveryStatus: "failed" });
-      expect(String(again.deps.watchdogHistoryLog!.listForJob(r.jobId, 1)[0]!.evaluationNotes?.["deliveryReason"])).toMatch(/outcome is unknown/);
+      expect(again.deps.watchdogHistoryLog!.listForJob(r.jobId, 1)[0]).toMatchObject({ deliveryStatus: "ok" });
     }
     again.deps.watchdogScheduler?.stop?.();
     again.db.close();
@@ -241,7 +241,7 @@ describe("due parked-row reminders for one seat", () => {
     await lost;
   });
 
-  it("accounts a member whose accounting failed after the send from that attempt, without a second send", async () => {
+  it("retries the current member whose accounting failed after a digest send", async () => {
     const owner = seat();
     const [a, b] = [await park(owner, "a"), await park(owner, "b")];
     due(a.jobId);
@@ -251,11 +251,12 @@ describe("due parked-row reminders for one seat", () => {
     await deps.watchdogScheduler!.runTickNow();
     spy.mockImplementation(original);
     expect(sends.filter((s) => s.session === owner)).toHaveLength(1);
-    // B was never accounted, so it is still due; the next pass accounts it from the digest and sends nothing.
+    // B is still due; its old digest receipt cannot substitute for a new transport attempt.
     expect(deps.watchdogJobsRepo!.getByIdOrThrow(b.jobId).state).toBe("active");
     due(b.jobId);
     await deps.watchdogScheduler!.runTickNow();
-    expect(sends.filter((s) => s.session === owner)).toHaveLength(1);
+    expect(sends.filter((s) => s.session === owner)).toHaveLength(2);
+    expect(sends.filter((s) => s.session === owner).at(-1)!.text).toContain(b.qitemId);
     expect(disposition(b.jobId, b.qitemId)).toMatchObject({ state: "terminal", terminalReason: "park_timer_fired_once", deliveryStatus: "ok", wakePhase: "fired" });
   });
 
@@ -281,7 +282,7 @@ describe("due parked-row reminders for one seat", () => {
     expect(digest).toContain(b.qitemId);
     expect(digest).toContain(c.qitemId);
     expect(digest).not.toContain(a.qitemId);
-    expect(texts).toContain(`[OpenRig watchdog scheduler · policy: periodic-reminder · job: ${a.jobId}]\n`
+    expect(texts).toContain(`[OpenRig watchdog scheduler · policy: periodic-reminder · job: ${a.jobId}]\nDelivery may repeat after an unconfirmed attempt.\n`
       + `Wake timer fired for parked qitem ${a.qitemId}. Resume the recorded continuation and update the row.`);
     expect(deps.queueRepo.getParkWakeStatus(attached)).toMatchObject({ phase: "fired" });
   });
@@ -334,7 +335,7 @@ describe("due parked-row reminders for one seat", () => {
     };
     await deps.watchdogScheduler!.runTickNow();
     const texts = sends.filter((s) => s.session === owner).map((s) => s.text);
-    const lone = (r: { jobId: string; qitemId: string }) => `[OpenRig watchdog scheduler · policy: periodic-reminder · job: ${r.jobId}]\n`
+    const lone = (r: { jobId: string; qitemId: string }) => `[OpenRig watchdog scheduler · policy: periodic-reminder · job: ${r.jobId}]\nDelivery may repeat after an unconfirmed attempt.\n`
       + `Wake timer fired for parked qitem ${r.qitemId}. Resume the recorded continuation and update the row.`;
     expect(texts).toEqual([lone(b), lone(a), lone(c)]);
   });
@@ -371,7 +372,7 @@ describe("due parked-row reminders for one seat", () => {
 });
 
 describe("a park wake shows the park's recorded continuation", () => {
-  const header = (jobId: string) => `[OpenRig watchdog scheduler · policy: periodic-reminder · job: ${jobId}]\n`;
+  const header = (jobId: string) => `[OpenRig watchdog scheduler · policy: periodic-reminder · job: ${jobId}]\nDelivery may repeat after an unconfirmed attempt.\n`;
   // Earlier tests leave other seats' reminders due on purpose, so each test reads only its own seat's sends.
   const to = (owner: string) => sends.filter((s) => s.session === owner);
   const guidance = "Check the row's current state and blocker first, then resume only that recorded work and record the "

@@ -1,11 +1,5 @@
-// A watchdog digest through the real outbox and the draft-aware transport, with inert terminal effects: each member is
-// bound to the one attempt before any input, so an interrupted or partly accounted attempt is never written again under
-// another identity, and a new reminder still goes.
+// Real scheduler/transport with inert terminal effects: a receipt cannot suppress a current reminder.
 import Database from "better-sqlite3";
-import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import stringWidth from "string-width";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TmuxAdapter } from "../src/adapters/tmux.js";
@@ -17,7 +11,7 @@ import { RigRepository } from "../src/domain/rig-repository.js";
 import { SeatDeliveryGuard, resolveGuardTarget } from "../src/domain/seat-delivery-guard.js";
 import { SessionRegistry } from "../src/domain/session-registry.js";
 import { SessionTransport } from "../src/domain/session-transport.js";
-import { makeWatchdogDeliver, occurrenceAttempted, priorDigestAttempt, watchdogDeliveryId } from "../src/domain/watchdog-delivery.js";
+import { makeWatchdogDeliver } from "../src/domain/watchdog-delivery.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
@@ -72,140 +66,12 @@ function fixture(saved?: Buffer) {
     agentActivityStore: { getLatestForNode: () => ({ state: "idle", reason: "fixture idle hook", evidenceSource: "runtime_hook", sampledAt: new Date(at).toISOString(), evidence: null }) } as never });
   transport.guardedDelivery!.recover();
   const outbox = new OutboxHandler(db);
-  const deliver = makeWatchdogDeliver({ sessionTransport: transport, outbox, db });
+  const deliver = makeWatchdogDeliver({ sessionTransport: transport });
   cleanup.push(async () => { await transport.guardedDelivery!.stop(); db.close(); });
-  return { db, outbox, deliver, transport, submissions, hooks, enable: () => guard.set("a", { mode: "draft-aware" }, "human@test", "keep draft") };
+  return { db, outbox, deliver, transport, submissions, hooks, setInput: (text: string) => { body = text; }, enable: () => guard.set("a", { mode: "draft-aware" }, "human@test", "keep draft") };
 }
 
 const seat = "worker@test";
-
-describe("recurring watchdog delivery to a draft-aware seat", () => {
-  it("finishes an interrupted condition receipt after reopening, and still delivers a changed condition", async () => {
-    const f = fixture();
-    await f.enable();
-    const s = scheduled(f);
-    await s.repo.create({ sourceSession: seat, destinationSession: seat, body: "review", tags: ["gate:review"], nudge: false });
-    const policy = (db: Database.Database) => makeIdleGateQitemPolicy({ db, seatActivity: {
-      getSeatStateBySession: () => ({ activity: "idle-at-prompt", needsInput: { count: 0 } }),
-    } as never });
-    const history = new WatchdogHistoryLog(f.db);
-    const engine = new WatchdogPolicyEngine({ jobsRepo: s.jobs, historyLog: history, eventBus: new EventBus(f.db),
-      deliver: f.deliver, additionalPolicies: [policy(f.db)] });
-    const job = s.jobs.register({ policy: "idle-gate-qitem", targetSession: seat, intervalSeconds: 60, registeredBySession: seat,
-      specYaml: "message: Gate ready\n" });
-    vi.spyOn(s.jobs, "recordConditionReceipt").mockImplementationOnce(() => { throw new Error("receipt interrupted"); });
-    await expect(engine.evaluate(job)).rejects.toThrow("receipt interrupted");
-    expect(f.submissions).toHaveLength(1);
-    expect(s.jobs.getByIdOrThrow(job.jobId).lastFireAt).not.toBeNull();
-
-    const g = fixture(f.db.serialize());
-    const jobs = new WatchdogJobsRepository(g.db);
-    const reopened = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: new WatchdogHistoryLog(g.db),
-      eventBus: new EventBus(g.db), deliver: g.deliver, additionalPolicies: [policy(g.db)] });
-    expect((await reopened.evaluate(jobs.getByIdOrThrow(job.jobId))).delivery).toMatchObject({ status: "ok" });
-    expect(g.submissions).toEqual([]);
-    const receipt = (g.db.prepare("SELECT last_fired_condition AS value FROM watchdog_jobs WHERE job_id = ?").get(job.jobId) as { value: string }).value;
-    expect(receipt).toEqual(expect.any(String));
-    expect((await reopened.evaluate(jobs.getByIdOrThrow(job.jobId))).outcome).toMatchObject({ action: "skip", reason: "gate_condition_unchanged" });
-    await scheduled(g).repo.create({ sourceSession: seat, destinationSession: seat, body: "another review", tags: ["gate:review"], nudge: false });
-    await reopened.evaluate(jobs.getByIdOrThrow(job.jobId));
-    expect(g.submissions).toHaveLength(1);
-    expect((g.db.prepare("SELECT last_fired_condition AS value FROM watchdog_jobs WHERE job_id = ?").get(job.jobId) as { value: string }).value).not.toBe(receipt);
-  });
-
-  it.each(["sending", "indeterminate", "delivered"] as const)("keeps an unfinished pre-upgrade %s occurrence, then sends the later cadence", async (state) => {
-    const f = fixture();
-    await f.enable();
-    const pool = mkdtempSync(join(tmpdir(), "watchdog-upgrade-"));
-    cleanup.push(async () => { rmSync(pool, { recursive: true, force: true }); });
-    writeFileSync(join(pool, "ready.md"), "ready");
-    let at = Date.now() - 120_000;
-    const jobs = new WatchdogJobsRepository(f.db, () => new Date(at));
-    const job = jobs.register({ policy: "artifact-pool-ready", targetSession: seat, intervalSeconds: 60, registeredBySession: seat,
-      specYaml: JSON.stringify({ message: "Pool B", context: { pools: [{ path: pool }] } }) });
-    // The old release accounted A at T0, then attempted B under its three-field identity.
-    jobs.recordEvaluation(job.jobId, new Date(at).toISOString(), true);
-    new WatchdogHistoryLog(f.db).record({ jobId: job.jobId, evaluatedAt: new Date(at).toISOString(), outcome: "sent",
-      deliveryMessage: "Pool A", deliveryTargetSession: seat, deliveryStatus: "ok" });
-    const oldOccurrence = createHash("sha256").update(JSON.stringify([job.jobId, null, "Pool B"])).digest("hex");
-    const source = { jobId: job.jobId, policy: job.policy, occurrenceId: oldOccurrence };
-    let saved: Buffer;
-    if (state === "sending") {
-      let reached!: () => void, release!: () => void;
-      const started = new Promise<void>(resolve => { reached = resolve; });
-      f.hooks.paste = () => { reached(); return new Promise<void>(resolve => { release = resolve; }); };
-      const pending = f.deliver({ targetSession: seat, message: "Pool B" }, source);
-      await started;
-      saved = f.db.serialize();
-      release();
-      await pending;
-    } else {
-      if (state === "indeterminate") f.hooks.paste = async () => { throw new Error("lost paste acknowledgement"); };
-      await f.deliver({ targetSession: seat, message: "Pool B" }, source);
-      expect(f.outbox.getById(watchdogDeliveryId(oldOccurrence))?.deliveryState).toBe(state);
-      saved = f.db.serialize();
-    }
-    let g = fixture(saved);
-    let reopenedJobs = new WatchdogJobsRepository(g.db);
-    at += 60_000;
-    const history = new WatchdogHistoryLog(g.db);
-    let engine = new WatchdogPolicyEngine({ jobsRepo: reopenedJobs, historyLog: history,
-      eventBus: new EventBus(g.db), deliver: g.deliver, now: () => new Date(at) });
-    if (state === "delivered") {
-      vi.spyOn(history, "record").mockImplementationOnce(() => { throw new Error("bridge accounting interrupted"); });
-      await expect(engine.evaluate(reopenedJobs.getByIdOrThrow(job.jobId))).rejects.toThrow("bridge accounting interrupted");
-      expect(g.submissions).toEqual([]);
-      // The adoption itself is durable even if this upgraded process also stops.
-      g = fixture(g.db.serialize());
-      reopenedJobs = new WatchdogJobsRepository(g.db);
-      engine = new WatchdogPolicyEngine({ jobsRepo: reopenedJobs, historyLog: new WatchdogHistoryLog(g.db),
-        eventBus: new EventBus(g.db), deliver: g.deliver, now: () => new Date(at) });
-    }
-    const outcome = await engine.evaluate(reopenedJobs.getByIdOrThrow(job.jobId));
-    expect(g.submissions).toEqual([]);
-    expect(outcome.delivery?.status).toBe(state === "delivered" ? "ok" : "failed");
-    expect(g.outbox.getById(watchdogDeliveryId(oldOccurrence))?.deliveryState).toBe(state === "sending" ? "indeterminate" : state);
-    expect(g.db.prepare("SELECT count(*) AS n FROM outbox_entries").get()).toEqual({ n: 1 });
-    at += 60_000;
-    expect((await engine.evaluate(reopenedJobs.getByIdOrThrow(job.jobId))).delivery).toMatchObject({ status: "ok" });
-    expect(g.submissions).toHaveLength(1);
-    expect(g.db.prepare("SELECT count(*) AS n FROM outbox_entries").get()).toEqual({ n: 2 });
-  });
-
-  it.each([false, true])("sends the next keepalive after accounting the previous occurrence (interrupted: %s)", async (interrupted) => {
-    const f = fixture();
-    await f.enable();
-    const instance = new WorkflowInstanceStore(f.db).create({ workflowName: "ongoing", workflowVersion: "1", createdBySession: seat });
-    let at = Date.now();
-    const jobs = new WatchdogJobsRepository(f.db, () => new Date(at));
-    const history = new WatchdogHistoryLog(f.db);
-    const engine = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: history, eventBus: new EventBus(f.db),
-      deliver: f.deliver, now: () => new Date(at), additionalPolicies: [makeWorkflowKeepalivePolicy({ db: f.db })] });
-    const job = jobs.register({ policy: "workflow-keepalive", targetSession: seat, intervalSeconds: 60, registeredBySession: seat,
-      specYaml: `message: Continue the current step\ncontext:\n  workflow_instance_id: ${instance.instanceId}\n` });
-
-    if (interrupted) {
-      vi.spyOn(history, "record").mockImplementationOnce(() => { throw new Error("accounting interrupted"); });
-      await expect(engine.evaluate(jobs.getByIdOrThrow(job.jobId))).rejects.toThrow("accounting interrupted");
-      expect(f.submissions).toHaveLength(1);
-      // The same unaccounted occurrence must read the saved receipt, without another input.
-    }
-    expect((await engine.evaluate(jobs.getByIdOrThrow(job.jobId))).delivery).toMatchObject({ status: "ok" });
-    expect(f.submissions).toHaveLength(1);
-    const firstOccurrence = createHash("sha256").update(JSON.stringify([job.jobId, null, "Continue the current step"])).digest("hex");
-    expect(f.outbox.getById(watchdogDeliveryId(firstOccurrence))?.deliveryState).toBe("delivered");
-    at += 60_000;
-    if (interrupted) {
-      vi.spyOn(history, "record").mockImplementationOnce(() => { throw new Error("later accounting interrupted"); });
-      await expect(engine.evaluate(jobs.getByIdOrThrow(job.jobId))).rejects.toThrow("later accounting interrupted");
-      expect(f.submissions).toHaveLength(2);
-    }
-    await engine.evaluate(jobs.getByIdOrThrow(job.jobId));
-    expect(f.submissions).toHaveLength(2);
-    expect(f.submissions[1]).toContain("Continue the current step");
-    expect(f.db.prepare("SELECT count(*) AS n FROM outbox_entries WHERE delivery_state = 'delivered'").get()).toEqual({ n: 2 });
-  });
-});
 
 /** The queue, watchdog engine and scheduler on a fixture's store, wired as the daemon wires them. `withoutPreview`
  *  leaves out the park-entry lookup, so wakes go with their stored message, as a daemon before the preview sent them. */
@@ -220,8 +86,7 @@ function scheduled(f: ReturnType<typeof fixture>, { withoutPreview = false } = {
     resolvePreDeliveryTerminalReason: ({ jobId }) => repo.resolveWatchdogPreDeliveryTerminalReason(jobId),
     onWakeAttempt: ({ jobId, deliveryStatus }) => repo.recordWatchdogWakeAttempt(jobId, deliveryStatus),
     ...(withoutPreview ? {} : { resolveDigestEntry: ({ jobId, message }: { jobId: string; message: string }) => repo.parkReminderDigestEntry(jobId, message) }),
-    priorDigestAttempt: (occurrence) => priorDigestAttempt(f.outbox, occurrence),
-    occurrenceAttempted: (occurrence) => occurrenceAttempted(f.outbox, occurrence) });
+  });
   const scheduler = new WatchdogScheduler({ jobsRepo: jobs, policyEngine: engine });
   const park = async (summary: string, transitionNote = "parked") => {
     const row = await repo.create({ sourceSession: "orch@test", destinationSession: seat, body: summary, summary, nudge: false } as never) as unknown as { qitemId: string };
@@ -240,81 +105,88 @@ const digest = (...members: Array<[string, string]>) => ({
   members: members.map(([jobId, occurrenceId]) => ({ jobId, occurrenceId })),
 });
 
-describe("a watchdog digest through the real outbox and draft-aware transport", () => {
-  it("binds every member to the one attempt, so neither a lone send nor a changed digest writes it again, and a new reminder goes", async () => {
+describe("watchdog reminders reach the recipient despite earlier delivery records", () => {
+  it("retries an unaccounted condition and still delivers a changed condition", async () => {
     const f = fixture();
     await f.enable();
-    expect(await f.deliver({ targetSession: seat, message: "A and B" }, digest(["job-a", "occ-a"], ["job-b", "occ-b"]))).toMatchObject({ status: "ok" });
+    const s = scheduled(f);
+    await s.repo.create({ sourceSession: seat, destinationSession: seat, body: "review", tags: ["gate:review"], nudge: false });
+    const policy = (db: Database.Database) => makeIdleGateQitemPolicy({ db, seatActivity: {
+      getSeatStateBySession: () => ({ activity: "idle-at-prompt", needsInput: { count: 0 } }),
+    } as never });
+    const history = new WatchdogHistoryLog(f.db);
+    const engine = new WatchdogPolicyEngine({ jobsRepo: s.jobs, historyLog: history, eventBus: new EventBus(f.db),
+      deliver: f.deliver, additionalPolicies: [policy(f.db)] });
+    const job = s.jobs.register({ policy: "idle-gate-qitem", targetSession: seat, intervalSeconds: 60, registeredBySession: seat,
+      specYaml: "message: Gate ready\n" });
+    vi.spyOn(s.jobs, "recordConditionReceipt").mockImplementationOnce(() => { throw new Error("receipt interrupted"); });
+    await expect(engine.evaluate(job)).rejects.toThrow("receipt interrupted");
     expect(f.submissions).toHaveLength(1);
-    for (const occ of ["occ-a", "occ-b"]) expect(f.outbox.getById(watchdogDeliveryId(occ))).toMatchObject({ deliveryState: "delivered" });
-    // A lone fallback for B, and a digest that now also holds C: no input for the attempted occurrences.
-    expect(await f.deliver({ targetSession: seat, message: "B alone" }, lone("job-b", "occ-b"))).toMatchObject({ status: "ok" });
-    // A digest naming an already-recorded member refuses before any input, and reports no attempt for anyone.
-    await expect(f.deliver({ targetSession: seat, message: "A and C" }, digest(["job-a", "occ-a"], ["job-c", "occ-c"]))).rejects.toThrow(/already has a delivery record/);
+
+    const g = fixture(f.db.serialize());
+    const jobs = new WatchdogJobsRepository(g.db);
+    const reopened = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: new WatchdogHistoryLog(g.db),
+      eventBus: new EventBus(g.db), deliver: g.deliver, additionalPolicies: [policy(g.db)] });
+    expect((await reopened.evaluate(jobs.getByIdOrThrow(job.jobId))).delivery).toMatchObject({ status: "ok" });
+    expect(g.submissions).toHaveLength(1);
+    expect(g.submissions[0]).toContain("Gate ready");
+    expect(g.submissions[0]).toMatch(/may (?:be repeated|repeat)/i);
+    expect((await reopened.evaluate(jobs.getByIdOrThrow(job.jobId))).outcome).toMatchObject({ action: "skip", reason: "gate_condition_unchanged" });
+    await scheduled(g).repo.create({ sourceSession: seat, destinationSession: seat, body: "another review", tags: ["gate:review"], nudge: false });
+    await reopened.evaluate(jobs.getByIdOrThrow(job.jobId));
+    expect(g.submissions).toHaveLength(2);
+  });
+
+  it.each(["sending", "indeterminate", "delivered", "failed"] as const)("delivers the current reminder despite an old %s digest record", async (state) => {
+    const f = fixture();
+    await f.enable();
+    const id = "guard-watchdog-occ-a";
+    f.outbox.record({ outboxId: id, senderSession: "watchdog@system", destinationSession: seat,
+      body: "old body", tags: ["watchdog:digest"] });
+    f.db.prepare("UPDATE outbox_entries SET delivery_state = ? WHERE outbox_id = ?").run(state, id);
+    const result = await f.deliver({ targetSession: seat, message: "Current A and B" }, digest(["job-a", "occ-a"], ["job-b", "occ-b"]));
+    expect(result).toMatchObject({ status: "ok" });
     expect(f.submissions).toHaveLength(1);
-    expect(f.outbox.getById(watchdogDeliveryId("occ-c"))).toBeNull();
-    // C, never attempted, still goes.
-    expect(await f.deliver({ targetSession: seat, message: "C alone" }, lone("job-c", "occ-c"))).toMatchObject({ status: "ok" });
-    expect(f.submissions).toHaveLength(2);
-    expect(f.submissions[1]).toContain("C alone");
+    expect(f.submissions[0]).toContain("Current A and B");
+    expect(f.submissions[0]).toMatch(/may (?:be repeated|repeat)/i);
+    expect(f.submissions[0]).not.toContain("old body");
   });
 
-  it("never writes an interrupted attempt again after the store is reopened", async () => {
+  it("delivers without requiring the watchdog's outbox bookkeeping", async () => {
     const f = fixture();
     await f.enable();
-    let reached!: () => void;
-    const pasting = new Promise<void>((done) => { reached = done; });
-    let unblock!: () => void;
-    f.hooks.paste = () => { reached(); return new Promise((done) => { unblock = done; }); };
-    void f.deliver({ targetSession: seat, message: "A and B" }, digest(["job-a", "occ-a"], ["job-b", "occ-b"]));
-    await pasting;
-    // The process ends mid-write; the next one opens the same store.
-    const g = fixture(f.db.serialize());
-    for (const occ of ["occ-a", "occ-b"]) expect(g.outbox.getById(watchdogDeliveryId(occ))?.deliveryState).toMatch(/^(indeterminate|sending)$/);
-    const b = await g.deliver({ targetSession: seat, message: "B alone" }, lone("job-b", "occ-b"));
-    expect(b).toMatchObject({ status: "failed" });
-    expect(b.error).toMatch(/outcome is unknown/);
-    expect(g.submissions).toEqual([]);
-    expect(await g.deliver({ targetSession: seat, message: "C alone" }, lone("job-c", "occ-c"))).toMatchObject({ status: "ok" });
-    expect(g.submissions).toHaveLength(1);
-    // Let the first process's abandoned write end, so its cleanup doesn't wait on it.
-    unblock();
+    vi.spyOn(f.outbox, "record").mockImplementation(() => { throw new Error("watchdog bookkeeping unavailable"); });
+    expect(await f.deliver({ targetSession: seat, message: "Both waits are due" }, digest(["a", "a1"], ["b", "b1"]))).toMatchObject({ status: "ok" });
+    expect(f.submissions).toHaveLength(1);
+    expect(f.submissions[0]).toContain("Both waits are due");
   });
 
-  it("after a lone guarded reminder is cut short, the next pass writes nothing more for it and still sends a new one once", async () => {
+  it.each([false, true])("keeps recurring after accounting interruption: %s", async (interrupted) => {
     const f = fixture();
     await f.enable();
-    const first = scheduled(f);
-    const a = await first.park("A's wait");
-    first.due(a.jobId);
-    let reached!: () => void;
-    const pasting = new Promise<void>((done) => { reached = done; });
-    let unblock!: () => void;
-    f.hooks.paste = () => { reached(); return new Promise((done) => { unblock = done; }); };
-    const lost = first.scheduler.runTickNow();
-    await pasting;
-    // The process ends with A's lone send claimed and unaccounted; the next one opens the same store, where B is due too.
-    const g = fixture(f.db.serialize());
-    const next = scheduled(g);
-    expect(next.jobs.getByIdOrThrow(a.jobId).state).toBe("active");
-    const b = await next.park("B's wait");
-    next.due(b.jobId);
-    await next.scheduler.runTickNow();
-    expect(g.submissions).toHaveLength(1);
-    expect(g.submissions[0]).toContain(`Wake timer fired for parked qitem ${b.qitemId}.`);
-    expect(g.submissions[0]).not.toContain(a.qitemId);
-    expect(next.jobs.getByIdOrThrow(b.jobId)).toMatchObject({ state: "terminal", terminalReason: "park_timer_fired_once" });
-    expect(next.history.listForJob(b.jobId, 1)[0]).toMatchObject({ deliveryStatus: "ok" });
-    expect(next.history.listForJob(a.jobId, 1)[0]).toMatchObject({ deliveryStatus: "failed" });
-    // Let the first process's abandoned pass end before its store closes.
-    unblock();
-    await lost;
+    const instance = new WorkflowInstanceStore(f.db).create({ workflowName: "ongoing", workflowVersion: "1", createdBySession: seat });
+    let at = Date.now();
+    const jobs = new WatchdogJobsRepository(f.db, () => new Date(at));
+    const history = new WatchdogHistoryLog(f.db);
+    const engine = new WatchdogPolicyEngine({ jobsRepo: jobs, historyLog: history, eventBus: new EventBus(f.db),
+      deliver: f.deliver, now: () => new Date(at), additionalPolicies: [makeWorkflowKeepalivePolicy({ db: f.db })] });
+    const job = jobs.register({ policy: "workflow-keepalive", targetSession: seat, intervalSeconds: 60, registeredBySession: seat,
+      specYaml: `message: Continue the current step\ncontext:\n  workflow_instance_id: ${instance.instanceId}\n` });
+    if (interrupted) {
+      vi.spyOn(history, "record").mockImplementationOnce(() => { throw new Error("accounting interrupted"); });
+      await expect(engine.evaluate(jobs.getByIdOrThrow(job.jobId))).rejects.toThrow("accounting interrupted");
+    }
+    expect((await engine.evaluate(jobs.getByIdOrThrow(job.jobId))).delivery).toMatchObject({ status: "ok" });
+    expect(f.submissions).toHaveLength(interrupted ? 2 : 1);
+    at += 60_000;
+    await engine.evaluate(jobs.getByIdOrThrow(job.jobId));
+    expect(f.submissions).toHaveLength(interrupted ? 3 : 2);
+    expect(f.submissions.at(-1)).toContain("Continue the current step");
   });
 
-  it("a recovered lone wake's history names the body it was bound with, not a preview composed now", async () => {
+  it("reopens an interrupted wake and submits all current reminders with their continuations", async () => {
     const f = fixture();
     await f.enable();
-    // The first process binds A's wake with its stored, generic message; A's park has a recorded continuation.
     const first = scheduled(f, { withoutPreview: true });
     const a = await first.park("A's wait", "continuation: hand the head to the planner");
     first.due(a.jobId);
@@ -324,15 +196,27 @@ describe("a watchdog digest through the real outbox and draft-aware transport", 
     f.hooks.paste = () => { reached(); return new Promise((done) => { unblock = done; }); };
     const lost = first.scheduler.runTickNow();
     await pasting;
-    // After the restart the engine would compose a preview, but the bound occurrence keeps its body and types nothing.
     const g = fixture(f.db.serialize());
-    const next = scheduled(g);
-    await next.scheduler.runTickNow();
-    expect(g.submissions).toEqual([]);
-    const [history] = next.history.listForJob(a.jobId, 1);
-    expect(history!.deliveryMessage).toBe(`Wake timer fired for parked qitem ${a.qitemId}. Resume the recorded continuation and update the row.`);
-    expect(history!.deliveryMessage).not.toContain("Recorded continuation");
+    // Settle the first process before assertions, while retaining its interrupted store as the recovery input.
     unblock();
     await lost;
+    const next = scheduled(g);
+    const b = await next.park("B's wait");
+    next.due(b.jobId);
+    await next.scheduler.runTickNow();
+    expect(g.submissions).toHaveLength(1);
+    expect(g.submissions[0]).toContain(a.qitemId);
+    expect(g.submissions[0]).toContain(b.qitemId);
+    expect(g.submissions[0]).toContain("hand the head to the planner");
+    expect(g.submissions[0]).toMatch(/may (?:be repeated|repeat)/i);
+    for (const { jobId } of [a, b]) expect(next.history.listForJob(jobId, 1)[0]).toMatchObject({ deliveryStatus: "ok" });
+  });
+
+  it("still protects a person's draft instead of submitting the reminder", async () => {
+    const f = fixture();
+    await f.enable();
+    f.setInput("a person's unfinished message");
+    expect(await f.deliver({ targetSession: seat, message: "Reminder" }, lone("a", "a1"))).toMatchObject({ status: "retained" });
+    expect(f.submissions).toEqual([]);
   });
 });
