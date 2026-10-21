@@ -6,7 +6,7 @@ import { resolveEffectiveHost } from "../host-selection.js";
 import { existsSync, readFileSync } from "node:fs";
 import { parse as parseYamlDoc } from "yaml";
 import { Command } from "commander";
-import { DaemonClient, DaemonConnectionError } from "../client.js";
+import { DaemonClient, DaemonConnectionError, DaemonTimeoutError } from "../client.js";
 import { getDaemonStatus, getDaemonUrl, startDaemon, type LifecycleDeps, daemonStatusGuard } from "../daemon-lifecycle.js";
 import { shouldAutoStartDaemon } from "../daemon-reachability.js";
 import { prepareDaemonAutoStart } from "../daemon-auto-start.js";
@@ -75,6 +75,19 @@ export function sourceLooksLikeTopology(source: string): boolean {
   } catch {
     return false; // unreadable/unparseable — existing flows own the error
   }
+}
+
+/** #1654: a plan creates or changes no rig or seat, so a plan the daemon didn't answer is safe to run again, locally
+ *  or with --host. Reported in place of the unknown-outcome guidance, which stays for writes. */
+const PLAN_NOT_ANSWERED = "A plan doesn't create or change any rig or seat, so it's safe to run again. If the daemon stays slow, check it with: rig status";
+function reportPlanNotAnswered(fact: string, error: string, json: boolean | undefined, extra: Record<string, unknown> = {}): void {
+  if (json) {
+    console.log(JSON.stringify({ ok: false, ...extra, error, plan: true, changed: false, message: PLAN_NOT_ANSWERED }));
+  } else {
+    console.error(fact);
+    console.error(PLAN_NOT_ANSWERED);
+  }
+  process.exitCode = 1;
 }
 
 export const HOST_TOPOLOGY_REJECTION =
@@ -224,8 +237,14 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
             const inspected = await runRemoteHttpOp(opts.host!, "POST", "/api/bundles/inspect", { bundlePath: source }, deps, opts);
             return { status: inspected.ok ? 200 : 500, data: (inspected.data ?? { error: inspected.error }) as Record<string, unknown> };
           }) : undefined;
-        const result = await runRemoteHttpOp(opts.host, "POST", "/api/up", body, deps, { ...opts, timeoutMs: opts.plan ? undefined : LONG_RUNNING_UP_TIMEOUT_MS });
+        const result = await runRemoteHttpOp(opts.host, "POST", "/api/up", body, deps, { ...opts, timeoutMs: LONG_RUNNING_UP_TIMEOUT_MS });
         if (behaviour) result.data = { ...(result.data as Record<string, unknown> | undefined), behaviour };
+        if (opts.plan && !result.ok && result.outcomeUnknown) {
+          const rest: Record<string, unknown> = { ...result };
+          delete rest["outcomeUnknown"];
+          reportPlanNotAnswered(`The daemon on host ${opts.host} didn't answer the plan${result.error ? `: ${result.error}` : ""}`, result.error ?? "no answer", opts.json, rest);
+          return;
+        }
         if (opts.json) {
           console.log(JSON.stringify(result));
           if (!result.ok) process.exitCode = 1;
@@ -496,10 +515,14 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
           targetRoot,
           // OPR.0.3.4.2 — operation B opt-in seats (deliberate fresh-prime).
           freshLogicalIds: opts.fresh,
-        }, opts.plan ? undefined : { timeoutMs: LONG_RUNNING_UP_TIMEOUT_MS });
+        }, { timeoutMs: LONG_RUNNING_UP_TIMEOUT_MS }); // #1654: a plan runs an apply's preflight, Codex profile probes included
       } catch (err) {
         if (err instanceof DaemonConnectionError && !opts.plan) {
           printHonestTimeout(err);
+          return;
+        }
+        if (opts.plan && (err instanceof DaemonTimeoutError || (err instanceof DaemonConnectionError && err.writeOutcome === "unknown"))) {
+          reportPlanNotAnswered(`The daemon didn't answer the plan (${err.message}).`, err.message, opts.json);
           return;
         }
         throw err;
