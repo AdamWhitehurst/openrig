@@ -218,6 +218,8 @@ export function mapPiEvent(event: Record<string, unknown>, runtime: RunnerRuntim
       // Pi keeps main's mapping: turn_end carries no notice.
       return runtime === "omp" ? { mirrorLines: [], ...modelErrorNotice(event, runtime) } : { mirrorLines: [] };
     case "turn_start":
+      // Some turn paths omit agent_start; turn_start still opens a turn, so it reports the seat working.
+      return { mirrorLines: [], activity: { hookEvent: "active", subtype: "turn_start" } };
     case "message_start":
       return { mirrorLines: [] };
     case "message_update": {
@@ -839,8 +841,12 @@ export class RunnerCore {
     ).finally(() => { this.identityInFlight = false; });
   }
 
+  /** Each activity post's place in this runner's event order: posts aren't awaited, so they can arrive out of order. */
+  private activitySequence = 0;
+
   private activityPayload(hookEvent: string, subtype: string | null): Record<string, unknown> {
     return {
+      sequence: ++this.activitySequence,
       sessionName: this.identity.sessionName,
       nodeId: this.identity.nodeId ?? null,
       generation: this.identity.generation ?? null,
