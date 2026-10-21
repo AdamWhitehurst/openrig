@@ -25,6 +25,8 @@ import type { TmuxAdapter } from "../src/adapters/tmux.js";
 
 const CULTURE_TEXT = "Rig culture: say it once, then stop.";
 const NOTES_TEXT = "Rig notes every seat reads.";
+const DEV_POD_TEXT = "Dev pod notes: run the checks before you hand off.";
+const OPS_POD_TEXT = "Ops pod notes: never touch production by hand.";
 
 function mockTmux(): TmuxAdapter {
   return {
@@ -76,7 +78,9 @@ function agentAt(root: string): void {
     `name: impl\nversion: "1.0.0"\nresources:\n  skills: []\nprofiles:\n  default:\n    uses:\n      skills: []\n`);
 }
 
-function fixture() {
+/** `podStartup`: the `dev` pod declares DEV-NOTES.md (required) and DEV-OPTIONAL.md (optional, never written), and a
+ *  second pod `ops` declares OPS-NOTES.md (required), each beside the rig file. */
+function fixture(opts: { podStartup?: boolean } = {}) {
   const base = fs.mkdtempSync(nodePath.join(os.tmpdir(), "or-added-seat-culture-"));
   tmpDirs.push(base);
   const rigRoot = nodePath.join(base, "rig");
@@ -88,6 +92,10 @@ function fixture() {
   agentAt(otherRoot);
   fs.writeFileSync(nodePath.join(rigRoot, "CULTURE.md"), `# Culture\n\n${CULTURE_TEXT}\n`);
   fs.writeFileSync(nodePath.join(rigRoot, "RIG-NOTES.md"), `# Notes\n\n${NOTES_TEXT}\n`);
+  if (opts.podStartup) {
+    fs.writeFileSync(nodePath.join(rigRoot, "DEV-NOTES.md"), `# Dev\n\n${DEV_POD_TEXT}\n`);
+    fs.writeFileSync(nodePath.join(rigRoot, "OPS-NOTES.md"), `# Ops\n\n${OPS_POD_TEXT}\n`);
+  }
   const cwd = (name: string) => {
     const dir = nodePath.join(base, name);
     fs.mkdirSync(dir, { recursive: true });
@@ -127,6 +135,14 @@ function fixture() {
     `pods:`,
     `  - id: dev`,
     `    label: Dev`,
+    ...(opts.podStartup ? [
+      `    startup:`,
+      `      files:`,
+      `        - path: DEV-NOTES.md`,
+      `          required: true`,
+      `        - path: DEV-OPTIONAL.md`,
+      `          required: false`,
+    ] : []),
     `    members:`,
     `      - id: impl`,
     `        agent_ref: "local:agents/impl"`,
@@ -134,6 +150,21 @@ function fixture() {
     `        runtime: claude-code`,
     `        cwd: "${cwd("repo")}"`,
     `    edges: []`,
+    ...(opts.podStartup ? [
+      `  - id: ops`,
+      `    label: Ops`,
+      `    startup:`,
+      `      files:`,
+      `        - path: OPS-NOTES.md`,
+      `          required: true`,
+      `    members:`,
+      `      - id: runner`,
+      `        agent_ref: "local:agents/impl"`,
+      `        profile: default`,
+      `        runtime: claude-code`,
+      `        cwd: "${cwd("ops-repo")}"`,
+      `    edges: []`,
+    ] : []),
     `edges: []`,
   ].join("\n") + "\n";
 
@@ -150,7 +181,16 @@ function fixture() {
   const rigFile = (logicalId: string, path: string) => context(logicalId).files.find((f) => f.path === path);
   const claudeMd = (dir: string) => fs.readFileSync(nodePath.join(dir, "CLAUDE.md"), "utf-8");
 
-  return { db, rigRepo, inst, expansion, yaml, rigRoot, otherRoot, cwd, context, rigFile, claudeMd };
+  /** The files of a seat's stored startup context, in delivery order. */
+  const order = (logicalId: string) => context(logicalId).files.map((file) => file.path);
+  const nodeExists = (logicalId: string) => !!db.prepare("SELECT 1 FROM nodes WHERE logical_id = ?").get(logicalId);
+  const addHelper = (podId: string, id: string) => inst.addMemberToPod(rigIdOf(), podId,
+    { id, agent_ref: "local:agents/impl", profile: "default", runtime: "claude-code", cwd: cwd(`${id}-repo`) }, otherRoot);
+  let currentRigId = "";
+  const rigIdOf = () => currentRigId;
+  const setRigId = (id: string) => { currentRigId = id; };
+
+  return { db, rigRepo, inst, expansion, yaml, rigRoot, otherRoot, cwd, context, rigFile, claudeMd, order, nodeExists, addHelper, setRigId };
 }
 
 async function launched(f: ReturnType<typeof fixture>): Promise<string> {
@@ -211,6 +251,144 @@ describe("a seat added to a running rig gets the rig's culture and startup layer
     expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
     expect(f.rigFile("dev.late", "CULTURE.md")).toBeUndefined();
     expect(f.rigFile("dev.late", "RIG-NOTES.md")).toBeUndefined();
+    f.db.close();
+  });
+});
+
+describe("a seat added to an existing pod also gets that pod's startup files, and the add stops when a required inherited file is gone", () => {
+  async function podRig() {
+    const f = fixture({ podStartup: true });
+    const rigId = await launched(f);
+    f.setRigId(rigId);
+    return { f, rigId };
+  }
+
+  it("an original seat has its pod's files (the baseline)", async () => {
+    const { f } = await podRig();
+    expect(f.rigFile("dev.impl", "DEV-NOTES.md")?.absolutePath).toBe(nodePath.join(f.rigRoot, "DEV-NOTES.md"));
+    f.db.close();
+  });
+
+  it("add-member into the pod: the added seat gets the pod's file, resolved against the rig's root, after the rig layers", async () => {
+    const { f } = await podRig();
+    const outcome = await f.addHelper("dev", "helper");
+    expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
+    expect(f.rigFile("dev.helper", "DEV-NOTES.md")?.absolutePath).toBe(nodePath.join(f.rigRoot, "DEV-NOTES.md"));
+    const order = f.order("dev.helper");
+    expect(order.indexOf("CULTURE.md")).toBeGreaterThan(-1);
+    expect(order.indexOf("CULTURE.md")).toBeLessThan(order.indexOf("RIG-NOTES.md"));
+    expect(order.indexOf("RIG-NOTES.md")).toBeLessThan(order.indexOf("DEV-NOTES.md"));
+    // The same list, in the same order, as the declared seat in that pod.
+    expect(order).toEqual(f.order("dev.impl"));
+    f.db.close();
+  });
+
+  it("each file comes from its own pod: a seat added to ops gets OPS-NOTES.md and not the dev pod's files", async () => {
+    const { f } = await podRig();
+    const outcome = await f.addHelper("ops", "second");
+    expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
+    expect(f.rigFile("ops.second", "OPS-NOTES.md")?.absolutePath).toBe(nodePath.join(f.rigRoot, "OPS-NOTES.md"));
+    expect(f.rigFile("ops.second", "DEV-NOTES.md")).toBeUndefined();
+    expect(f.rigFile("dev.impl", "OPS-NOTES.md")).toBeUndefined();
+    f.db.close();
+  });
+
+  it("the record is the one taken at creation: editing the rig file's startup list afterwards changes nothing", async () => {
+    const { f } = await podRig();
+    fs.writeFileSync(nodePath.join(f.rigRoot, "rig.yaml"), f.yaml.replace("- path: DEV-NOTES.md", "- path: SOMETHING-ELSE.md"));
+    const outcome = await f.addHelper("dev", "helper");
+    expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
+    expect(f.rigFile("dev.helper", "DEV-NOTES.md")).toBeDefined();
+    expect(f.rigFile("dev.helper", "SOMETHING-ELSE.md")).toBeUndefined();
+    f.db.close();
+  });
+
+  it("the added seat's saved list carries the pod file, so launch and restore replay it with no re-resolution", async () => {
+    const { f, rigId } = await podRig();
+    expect((await f.addHelper("dev", "helper")).ok).toBe(true);
+    // Drop the record: what a restore replays is the seat's own saved list, not the rig's record.
+    f.rigRepo.setRigStartupLayers(rigId, null);
+    expect(f.rigFile("dev.helper", "DEV-NOTES.md")?.absolutePath).toBe(nodePath.join(f.rigRoot, "DEV-NOTES.md"));
+    f.db.close();
+  });
+
+  it("an optional pod file that is missing does not stop the add, and is listed as for the declared seat", async () => {
+    const { f } = await podRig();
+    const outcome = await f.addHelper("dev", "helper");
+    expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
+    expect(f.rigFile("dev.helper", "DEV-OPTIONAL.md")).toBeDefined(); // listed, like the declared seat's
+    expect(f.rigFile("dev.helper", "DEV-OPTIONAL.md")).toEqual(f.rigFile("dev.impl", "DEV-OPTIONAL.md"));
+    f.db.close();
+  });
+
+  it("a rig created before this change (nothing recorded) is unchanged: no pod file, no failure", async () => {
+    const { f, rigId } = await podRig();
+    f.rigRepo.setRigStartupLayers(rigId, null);
+    fs.rmSync(nodePath.join(f.rigRoot, "DEV-NOTES.md"));
+    const outcome = await f.addHelper("dev", "helper");
+    expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
+    expect(f.rigFile("dev.helper", "DEV-NOTES.md")).toBeUndefined();
+    f.db.close();
+  });
+
+  it("a required pod file that is gone stops the add before any seat exists, naming the file and the pod", async () => {
+    const { f } = await podRig();
+    fs.rmSync(nodePath.join(f.rigRoot, "DEV-NOTES.md"));
+    const outcome = await f.addHelper("dev", "helper");
+    expect(outcome.ok).toBe(false);
+    const text = JSON.stringify(outcome);
+    expect(text).toContain("DEV-NOTES.md");
+    expect(text).toContain(nodePath.join(f.rigRoot, "DEV-NOTES.md"));
+    expect(text).toContain('pod "dev"');
+    expect(f.nodeExists("dev.helper")).toBe(false);
+    f.db.close();
+  });
+
+  it("a required rig startup file that is gone stops the add, naming the file and the rig", async () => {
+    const { f } = await podRig();
+    fs.rmSync(nodePath.join(f.rigRoot, "RIG-NOTES.md"));
+    const outcome = await f.addHelper("dev", "helper");
+    expect(outcome.ok).toBe(false);
+    const text = JSON.stringify(outcome);
+    expect(text).toContain("RIG-NOTES.md");
+    expect(text).toContain('rig "culture-rig"');
+    expect(f.nodeExists("dev.helper")).toBe(false);
+    f.db.close();
+  });
+
+  it("a declared culture_file that is gone stops the add", async () => {
+    const { f } = await podRig();
+    fs.rmSync(nodePath.join(f.rigRoot, "CULTURE.md"));
+    const outcome = await f.addHelper("dev", "helper");
+    expect(outcome.ok).toBe(false);
+    expect(JSON.stringify(outcome)).toContain("CULTURE.md");
+    expect(f.nodeExists("dev.helper")).toBe(false);
+    f.db.close();
+  });
+
+  it("a required file that cannot be read stops the add the same way", async () => {
+    const { f } = await podRig();
+    const target = nodePath.join(f.rigRoot, "DEV-NOTES.md");
+    fs.rmSync(target);
+    fs.mkdirSync(target); // present, but not a readable file
+    const outcome = await f.addHelper("dev", "helper");
+    expect(outcome.ok).toBe(false);
+    expect(JSON.stringify(outcome)).toContain("DEV-NOTES.md");
+    expect(f.nodeExists("dev.helper")).toBe(false);
+    f.db.close();
+  });
+
+  it("rig expand (a new pod) stops on a missing required rig file and creates no pod", async () => {
+    const { f, rigId } = await podRig();
+    fs.rmSync(nodePath.join(f.rigRoot, "RIG-NOTES.md"));
+    const result = await f.expansion.expand({
+      rigId,
+      pod: { id: "ux", label: "UX", members: [{ id: "designer", agentRef: "local:agents/impl", profile: "default", runtime: "claude-code", cwd: f.cwd("ux-repo") }], edges: [] },
+      rigRoot: f.otherRoot,
+    } as never);
+    expect(result.ok).toBe(false);
+    expect(JSON.stringify(result)).toContain("RIG-NOTES.md");
+    expect(f.nodeExists("ux.designer")).toBe(false);
     f.db.close();
   });
 });
