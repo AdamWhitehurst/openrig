@@ -175,6 +175,8 @@ const QUIET_SKIP_REASONS = new Set<string>([
   "not_due",
   // Quiet hours: the window's release job while quiet is still on. Nothing changed, so no history row or event per minute.
   "quiet_hours_still_on",
+  // A person's mode before its scheduled end (mode-scheduled-end): the same, for every minute it waits.
+  "mode_end_not_yet",
   "queue_wait_already_presented",
   "queue_wait_owner_working",
   "workflow_healthy_deadline_gated",

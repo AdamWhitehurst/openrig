@@ -15,7 +15,9 @@ import { addHumanFragment, loadHumanRegistry, readHumanAvailability, removeHuman
 import { HumanModeService, registryAvailability } from "../src/domain/gateway/human-operating-modes.js";
 import { makeTopologyDestinationCheck } from "../src/domain/queue-destination-check.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
-import { armModeScheduledEnd, KERNEL_OPERATOR_SESSION, MODE_SCHEDULED_END_POLICY, runModeScheduledEnd } from "../src/domain/policies/mode-scheduled-end.js";
+import { armModeScheduledEnd, KERNEL_OPERATOR_SESSION, makeModeScheduledEndPolicy, MODE_SCHEDULED_END_POLICY, runModeScheduledEnd } from "../src/domain/policies/mode-scheduled-end.js";
+import { WatchdogPolicyEngine } from "../src/domain/watchdog-policy-engine.js";
+import { WatchdogHistoryLog } from "../src/domain/watchdog-history-log.js";
 
 const homes: string[] = [];
 afterEach(() => { for (const h of homes.splice(0)) rmSync(h, { recursive: true, force: true }); });
@@ -155,5 +157,32 @@ describe("a mode's scheduled end", () => {
     expect(await f.run(job.jobId, END)).toEqual({ state: "already-ended" });
     expect(f.modes.get(app.applicationId)!.endReason).toBe("back");
     expect(f.availability()).toBe("off");
+  });
+
+  it("while a mode waits to end, the watchdog records nothing each minute; a notice still owed is recorded", async () => {
+    const f = fixture();
+    const bus = new EventBus(f.db);
+    const events: Array<{ type: string }> = [];
+    bus.subscribe((e) => events.push(e as { type: string }));
+    const jobsRepo = new WatchdogJobsRepository(f.db);
+    const historyLog = new WatchdogHistoryLog(f.db);
+    const engine = new WatchdogPolicyEngine({ jobsRepo, historyLog, eventBus: bus, deliver: async () => ({ ok: true }) as never,
+      additionalPolicies: [makeModeScheduledEndPolicy({ db: f.db, queueRepo: new QueueRepository(f.db, new EventBus(f.db), {
+        validateRig: makeTopologyDestinationCheck({ findRigsByName: (name) => new RigRepository(f.db).findRigsByName(name), loadHumanRegistry: () => loadHumanRegistry(f.home) }),
+      }), jobsRepo, home: f.home })] } as never);
+    const later = f.modes.apply("alex", "asleep", { scheduledEnd: new Date("2099-01-01T07:00:00Z") }, "orch@rig").application!;
+    const waiting = f.jobFor(later.applicationId)!;
+    await engine.evaluate(waiting);
+    await engine.evaluate(jobsRepo.getById(waiting.jobId)!);
+    expect(historyLog.countForJob(waiting.jobId)).toBe(0);
+    expect(events.filter((e) => e.type.startsWith("watchdog."))).toEqual([]);
+
+    f.modes.end("alex", "back", "alex");
+    const app = f.modes.apply("alex", "asleep", { scheduledEnd: END }, "op").application!; // END has passed by the wall clock
+    const owed = f.jobFor(app.applicationId)!;
+    writeFileSync(join(f.home, "gateway", "humans", "alex.yaml"), "entityId: [unclosed\n"); // the notice can't be addressed yet
+    await engine.evaluate(owed);
+    expect(historyLog.countForJob(owed.jobId)).toBe(1);
+    expect(events.some((e) => e.type === "watchdog.evaluation_skipped")).toBe(true);
   });
 });

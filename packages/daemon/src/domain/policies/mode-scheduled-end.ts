@@ -158,13 +158,16 @@ function noticeFor(ended: ModeApplication, scheduledEnd: string, qitemId: string
   };
 }
 
+/** The waiting skip: a quiet reason in the engine, so a mode waiting to end leaves no history row or event each minute. */
+export const MODE_END_NOT_YET = "mode_end_not_yet";
+
 /** Watchdog-engine wrapper: the scheduler's cadence drives evaluation; the application's own record owns the timing. */
 export function makeModeScheduledEndPolicy(deps: Omit<ModeScheduledEndInput, "jobId" | "now">): Policy {
   return {
     name: MODE_SCHEDULED_END_POLICY,
     async evaluate(job: PolicyJob): Promise<PolicyEvaluation> {
       const r = await runModeScheduledEnd({ ...deps, jobId: job.jobId });
-      if (r.state === "not-yet") return { action: "skip", reason: "before its scheduled end" };
+      if (r.state === "not-yet") return { action: "skip", reason: MODE_END_NOT_YET };
       if (r.state === "notice-pending") return { action: "skip", reason: `ended; the notice is still to be created${r.why ? `: ${r.why}` : ""}` };
       return { action: "terminal", reason: r.state === "ended" ? "mode ended at its scheduled time" : "mode had already ended" };
     },
