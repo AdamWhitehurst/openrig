@@ -48,6 +48,31 @@ export const LADDER_ATTEMPT_PREFIX = "wake-attempt:";
 export const LADDER_RUNG_PREFIX = "escalation-rung:";
 export const LADDER_EXHAUSTED_PREFIX = "ladder-exhausted:";
 
+/** Suppression floor: even at the ladder's default cadence, a marker suppresses for half
+ *  an hour. */
+export const LADDER_SUPPRESSION_MINIMUM_MINUTES = 30;
+
+/** The ladder's own retry cadence, read from the setting the ladder itself uses
+ *  (queue.wake_retry_interval_seconds, default 300s). Read by key here rather than
+ *  imported: queue-wake-ladder imports this module for the marker prefixes, so an import
+ *  back would close a cycle. A test pins the key to the ladder's own. */
+const WAKE_RETRY_INTERVAL_SETTING_KEY = "queue.wake_retry_interval_seconds";
+const DEFAULT_WAKE_RETRY_INTERVAL_SECONDS = 300;
+
+/** How long a ladder marker suppresses re-reporting: half an hour, or two of the owning
+ *  ladder's own retry intervals, whichever is longer. A working ladder must not lose its
+ *  marker between its own attempts, or the sweep would report an item the ladder still
+ *  owns. #1419. */
+export function resolveLadderSuppressionMinutes(): number {
+  let intervalSeconds = DEFAULT_WAKE_RETRY_INTERVAL_SECONDS;
+  try {
+    const v = new SettingsStore().resolveOne(WAKE_RETRY_INTERVAL_SETTING_KEY as never).value;
+    const n = typeof v === "number" ? v : Number(v);
+    if (Number.isFinite(n) && n > 0) intervalSeconds = n;
+  } catch { /* a settings error must never shorten the bound */ }
+  return Math.max(LADDER_SUPPRESSION_MINIMUM_MINUTES, (2 * intervalSeconds) / 60);
+}
+
 export type StuckFindingKind =
   | "unconsumed-wait"
   | "overdue-claim"
@@ -144,6 +169,10 @@ export interface StuckSweepDeps {
    *  hosts.yaml once per sweep pass, and an unavailable registry degrades honestly to
    *  verification-required (more indeterminate findings, never a false verdict). */
   isRegisteredHost?: (hostId: string) => boolean;
+  /** How long a ladder marker suppresses re-reporting, in minutes. Default: half an hour,
+   *  or two of the owning ladder's own retry intervals, whichever is longer. Injectable for
+   *  tests; the default reads the ladder's existing setting. */
+  ladderSuppressionMinutes?: number;
 }
 
 export interface StuckSweepFindingAction {
@@ -256,17 +285,25 @@ function custodyFindingRoute(db: Database.Database, queueRepo: QueueRepository, 
   return row.destinationSession;
 }
 
-function hasLiveLadder(db: Database.Database, qitemId: string): boolean {
+function hasLiveLadder(db: Database.Database, qitemId: string, now: Date, suppressionMinutes: number): boolean {
   const notes = db
-    .prepare("SELECT transition_note FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id DESC")
-    .all(qitemId) as TransitionNoteRow[];
-  for (const { transition_note: note } of notes) {
+    .prepare("SELECT ts, transition_note FROM queue_transitions WHERE qitem_id = ? ORDER BY transition_id DESC")
+    .all(qitemId) as Array<{ ts: string | null; transition_note: string | null }>;
+  for (const { ts, transition_note: note } of notes) {
     if (!note) continue;
     if (note.startsWith(LADDER_EXHAUSTED_PREFIX)) return false;
-    if (note.startsWith(LADDER_ATTEMPT_PREFIX) || note.startsWith(LADDER_RUNG_PREFIX)) return true;
+    if (note.startsWith(LADDER_ATTEMPT_PREFIX) || note.startsWith(LADDER_RUNG_PREFIX)) {
+      // Freshness bounds the suppression (#1419): the marker's time decides, and a missing,
+      // unparsable or future timestamp fails open for reporting instead of suppressing
+      // forever.
+      const tsMs = Date.parse(ts ?? "");
+      const ageMs = now.getTime() - tsMs;
+      return !Number.isNaN(tsMs) && tsMs <= now.getTime() && ageMs <= suppressionMinutes * 60_000;
+    }
   }
   return false;
 }
+
 
 function minutesSince(iso: string | null | undefined, now: Date): number {
   if (!iso) return 0;
@@ -373,6 +410,12 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
   const status = deps.status;
   try {
     const now = deps.now ?? new Date();
+    const suppressionMinutes = deps.ladderSuppressionMinutes ?? resolveLadderSuppressionMinutes();
+    /** The dedup tags of the candidates the LADDER suppressed in this pass, and only those:
+     *  a row the ladder alone would have stopped. A finding for such a row stays open,
+     *  because the marker only ever stopped the re-report — it never resolved anything.
+     *  Every other finding resolves as soon as the sweep no longer detects its condition. */
+    const suppressedTags = new Set<string>();
     const ageMinutes = deps.unclaimedAgeMinutes ?? resolveStuckSweepUnclaimedAgeMinutes();
     const resolveOrch =
       deps.resolveOrchestrator ?? ((session: string) => defaultResolveOrchestrator(deps.db, session));
@@ -446,8 +489,6 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
     for (const row of deps.queueRepo.findUndelivered()) {
       if (isFindingRow(row)) continue;
       const humanNotice = row.deliveryOutcome === "never-posted" || row.deliveryOutcome === "transport-failed";
-      // Agent wake retries do not own the separate notice to a person.
-      if (!humanNotice && hasLiveLadder(deps.db, row.qitemId)) continue;
       const notification = humanNotice ? deps.queueRepo.transitionLog.latestOwnerNotificationForQitem(row.qitemId) : null;
       const resolutionNotice = notification?.ownerNotificationKind === "human-decision-resolved";
       // Match the notification source in slack/queue-access.ts, not the agent wake's escalator.
@@ -461,6 +502,13 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       // live release job is orphaned: both stay findings, with their own reason.
       const quiet = quietHoldCustody(deps.db, row.qitemId, now);
       if (quiet && (quiet.state === "held" || quiet.state === "released")) continue;
+      // The ladder check runs LAST, so only a row the ladder ALONE would have stopped counts
+      // as ladder-suppressed (#1419). Agent wake retries do not own the separate notice to a
+      // person: a human notice is never the ladder's to suppress.
+      if (!humanNotice && hasLiveLadder(deps.db, row.qitemId, now, suppressionMinutes)) {
+        suppressedTags.add(findingDedupTag("undelivered-wake", row.qitemId));
+        continue;
+      }
       candidates.push({
         kind: humanNotice ? "undelivered-human-notice" : "undelivered-wake",
         row,
@@ -496,7 +544,6 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       if (!row || isFindingRow(row)) continue;
       const actionableAt = pendingSince(deps.db, row.qitemId) ?? row.tsCreated;
       if (actionableAt > cutoff) continue;
-      if (hasLiveLadder(deps.db, row.qitemId)) continue;
       // #514 — an ask already posted to its registered human in the current delivery episode waits on
       // that human; it is not stuck, and a finding would post the human again. Unposted, failed,
       // legacy and non-human rows keep this net.
@@ -506,6 +553,12 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       // hold with no live release job is stuck: nothing will ever release it.
       const quiet = quietHoldCustody(deps.db, row.qitemId, now);
       if (quiet && quiet.state !== "orphaned") continue;
+      // The ladder check runs LAST here too: a row the ladder alone would have stopped is
+      // ladder-suppressed, and its finding stays open (#1419).
+      if (hasLiveLadder(deps.db, row.qitemId, now, suppressionMinutes)) {
+        suppressedTags.add(findingDedupTag("unclaimed-obligation", row.qitemId));
+        continue;
+      }
       candidates.push({
         kind: "unclaimed-obligation",
         row,
@@ -698,6 +751,12 @@ export async function runStuckSweep(deps: StuckSweepDeps): Promise<StuckSweepRes
       const dedupTag = tags.find((t) => t.startsWith("stuck-sweep:"));
       if (!dedupTag || liveDedupTags.has(dedupTag)) continue;
       const [, kind, stuckId] = dedupTag.match(/^stuck-sweep:([a-z-]+):(.+)$/) ?? [];
+      // Suppression is not resolution (#1419), and only the ladder's own suppression counts:
+      // a finding whose row the ladder stopped in THIS pass stays open, because the marker
+      // only ever stopped the re-report. Every other finding resolves as soon as the sweep
+      // no longer detects its condition — a resumed claim, a verified custody disposition, a
+      // notice that has since posted, or a row the ladder never owned.
+      if (suppressedTags.has(dedupTag)) continue;
       await deps.queueRepo.update({
         qitemId: f.qitem_id,
         actorSession: f.source_session,
