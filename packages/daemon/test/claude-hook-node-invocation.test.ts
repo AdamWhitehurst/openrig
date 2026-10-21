@@ -45,14 +45,20 @@ function fixture() {
   return { root, cwd, state, settings, relayDest, collectorDest, adapter, project };
 }
 
-it.each(["legacy", "pinned"])("refreshes %s commands through the actual writers and preserves unrelated settings", async kind => {
+it.each(["legacy", "pinned", "unquoted", "absolute-unquoted", "plugin-unquoted"])("refreshes %s commands through the actual writers and preserves unrelated settings", async kind => {
   const f = fixture();
-  const old = kind === "legacy" ? "node" : shellQuote("/old Node's version/node");
+  const unquoted = kind.includes("unquoted");
+  const old = kind === "legacy" || kind === "unquoted" || kind === "plugin-unquoted" ? "node"
+    : unquoted ? "/old/runtime/node" : shellQuote("/old Node's version/node");
+  const oldRelay = kind === "plugin-unquoted" ? path.join(f.root, "plugins/openrig-core/hooks/scripts/activity-relay.cjs")
+    : unquoted ? path.join(f.root, "state/claude-activity-hooks/activity-relay.cjs") : f.relayDest;
+  const oldCollector = unquoted ? path.join(f.root, ".openrig/context-collector.cjs") : f.collectorDest;
+  const arg = (value: string) => unquoted ? value : shellQuote(value);
   const custom = { type: "command", command: `custom-wrapper ${shellQuote(f.relayDest)}` };
   const permissions = { allow: ["Bash(ls:*)"] };
   fs.writeFileSync(f.settings, JSON.stringify({ permissions,
-    statusLine: { type: "command", command: `${old} ${shellQuote(f.collectorDest)} '/old/context' '/old/provider'`, padding: 3 },
-    hooks: { Stop: [{ hooks: [custom, { type: "command", command: `${old} ${shellQuote(f.relayDest)}` }] }] },
+    statusLine: { type: "command", command: `${old} ${arg(oldCollector)} ${arg("/old/context")} ${arg("/old/provider")}`, padding: 3 },
+    hooks: { Stop: [{ hooks: [custom, { type: "command", command: `${old} ${arg(oldRelay)}` }] }] },
   }));
   const a = f.adapter();
   const result = await f.project(a);
@@ -156,5 +162,35 @@ it.each(["node", shellQuote("/Node O'Brien/node")])("keeps the adapter and stand
   expect(relayParser.settingsRelayPath(command)).toEqual({ executable: executable === "node" ? "node" : "/Node O'Brien/node", relay: script });
   for (const invalid of [command + " extra", command + " 'extra'", `${shellQuote("/custom/wrapper")} ${shellQuote(script)}`, command + "\necho extra"]) {
     expect(relayParser.settingsRelayPath(invalid)).toBeNull();
+  }
+});
+
+it.each(["explicit", "legacy"])("runs every Claude plugin hook command with the %s interpreter selection", kind => {
+  const f = fixture();
+  const plugin = path.join(f.root, "plugin's hooks");
+  const manifest = JSON.parse(fs.readFileSync(path.resolve(path.dirname(relay), "../claude.json"), "utf8"));
+  const commands = Object.values(manifest.hooks).flatMap((groups: any) => groups.flatMap((g: any) => g.hooks.map((h: any) => h.command))) as string[];
+  for (const command of commands) {
+    const relative = /\$\{CLAUDE_PLUGIN_ROOT\}([^"\s]+)/.exec(command)![1]!;
+    const script = path.join(plugin, relative);
+    fs.mkdirSync(path.dirname(script), { recursive: true });
+    fs.writeFileSync(script, 'process.stdout.write(JSON.stringify({ node: process.execPath, args: process.argv.slice(2) }));');
+    const r = spawnSync("/bin/sh", ["-c", command], { encoding: "utf8", timeout: 5000,
+      env: { PATH: kind === "explicit" ? "" : path.dirname(process.execPath), CLAUDE_PLUGIN_ROOT: plugin,
+        ...(kind === "explicit" ? { OPENRIG_NODE: process.execPath } : {}) } });
+    expect(r.status, r.stderr).toBe(0);
+    expect(JSON.parse(r.stdout).node).toBe(fs.realpathSync(process.execPath));
+  }
+});
+
+it.each(["node", "/old/runtime/node", "'/old/runtime/node'"])("recognizes unquoted relay paths in both readers: %s", executable => {
+  const script = "/instance/state/claude-activity-hooks/activity-relay.cjs";
+  const command = `${executable} ${script}`;
+  const wanted = executable === "node" ? "node" : "/old/runtime/node";
+  expect(parseManagedClaudeNodeCommand(command)).toEqual({ executable: wanted, args: [script] });
+  expect(relayParser.settingsRelayPath(command)).toEqual({ executable: wanted, relay: script });
+  for (const suffix of ["; echo extra", " && echo extra", " | cat", " $(echo extra)", "*", "\nnode extra"]) {
+    expect(parseManagedClaudeNodeCommand(command + suffix)).toBeNull();
+    expect(relayParser.settingsRelayPath(command + suffix)).toBeNull();
   }
 });

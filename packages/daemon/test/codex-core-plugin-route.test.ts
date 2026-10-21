@@ -133,7 +133,7 @@ describe("the launch signal: selected, unselected and personal", () => {
       expect(created[1]!.env).not.toHaveProperty(SEAT_PROJECT_DIR_ENV);
       expect(created[1]!.env).not.toHaveProperty(SEAT_NODE_ENV);
       expect(created[2]!.env).toMatchObject({ [SEAT_PROJECT_DIR_ENV]: "/work/claude-selected", CLAUDE_CODE_PLUGIN_DIRS: dir });
-      expect(created[2]!.env).not.toHaveProperty(SEAT_NODE_ENV);
+      expect(created[2]!.env).toHaveProperty(SEAT_NODE_ENV, process.execPath);
     } finally { db.close(); }
   });
 });

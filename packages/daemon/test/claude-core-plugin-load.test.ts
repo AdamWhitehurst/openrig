@@ -30,7 +30,7 @@ import { TmuxAdapter } from "../src/adapters/tmux.js";
 import { ClaudeManagedLaunch as RealManagedLaunch } from "../src/domain/claude-managed-launch.js";
 import type { ClaudeManagedLaunch } from "../src/domain/claude-managed-launch.js";
 import { SEAT_ENV_KEYS_VAR } from "../src/domain/seat-env.js";
-import { SEAT_PROJECT_DIR_ENV } from "../src/domain/claude-core-plugin-env.js";
+import { SEAT_NODE_ENV, SEAT_PROJECT_DIR_ENV } from "../src/domain/claude-core-plugin-env.js";
 import {
   persistedPluginPaths, seatCorePluginDir, vendoredCorePluginDir, withCorePlugin,
 } from "../src/domain/claude-core-plugin-env.js";
@@ -304,8 +304,10 @@ describe("a Claude seat's launch env, on the launch paths that don't re-resolve 
     expect((await launcher.launchNode(rig.id, "elsewhere", { pluginPaths: [vendored], cwd: "/work/moved" })).ok).toBe(true);
     expect((await launcher.launchNode(rig.id, "nothing", { pluginPaths: [] })).ok).toBe(true);
     expect(created[0]!.env![SEAT_PROJECT_DIR_ENV]).toBe("/work/seat");
+    expect(created[0]!.env![SEAT_NODE_ENV]).toBe(process.execPath);
     expect(created[1]!.env![SEAT_PROJECT_DIR_ENV]).toBe("/work/moved"); // the folder the session actually starts in
     expect(created[2]!.env).not.toHaveProperty(SEAT_PROJECT_DIR_ENV);
+    expect(created[2]!.env).not.toHaveProperty(SEAT_NODE_ENV);
   });
 
   it("fresh launch: nothing is added when the plugin isn't vendored", async () => {
@@ -548,7 +550,7 @@ describe.skipIf(process.platform === "win32")("the managed (env -i) Claude launc
     for (const dir of [bin, home, cwd]) mkdirSync(dir);
     writeFileSync(join(bin, "claude"), `#!/bin/sh
 if [ "$1" = --help ]; then printf '%s\\n' '--permission-mode <mode> (choices: "auto", "default")'; exit 0; fi
-printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s","PROJECT":"%s"}' "\${CLAUDE_CODE_PLUGIN_DIRS-absent}" "\${LEAKED-absent}" "\${OPENRIG_SEAT_PROJECT_DIR-absent}"
+printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s","PROJECT":"%s","NODE":"%s"}' "\${CLAUDE_CODE_PLUGIN_DIRS-absent}" "\${LEAKED-absent}" "\${OPENRIG_SEAT_PROJECT_DIR-absent}" "\${OPENRIG_NODE-absent}"
 `);
     chmodSync(join(bin, "claude"), 0o700);
     const db = new Database(":memory:"); cleanup.push(() => { db.close(); });
@@ -580,7 +582,7 @@ printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s","PROJECT":"%s"}' "\${CLAUDE_CODE_PLUGI
     const vars = withCorePlugin({}, vendored);
     const f = fixture({ sessionKeys: PLUGIN_ENV });
     const seen = await f.run(await launch(f), { ...vars, LEAKED: "should-not-pass" });
-    expect(seen).toEqual({ PLUGIN_DIRS: vendored, LEAKED: "absent", PROJECT: "absent" });
+    expect(seen).toEqual({ PLUGIN_DIRS: vendored, LEAKED: "absent", PROJECT: "absent", NODE: "absent" });
   });
 
   it("gives a seat that declared its own list the composed list, once", async () => {
@@ -594,8 +596,8 @@ printf '{"PLUGIN_DIRS":"%s","LEAKED":"%s","PROJECT":"%s"}' "\${CLAUDE_CODE_PLUGI
     // respawned pane's shell has the variable. The seat's saved plugin selection is what says to forward it.
     for (const sessionKeys of [undefined, "FOO"]) {
       const f = fixture({ sessionKeys, saved: ["vendored"] });
-      const seen = await f.run(await launch(f), { [PLUGIN_ENV]: f.vendored, [SEAT_PROJECT_DIR_ENV]: "/seat/project", LEAKED: "should-not-pass" });
-      expect(seen, String(sessionKeys)).toEqual({ PLUGIN_DIRS: f.vendored, LEAKED: "absent", PROJECT: "/seat/project" });
+      const seen = await f.run(await launch(f), { [PLUGIN_ENV]: f.vendored, [SEAT_PROJECT_DIR_ENV]: "/seat/project", [SEAT_NODE_ENV]: process.execPath, LEAKED: "should-not-pass" });
+      expect(seen, String(sessionKeys)).toEqual({ PLUGIN_DIRS: f.vendored, LEAKED: "absent", PROJECT: "/seat/project", NODE: process.execPath });
     }
   });
 

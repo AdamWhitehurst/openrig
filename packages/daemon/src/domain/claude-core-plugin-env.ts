@@ -81,7 +81,7 @@ export function seatCorePluginDir(
   return selectedCorePluginDir(paths, pluginsDir);
 }
 
-/** The explicit interpreter a Codex seat's plugin hooks run with, so they never depend on `node` resolving on PATH. */
+/** The explicit interpreter a selected seat's plugin hooks run with, so they never depend on `node` resolving on PATH. */
 export const SEAT_NODE_ENV = "OPENRIG_NODE";
 
 /**

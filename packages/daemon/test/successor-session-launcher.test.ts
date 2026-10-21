@@ -54,7 +54,7 @@ describe("SuccessorSessionLauncher", () => {
     return new SuccessorSessionLauncher(tmux, discoveryRepo, {
       sessionEnv: { OPENRIG_HOME: "/home", HOME: "/daemon-home", CODEX_HOME: "/daemon-codex" },
       newId: () => "01ABCDEFG",
-      runtimeAdapters: { codex: fakeAdapter("codex") },
+      runtimeAdapters: { codex: fakeAdapter("codex"), "claude-code": fakeAdapter("claude-code") },
       readinessTimeoutMs: 50,
       sleep: async () => {},
       exitPollMs: 1,
@@ -71,6 +71,14 @@ describe("SuccessorSessionLauncher", () => {
     expect(res.ok).toBe(true);
     const opts = respawnPane.mock.calls[0]![2];
     expect(opts.env).toMatchObject({ MODE: "fast", REGION: "eu", OPENRIG_SEAT_ENV_KEYS: "MODE,REGION", OPENRIG_NODE_ID: "node-1" });
+  });
+
+  it.each(["codex", "claude-code"])("a selected %s plugin keeps its interpreter on handover", async runtime => {
+    const res = await launcher().createSuccessor({
+      node: { id: "node-1", runtime, cwd: "/w", seatProjectDir: "/w" }, departingSessionName: "dev-impl@rig",
+    });
+    expect(res.ok).toBe(true);
+    expect(respawnPane.mock.calls[0]![2].env).toMatchObject({ OPENRIG_NODE: process.execPath });
   });
 
   it("a seat that declares no env gets no env keys variable", async () => {

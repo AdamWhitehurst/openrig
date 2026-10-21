@@ -223,19 +223,20 @@ function uid() {
 // each event once either way. Anything unreadable, missing or different counts as "not registered": a seat is never silent.
 const SETTINGS_RELAY_TAIL = "state/claude-activity-hooks/activity-relay.cjs";
 
-// Keep this finite generated-command grammar in parity with parseManagedClaudeNodeCommand.
-// Bare-node legacy commands and a canonical quoted absolute Node path are recognised;
-// extra arguments and user wrappers are not the settings relay.
+// Keep this finite Node-command grammar in parity with parseManagedClaudeNodeCommand.
+// Canonical POSIX quotes and literal unquoted words only; no expansion or wrappers.
 function settingsRelayPath(command) {
   if (/[\r\n]/.test(command)) return null;
-  const m = /^(node|'(?:[^']|'"'"')*')[ \t]+('(?:[^']|'"'"')*')$/.exec(command.trim());
+  const token = /'(?:[^']|'"'"')*'|[-A-Za-z0-9_./:@%+=,]+/.source;
+  const m = new RegExp(`^(${token})[ \t]+(${token})$`).exec(command.trim());
   if (!m) return null;
-  const decode = token => token.slice(1, -1).split(`'"'"'`).join("'");
+  const decode = token => token.startsWith("'") ? token.slice(1, -1).split(`'"'"'`).join("'") : token;
   const quote = value => "'" + value.replace(/'/g, `'"'"'`) + "'";
-  const executable = m[1] === "node" ? "node" : decode(m[1]);
+  const executable = decode(m[1]);
   const relay = decode(m[2]);
-  if (quote(relay) !== m[2] || !path.isAbsolute(relay) || !relay.endsWith(`/${SETTINGS_RELAY_TAIL}`)) return null;
-  if (m[1] !== "node" && (quote(executable) !== m[1] || !path.isAbsolute(executable) || !/^node(?:\.exe)?$/i.test(path.basename(executable)))) return null;
+  if (m.slice(1).some(token => token.startsWith("'") && quote(decode(token)) !== token)) return null;
+  if (!path.isAbsolute(relay) || !relay.endsWith(`/${SETTINGS_RELAY_TAIL}`)) return null;
+  if (executable !== "node" && (!path.isAbsolute(executable) || !/^node(?:\.exe)?$/i.test(path.basename(executable)))) return null;
   return { executable, relay };
 }
 

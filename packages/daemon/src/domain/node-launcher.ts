@@ -173,7 +173,7 @@ export class NodeLauncher {
       // The launch project of a seat that loads the plugin, so a Claude started elsewhere inside the seat is not taken for it.
       // For a Codex seat it is also the selection signal its plugin hooks check, beside the interpreter they run with.
       [SEAT_PROJECT_DIR_ENV]: corePluginDir || codexCorePluginDir ? sessionCwd : undefined,
-      [SEAT_NODE_ENV]: codexCorePluginDir ? process.execPath : undefined,
+      [SEAT_NODE_ENV]: corePluginDir || codexCorePluginDir ? process.execPath : undefined,
       OPENRIG_OCCUPANT_GENERATION: occupantGeneration ?? undefined,
     });
     const openRigEnv = launchEnv(opts?.env);

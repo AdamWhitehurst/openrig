@@ -1211,7 +1211,8 @@ function isOwnedRelayCommand(cmd: string | undefined): boolean {
   const parsed = parseManagedClaudeNodeCommand(cmd);
   if (!parsed || parsed.args.length !== 1) return false;
   const relay = parsed.args[0]!;
-  return relay.endsWith(LEGACY_OWNED_RELAY_SUFFIX)
+  return relay.endsWith("/plugins/openrig-core/hooks/scripts/activity-relay.cjs")
+    || relay.endsWith(LEGACY_OWNED_RELAY_SUFFIX)
     || relay.endsWith(`/${CLAUDE_ACTIVITY_RELAY_RELATIVE_PATH}`);
 }
 
