@@ -15,6 +15,7 @@ import { migrate } from "../src/db/migrate.js";
 import { ALL_MIGRATIONS } from "../src/db/all-migrations.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { EventBus } from "../src/domain/event-bus.js";
+import { runStuckSweep } from "../src/domain/queue-stuck-sweep.js";
 import type { OutboundDecision } from "../src/domain/gateway/protocol.js";
 
 const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
@@ -224,6 +225,12 @@ describe("Slack invalid_blocks is a permanent rejection (#47)", () => {
       expect(fetchImpl).toHaveBeenCalledTimes(multipart ? 2 : 1);
       expect(repo.list({ destinationSession: request.sourceSession }).filter((q) => q.tags.includes("slack-undeliverable"))).toHaveLength(2);
       expect(new DispatchBuffer(home).pending()).toHaveLength(1);
+      const swept = await runStuckSweep({ db, queueRepo: repo, resolveOrchestrator: () => null,
+        unclaimedAgeMinutes: 60, isRegisteredHost: () => false });
+      expect(swept.outcome).not.toBe("failed");
+      expect(swept.findings).toContainEqual(expect.objectContaining({ qitemId: item.qitemId,
+        findingQitemId: noticeId, action: "refreshed" }));
+      expect(repo.list({ destinationSession: request.sourceSession }).filter((q) => q.tags.includes("stuck-sweep-finding"))).toHaveLength(0);
     } finally { wire.stop(); db.close(); }
   });
 });

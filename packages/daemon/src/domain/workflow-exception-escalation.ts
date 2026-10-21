@@ -74,7 +74,8 @@ export function makeEnsureStuckExceptionItem(deps: StuckExceptionDeps): EnsureSt
     const exception = classifyDeadlineVerdict(input.workflowName, input.verdict);
     if (!exception) return { outcome: "skipped-healthy" };
 
-    const previous = findQueueRecovery(deps.db, exception.deadlineEvidence!.packetId);
+    // A delivery failure notice at the sender does not own the workflow exception route.
+    const previous = findQueueRecovery(deps.db, exception.deadlineEvidence!.packetId, "slack-undeliverable");
     if (previous) return { outcome: "deduped", qitemId: previous.qitemId };
 
     // Honor historical occurrence rows, including their closed disposition.

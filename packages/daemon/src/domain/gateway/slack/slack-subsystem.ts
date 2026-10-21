@@ -33,6 +33,7 @@ import { ThreadSeatMap, formatPostedStamp } from "./thread-seat-map.js";
 import { makeThreadRouteResolver } from "./thread-routing.js";
 import { resolveInboundChannelDestination, resolveOutboundChannel, unsupportedChannelMapFields } from "./channel-map.js";
 import { resolveRigRepresentative } from "../../queue-owner.js";
+import { recoveryTag } from "../../queue-recovery.js";
 import { getSelfHostId } from "../../hosts/fanout-contract.js";
 import { envelopeChannel, forwardChannelProblems, makeEnvelopeForwarder } from "./forwarding.js";
 import type { HostRegistryLoadResult } from "../../hosts/hosts-registry-reader.js";
@@ -358,7 +359,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
           : "Shorten it and send it as a new ask. The original row stays open until you close it.",
       ].join("\n"),
       evidenceRef: `rig queue show ${p.qitemId}`,
-      tags: ["slack-undeliverable"],
+      tags: ["slack-undeliverable", recoveryTag(p.qitemId)],
     }).catch((e) => log(`undeliverable notice FAILED for ${p.qitemId}: ${(e as Error).message}`));
   };
 
