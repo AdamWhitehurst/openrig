@@ -28,6 +28,9 @@ import { authBearerTokenMiddleware } from "../middleware/auth-bearer-token.js";
 import type Database from "better-sqlite3";
 import { HumanQuietStore, QuietWindowError, parseDailyRule, resolveUntil } from "../domain/gateway/human-quiet-windows.js";
 import { HumanModeService, ModeError, registryAvailability, type QuietRule } from "../domain/gateway/human-operating-modes.js";
+import { modeAccount } from "../domain/gateway/human-mode-account.js";
+import { WatchdogJobsRepository } from "../domain/watchdog-jobs-repository.js";
+import { armModeScheduledEnd } from "../domain/policies/mode-scheduled-end.js";
 
 interface SubsystemHandle {
   restart: () => void;
@@ -163,7 +166,9 @@ export function gatewayRoutes(opts: {
         actor = identity.session;
       }
       const at = now();
-      const modes = new HumanModeService({ db, availability: registryAvailability(home), now: () => at });
+      const jobsRepo = new WatchdogJobsRepository(db);
+      const modes = new HumanModeService({ db, availability: registryAvailability(home), now: () => at,
+        armScheduledEnd: (application) => armModeScheduledEnd({ jobsRepo, ...application }) });
       try {
         return c.json({ ok: true, entityId, ...(handler({ modes, entityId, name: c.req.param("name") ?? "", actor, body, at }) as Record<string, unknown>) });
       } catch (error) {
@@ -197,6 +202,8 @@ export function gatewayRoutes(opts: {
   app.post("/human/:entityId/modes/:name/apply", modeRoute("applying a mode", ({ modes, entityId, name, actor, body, at }) => {
     const until = text(body.until);
     const saved = modes.saved(entityId, name);
+    // The CLI always sends a zone with an end time (this machine's, unless --tz). An API caller that sends none gets the
+    // mode's quiet-hours zone, else UTC.
     const timezone = text(body.timezone) ?? (saved?.delivery.quiet?.timezone || "UTC");
     const result = modes.apply(entityId, name, { scheduledEnd: until ? resolveUntil(until, timezone, at) : null }, actor);
     return { application: result.application, ended: result.ended, atDesk: result.application === null, unresolved: modes.unresolved(entityId) };
@@ -226,6 +233,22 @@ export function gatewayRoutes(opts: {
     const decisions = queueRepo.delegatedDecisionsFor(applicationId).map((item) => ({ qitemId: item.qitemId, summary: item.summary,
       sourceSession: item.sourceSession, decision: item.delegatedDecision }));
     return c.json({ ok: true, entityId, applicationId, modeName: application.modeName, decisions });
+  });
+  // The facts for the person's "back" account, for one ended application: made from the records only, never composed here.
+  app.get("/human/:entityId/mode/applications/:applicationId/account", async (c) => {
+    const entityId = c.req.param("entityId");
+    const applicationId = c.req.param("applicationId");
+    const db = c.get("db" as never) as Database.Database | undefined;
+    const queueRepo = c.get("queueRepo" as never) as QueueRepository | undefined;
+    if (!db || !queueRepo) return c.json({ error: "modes_unavailable", message: "The daemon's database isn't available to this route." }, 503);
+    const home = opts.home ?? OPENRIG_HOME;
+    const result = await modeAccount({ modes: new HumanModeService({ db, now }), queueRepo, home, registry: { loadHumanRegistry },
+      entityId, applicationId, now: now() });
+    if (result.status === "not-found") return c.json({ error: "application_not_found", entityId, applicationId }, 404);
+    if (result.status === "still-on") {
+      return c.json({ error: "still_on", message: `${result.application.modeName} is still on: end it first (current shows it while it's on)` }, 409);
+    }
+    return c.json({ ok: true, entityId, account: result.account });
   });
   app.post("/human/:entityId/mode/end", modeRoute("ending a mode", ({ modes, entityId, actor, body }) => {
     const reason = body.reason === "scheduled" ? "scheduled" : "back";

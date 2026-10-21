@@ -84,6 +84,14 @@ describe("rig gateway human mode", () => {
     expect(logs).toEqual(["asleep on since 2026-10-20T21:00:00.000Z, until 2026-10-21T07:00:00.000Z\n  availability: active\n  decision-room: active\n  quiet: failed (unknown timezone)"]);
   });
 
+  it("apply --until without --tz uses this machine's zone, as save does, and says which zone it used", async () => {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    reply = { status: 200, body: { ok: true, application, ended: null, atDesk: false, unresolved: [] } };
+    await run("mode", "apply", "mike", "asleep", "--until", "07:00");
+    expect(requests[0]!.body).toMatchObject({ until: "07:00", timezone: zone });
+    expect(logs.at(-1)).toBe(`until 07:00 in ${zone}; pass --tz for the person's own zone`);
+  });
+
   it("current says at desk, and lists a restoration still owed from an earlier mode", async () => {
     reply = { status: 200, body: { ok: true, current: null, atDesk: true, unresolved: [
       { applicationId: "a-0", modeName: "away-from-desk", endedAt: "2026-10-20T18:00:00.000Z",
@@ -121,6 +129,25 @@ describe("rig gateway human mode", () => {
     expect(logs).toEqual([`mike's asleep decision room: "design choices" except publishing\n  decide with: rig gateway human mode decide <qitemId> --application a-1 ...`,
       "mike: no decision room (at desk: no mode is on, so ask them); ask them",
       "q-1 by designer@rig (reversible): design=a; recommended"]);
+  });
+
+  it("account prints how the mode ended against its scheduled time, each effect, what was decided and what's waiting, and what isn't tracked", async () => {
+    reply = { status: 200, body: { ok: true, account: {
+      mode: { modeName: "asleep", settings: { name: "asleep", availability: { value: "away", expectedBack: null }, decisionRoom: null, delivery: { quiet: null, account: null } },
+        startedAt: "2026-10-20T21:00:00.000Z", scheduledEnd: "2026-10-21T07:00:00.000Z", endedAt: "2026-10-21T07:00:40.000Z", endReason: "scheduled" },
+      effects: [{ consumer: "availability", state: "ended", detail: "restored to focus" }, { consumer: "quiet", state: "kept", detail: "changed by hand" }],
+      unresolved: [], now: null, decisions: [],
+      waiting: [{ qitemId: "q-2", standing: "stale", reason: "superseded", summary: "Rename the repo?" }],
+      notTracked: ["work done while the mode was on: no record ties work to a person"] } } };
+    await run("mode", "account", "mike", "a-1");
+    expect(requests[0]!.url).toBe("/api/gateway/human/mike/mode/applications/a-1/account");
+    expect(logs).toEqual([
+      "asleep: availability away; decision room none (nothing is decided for them); delivery: quiet hours unchanged",
+      "  on 2026-10-20T21:00:00.000Z, ended 2026-10-21T07:00:40.000Z (scheduled; scheduled for 2026-10-21T07:00:00.000Z)",
+      "  availability: ended (restored to focus)", "  quiet: kept (changed by hand)", "  now: at desk", "  decided for them: nothing",
+      "  waiting for them: q-2 stale (superseded): Rename the repo?",
+      "  not tracked: work done while the mode was on: no record ties work to a person",
+    ]);
   });
 
   it("decide records each question's choice and the reason, and needs to be told whether it can be undone", async () => {
