@@ -280,6 +280,7 @@ decisions, and posts its own replies.
   and the machine checks it when it has `OPENRIG_AUTH_BEARER_TOKEN` set.
 - **What the receiving machine trusts:** a relayed event comes from whoever holds that machine's
   daemon token (or, with no token set, anything that can reach its daemon), not from Slack directly, and nothing checks Slack's own signature on it. The
+  credential issued by `rig host pair` is the daemon API bearer, not a relay-only credential; it also authorizes the other daemon write APIs that use that bearer. The
   machine still looks up the sender in its own list of people, but on a relayed event that's no
   proof a person just typed or clicked it in Slack: it trusts the caller for where the event came
   from.
@@ -297,10 +298,18 @@ decisions, and posts its own replies.
   that's down costs one attempt per retry: its other relays wait for the next one. A relay the
   machine keeps refusing is kept and retried with no limit, because dropping it would lose a
   person's message.
+- **Changing forwarding entries is not a drain or cancellation:** relays already retained keep
+  their original host and remain visible in `rig slack status`, even after the last entry is
+  removed. An enabled connector retries them; disabling it pauses retry without deleting them.
+  Let relays finish before removing a forward entry. A zero dead-letter backlog alone does not
+  prove they have drained: it does not count relay HTTP requests still in flight.
 - **Who answered:** every post ends `from <seat> on <machine>`, using the machine's host id (set
   it with `host.name`).
 - **The hub's own channels** are handled on the hub, as before. A channel can be relayed to one
   machine only, and never the hub's own default channel.
+  Messages that match neither forwarding nor an existing thread or channel route fall back locally
+  to `inboundDestination`; `rig slack status` names that policy and destination. These lists do not
+  establish exclusive channel ownership: two machines can still both handle a channel.
 - **Missed messages:** each machine recovers the channels it owns: the hub its own channels, and
   every other machine its default channel and its channel map's (the hub never recovers a channel
   it relays). See [Reconnect recovery and status](#reconnect-recovery-and-status).
@@ -392,8 +401,9 @@ channel, a thread line (tracked, scanned, waiting and why any are backing off or
 retry time and accepted/dead-lettered recovery counts since the connector last
 started, including threads that have since left the window (they reset when it is enabled or disabled, and when the daemon restarts).
 It also reports the durable dead-letter backlog: the retained records for inbound messages,
-reactions and click answers that await retry, counted from both dead-letter files so the number
-survives a restart, and shown as unknown with a reason (and no count) when a file cannot be read.
+reactions and click answers that await retry, including retained relays, counted across all three
+dead-letter files so the number survives a restart. Retry is paused while the connector is disabled.
+If a file cannot be read, status shows unknown with a reason and no count.
 Human-readable coverage and pending bounds use ISO timestamps; JSON keeps Slack timestamps.
 The status read calls no Slack API and starts no scan. If the daemon cannot be
 observed, local configuration remains visible and live state is unknown. A
