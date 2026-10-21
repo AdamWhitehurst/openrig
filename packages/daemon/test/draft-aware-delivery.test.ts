@@ -134,6 +134,13 @@ describe("current draft-aware delivery through the real transport", () => {
     expect(f.bodies.a).toBe("unfinished human input"); expect(f.writes).toEqual([]);
   });
 
+  it("a callback throwing null stays an uncertain delivery result", async () => {
+    const f = fixture(); await f.enable();
+    expect(await f.send("null-callback", "current request", { beforeWrite: () => { throw null; } }))
+      .toMatchObject({ ok: false, outcome: "failed", reason: "delivery_indeterminate" });
+    expect(f.submissions).toEqual([]);
+  });
+
   it("completes a successful send without requested verification without claiming render proof", async () => {
     const f = fixture(); await f.enable();
     const result = await f.send("no-verify", "message", { verify: false });

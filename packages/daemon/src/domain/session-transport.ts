@@ -2917,13 +2917,13 @@ export class SessionTransport {
     }
     if (!textResult.ok) {
       // A draft refusal is the guard holding the write before any input; it is not an attempted write.
-      const policyRefusal = typeof textResult.code === "string" && textResult.code.startsWith("draft_");
+      const policyRefusal = typeof textResult.code === "string" && (textResult.code.startsWith("draft_") || textResult.code === "managed_compaction_pending");
       return observe({
         ok: false,
         sessionName,
         reason: policyRefusal ? textResult.code : "send_failed",
         outcome: "failed",
-        ...(policyRefusal ? {} : { inputPhase: "attempted" as const }),
+        ...(policyRefusal ? (textResult.code === "managed_compaction_pending" ? { inputPhase: "not_reached" as const } : {}) : { inputPhase: "attempted" as const }),
         error: `Failed to send text to '${sessionName}': ${textResult.message}`,
         ...(waitMode || policyRefusal ? { sent: false, ...waitEvidence } : {}),
       });
@@ -2972,14 +2972,14 @@ export class SessionTransport {
         (result) => result.ok ? "ok" : "failed",
       );
       if (!submitResult.ok) {
-        const policyRefusal = typeof submitResult.code === "string" && submitResult.code.startsWith("draft_");
+        const policyRefusal = typeof submitResult.code === "string" && (submitResult.code.startsWith("draft_") || submitResult.code === "managed_compaction_pending");
         return observe({
           ok: false,
           sessionName,
           reason: policyRefusal ? submitResult.code : "submit_failed",
           outcome: "failed",
           inputPhase: "written",
-          error: `Text is in '${sessionName}', but the Enter reported a failure, so the submission outcome is unconfirmed. The agent may need manual attention.`,
+          error: `Text is in '${sessionName}', but the Enter reported a failure, so the submission outcome is unconfirmed. The agent may need manual attention.${submitResult.code === "managed_compaction_pending" ? ` ${submitResult.message}` : ""}`,
           ...(waitMode || policyRefusal ? { sent: true, ...waitEvidence } : {}),
         });
       }

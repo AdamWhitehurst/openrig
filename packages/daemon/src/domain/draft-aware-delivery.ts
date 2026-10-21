@@ -79,10 +79,16 @@ export class DraftAwareDelivery {
         },
       });
     } catch (error) {
-      const refusal = error instanceof DeliveryGuardError && error.code.startsWith("draft_");
-      result = { ok: false, sessionName: session, outcome: "failed",
-        ...(refusal || inputWritten ? { sent: inputWritten } : {}), reason: refusal ? error.code : "delivery_indeterminate",
-        error: refusal ? error.message : "The delivery attempt ended without a reliable write result. Repeating the request may duplicate input." };
+      const guardError = error instanceof DeliveryGuardError;
+      const effect = (error ?? {}) as { inputWritten?: boolean; inputAttempted?: boolean; enterAttempted?: boolean };
+      inputWritten ||= effect.inputWritten === true;
+      const inputPhase = inputWritten ? "written" : effect.inputAttempted ? "attempted" : guardError ? "not_reached" : undefined;
+      const detail = inputWritten
+        ? `Text was written to '${session}' but ${effect.enterAttempted ? "the Enter outcome is unconfirmed" : "Enter was not sent"}: ${error instanceof Error ? error.message : String(error)}`
+        : guardError ? error.message : "The delivery attempt ended without a reliable write result. Repeating the request may duplicate input.";
+      result = { ok: false, sessionName: session, outcome: "failed", inputPhase,
+        ...(inputWritten || inputPhase === "not_reached" ? { sent: inputWritten } : {}),
+        reason: guardError ? error.code : "delivery_indeterminate", error: detail };
     }
     if (inputWritten) result = { ...result, sent: true };
     const preInputRefusal = ["draft_input_busy", "draft_input_unknown", "draft_input_changed", "draft_wake_superseded",

@@ -55,6 +55,8 @@ export interface DeliveryRequest {
 export interface DeliveryOutcome {
   status: "ok" | "failed" | "retained";
   outboxIds?: string[];
+  /** The existing transport's actual input boundary; failure never means no input by itself. */
+  inputPhase?: "not_reached" | "attempted" | "written";
   error?: string;
   /** Structured continuity custody was durably created or identified. */
   continuityActionCompleted?: boolean;
@@ -714,6 +716,7 @@ export class WatchdogPolicyEngine {
     const notes = digest
       ? { ...(outcome.notes ?? {}), digestDeliveryId: digest.deliveryId, digestSize: digest.size }
       : outcome.notes;
+    const deliveryNotes = delivery.inputPhase === undefined ? notes : { ...(notes ?? {}), deliveryInputPhase: delivery.inputPhase };
     const history = this.historyLog.record({
       jobId: job.jobId,
       evaluatedAt,
@@ -727,8 +730,8 @@ export class WatchdogPolicyEngine {
       // refusal from a generic failure (status alone discards that identity).
       evaluationNotes:
         delivery.error !== undefined
-          ? { ...(notes ?? {}), deliveryReason: delivery.error }
-          : delivery.status === "retained" ? { ...(notes ?? {}), outboxIds: delivery.outboxIds ?? [], retainedNotDelivered: true } : notes ?? null,
+          ? { ...(deliveryNotes ?? {}), deliveryReason: delivery.error }
+          : delivery.status === "retained" ? { ...(deliveryNotes ?? {}), outboxIds: delivery.outboxIds ?? [], retainedNotDelivered: true } : deliveryNotes ?? null,
     });
     if (!isContextUsageThreshold) {
       this.jobsRepo.recordEvaluation(job.jobId, evaluatedAt, true, deliverySchedule);

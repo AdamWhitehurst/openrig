@@ -2131,6 +2131,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       eventBus,
       deliver: makeWatchdogDeliver({
         sessionTransport,
+        hasPendingPostCompactStage: (sessionName) => deps.compactionEnforcer?.hasPendingPostCompactStage(sessionName) ?? false,
         createContinuityAction: (action) => createContinuityCutoverBaton(action, queueRepoInstance).then(() => {}),
       }),
       // (i-c) fire-time target-generation gate: resolve the target's LIVE occupant-generation (P12
@@ -2168,9 +2169,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
         // parked diagnosis (diagnoseRigParked over the arbitrated oracle +
         // destination-scoped obligations + wake status; the same derivation
         // `rig parked` serves) consumed by one rig-level supervisor job.
-        // Episode receipts are TRANSITIONS on the obligation row, written
-        // reserve-before-deliver (the retention active-frontier invariant is
-        // the durability proof); watchdog history is telemetry only.
+        // Attempt notes preserve prompt-refusal recovery; neither notes nor history suppress current reminders.
         makeParkedOwnerConsumerPolicy({
           diagnoseRig: (rigName) => {
             const seats = db
@@ -2201,9 +2200,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
             listForJob: (jobId, limit) => watchdogHistoryLogInstance.listForJob(jobId, limit),
             countForJob: (jobId) => watchdogHistoryLogInstance.countForJob(jobId),
           },
-          // R2 repair: the durable row-side surfaces. Receipts are transitions on
-          // the obligation row (reserve-before-deliver); failures land in the
-          // ladder's native last_nudge_result vocabulary.
+          // Best-effort attempt reporting; actual prompt and failure recovery still use the existing ladder.
           rows: {
             recoveryOwnsWake: (qitemId) => queueRecoveryOwnsWake(db, queueRepoInstance.getById(qitemId)),
             listTransitions: (qitemId: string) =>
@@ -2288,8 +2285,9 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // ensured idempotently on the (policy, target_session) tuple; the anchor is
     // `parked-owner-consumer@<rigName>` (member@rig shape, policy name as the
     // member slug). activeWakeIntervalSeconds stays NULL so the engine never
-    // throttles one seat's wake because another fired — per-seat dedup lives in
-    // the durable episode receipts. Rigs created after startup are BORN ARMED:
+    // throttles one seat's wake because another fired. Only recorded success to
+    // the same known occupant with unchanged rows suppresses a repeat; failed,
+    // unknown or unrecorded attempts remain eligible. Prompt recovery stays with the ladder. Rigs created after startup are BORN ARMED:
     // rigRepo.onRigCreated (wired below) runs the same ensure in the creation
     // act itself (the birth-property ruling) — no restart wait, no watcher.
     {
