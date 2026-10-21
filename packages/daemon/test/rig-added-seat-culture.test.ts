@@ -193,6 +193,12 @@ function fixture(opts: { podStartup?: boolean } = {}) {
   return { db, rigRepo, inst, expansion, yaml, rigRoot, otherRoot, cwd, context, rigFile, claudeMd, order, nodeExists, addHelper, setRigId };
 }
 
+/** The reason an add gave for stopping, as one string. */
+function reason(outcome: unknown): string {
+  const o = outcome as { ok: boolean; errors?: string[]; message?: string; error?: string };
+  return [...(o.errors ?? []), o.message ?? "", o.error ?? ""].join(" ");
+}
+
 async function launched(f: ReturnType<typeof fixture>): Promise<string> {
   const result = await f.inst.instantiate(f.yaml, f.rigRoot);
   expect(result.ok, JSON.stringify(result)).toBe(true);
@@ -336,7 +342,7 @@ describe("a seat added to an existing pod also gets that pod's startup files, an
     fs.rmSync(nodePath.join(f.rigRoot, "DEV-NOTES.md"));
     const outcome = await f.addHelper("dev", "helper");
     expect(outcome.ok).toBe(false);
-    const text = JSON.stringify(outcome);
+    const text = reason(outcome);
     expect(text).toContain("DEV-NOTES.md");
     expect(text).toContain(nodePath.join(f.rigRoot, "DEV-NOTES.md"));
     expect(text).toContain('pod "dev"');
@@ -349,7 +355,7 @@ describe("a seat added to an existing pod also gets that pod's startup files, an
     fs.rmSync(nodePath.join(f.rigRoot, "RIG-NOTES.md"));
     const outcome = await f.addHelper("dev", "helper");
     expect(outcome.ok).toBe(false);
-    const text = JSON.stringify(outcome);
+    const text = reason(outcome);
     expect(text).toContain("RIG-NOTES.md");
     expect(text).toContain('rig "culture-rig"');
     expect(f.nodeExists("dev.helper")).toBe(false);
@@ -361,7 +367,7 @@ describe("a seat added to an existing pod also gets that pod's startup files, an
     fs.rmSync(nodePath.join(f.rigRoot, "CULTURE.md"));
     const outcome = await f.addHelper("dev", "helper");
     expect(outcome.ok).toBe(false);
-    expect(JSON.stringify(outcome)).toContain("CULTURE.md");
+    expect(reason(outcome)).toContain("CULTURE.md");
     expect(f.nodeExists("dev.helper")).toBe(false);
     f.db.close();
   });
@@ -373,7 +379,7 @@ describe("a seat added to an existing pod also gets that pod's startup files, an
     fs.mkdirSync(target); // present, but not a readable file
     const outcome = await f.addHelper("dev", "helper");
     expect(outcome.ok).toBe(false);
-    expect(JSON.stringify(outcome)).toContain("DEV-NOTES.md");
+    expect(reason(outcome)).toContain("DEV-NOTES.md");
     expect(f.nodeExists("dev.helper")).toBe(false);
     f.db.close();
   });
@@ -387,7 +393,7 @@ describe("a seat added to an existing pod also gets that pod's startup files, an
       rigRoot: f.otherRoot,
     } as never);
     expect(result.ok).toBe(false);
-    expect(JSON.stringify(result)).toContain("RIG-NOTES.md");
+    expect(reason(result)).toContain("RIG-NOTES.md");
     expect(f.nodeExists("ux.designer")).toBe(false);
     f.db.close();
   });
