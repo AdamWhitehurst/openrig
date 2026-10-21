@@ -25,7 +25,7 @@ export function compactCommand(depsOverride?: CompactDeps): Command {
     .argument("<session>", "Target Claude session name (e.g. dev-impl@my-rig)")
     .option("--json", "JSON output for agents")
     .option("--skip-map", "Skip the restore-map prerequisite once; keep target, idle and permission checks")
-    .option("--cancel", "End the current preparation and disarm its future compact")
+    .option("--cancel", "Disarm managed preparation or pending restore/audit; cannot undo a submitted /compact")
     .option("--state", "Show the current preparation, expected map and deadline without triggering")
     .addHelpText("after", `
 Examples:
@@ -44,7 +44,13 @@ the preparation prompt's delivery, and the /compact result: "submitted, unconfir
 means /compact and Enter reached the seat; OpenRig does not check that compaction
 then ran. Ordinary approvals during preparation can be answered within that same deadline;
 OpenRig does not answer them. Automatic /compact, like manual, is sent only to an idle seat.
---cancel ends preparation. --skip-map skips only the map requirement for this one
+--cancel disarms preparation and pending restore/audit prompts without sending input.
+An already submitted /compact stays unconfirmed: cancellation cannot undo it or prove
+it never ran. No restore request follows cancellation: check the pane before retrying.
+If it compacted or you cannot tell, send a normal restore request naming preparation.mapPath
+from --state, asking it to skip reading if it did not compact; a retry would compact it again.
+An explicit retry still waits for the live pane to be idle; no automatic retry follows
+cancellation. --skip-map skips only the map requirement for this one
 manual request. Cancel an active preparation before retrying or using --skip-map.
 Automatic preparation waits at most 25 minutes from prep delivery, using existing
 polls. A stopped attempt does not restart automatically; rerun this command to

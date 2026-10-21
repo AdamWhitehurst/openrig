@@ -35,3 +35,17 @@ it('state and cancel reach an authenticated daemon; a missing bearer stays rejec
 it('a triggered compaction is reported as submitted, unconfirmed, never as having run',async()=>{const f=fixture();await f.cmd.parseAsync(['node','rig','writer@demo']);const out=(console.log as any).mock.calls.map((c:unknown[])=>String(c[0])).join('\n');expect(out).toContain('Manual compaction for writer@demo: submitted, unconfirmed (stage: compact-sent)');expect(out).not.toMatch(/compaction triggered|compacted/i);});
 
 it('manual help binds180s preparation and preserves automatic25minutes',()=>{const f=fixture();let text='';f.cmd.configureOutput({writeOut:value=>{text+=value;}});f.cmd.outputHelp();expect(text).toContain('180 seconds');expect(text).toContain('25 minutes');expect(text).toContain('expiry disarms that attempt');});
+
+// The cancellation receipt must retain uncertainty for both human and JSON callers.
+for (const json of [false, true]) {
+ it(`cancel displays the submitted-unconfirmed receipt without triggering (json=${json})`,async()=>{
+  const f=fixture();
+  f.post.mockResolvedValueOnce({status:200,data:{preparation:{status:'stopped',compact:'submitted_unconfirmed'},guidance:'Cancellation cannot undo a submitted /compact.'}} as any);
+  await f.cmd.parseAsync(['node','rig','writer@demo','--cancel',...(json?['--json']:[])]);
+  const output=JSON.parse(String((console.log as any).mock.calls[0][0]));
+  expect(output.preparation).toMatchObject({status:'stopped',compact:'submitted_unconfirmed'});
+  expect(output.guidance).toContain('cannot undo');
+  expect(f.post).toHaveBeenCalledTimes(1);
+  expect(f.post.mock.calls[0]?.[0]).toBe('/api/compaction/cancel');
+ });
+}
