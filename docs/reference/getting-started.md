@@ -223,6 +223,12 @@ writes an OpenRig-managed block (mouse on, a longer history) into `~/.tmux.conf`
 It is optional for this selected-provider path, not a requirement to fix an unused
 provider.
 
+The block keeps `terminal.history_limit` rows of scrollback per pane (default
+10000). To keep more, run `rig config set terminal.history_limit 50000`, then
+`rig setup` again. A running tmux server keeps its old limit until it restarts
+or you run `tmux source-file ~/.tmux.conf`; before tmux 3.7 that changes new
+panes only.
+
 New managed agents and handover successors on macOS/Linux start from the daemon's
 selected launch environment and declared seat values, rather than stored tmux globals.
 Values named by tmux's `update-environment` option, including its default SSH-agent

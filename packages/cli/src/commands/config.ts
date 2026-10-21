@@ -105,6 +105,9 @@ Keys:
                          Turn on for custom setups that intentionally rely on tmux globals. Running agents are unchanged.
                          If the scoped boundary is unavailable, launch continues with its previous environment and a diagnostic.
   terminal.status_bar    show the inner tmux status bar on launch (default off)
+  terminal.history_limit rows of tmux scrollback per pane in the ~/.tmux.conf block rig setup writes (2000-1000000; default 10000).
+                         To keep more: rig config set terminal.history_limit 50000, then rig setup. A running tmux server keeps
+                         its old limit until it restarts or you run tmux source-file ~/.tmux.conf; before tmux 3.7 that changes new panes only
   output.compact         short default output for queue writes, queue show, queue transitions and whoami peers (default off)
                          --full opts out: queue transitions returns the full log, queue show the complete record, and whoami the complete payload, not its usual identity projection. whoami --all-peers keeps that projection with every peer
   output.whoami_peers    with output.compact on, how many peers rig whoami --json lists, edge peers first; --all-peers lists all (default 8)

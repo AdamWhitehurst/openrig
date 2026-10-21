@@ -153,6 +153,7 @@ describe("SettingsStore (User Settings v0)", () => {
       "snapshots.periodic.retention_keep",
       // OPR.0.4.6.02 S1 — inner-tmux status-bar launch default (static bool).
       "terminal.status_bar",
+      "terminal.history_limit",
       "terminal.inherit_tmux_environment",
       // Slice 15 (OPR.0.7.0.15) — compact command-output defaults switch.
       "output.compact",
@@ -209,6 +210,16 @@ describe("SettingsStore (User Settings v0)", () => {
   it("defaults the advisor session to the kernel's advisor seat", () => {
     const store = new SettingsStore(configPath);
     expect(store.resolveOne("agents.advisor_session")).toMatchObject({ value: "advisor-lead@kernel", source: "default" });
+  });
+
+  it("defaults terminal.history_limit to 10000 and accepts only an integer in [2000, 1000000]", () => {
+    const store = new SettingsStore(configPath);
+    expect(store.resolveOne("terminal.history_limit")).toMatchObject({ value: 10000, source: "default" });
+    store.set("terminal.history_limit", "50000");
+    expect(store.resolveOne("terminal.history_limit")).toMatchObject({ value: 50000, source: "file" });
+    for (const raw of ["0", "-5000", "1999", "1000001", "2.5", "10000rows", "many"]) {
+      expect(() => store.set("terminal.history_limit", raw)).toThrow(/terminal\.history_limit/);
+    }
   });
 
   it("defaults output.whoami_peers to 8 and accepts only an integer >= 1 (slice 15 P5)", () => {

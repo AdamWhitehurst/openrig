@@ -182,6 +182,8 @@ export const SETTINGS_VALID_KEYS = [
   // twins). Consumed by NodeLauncher at session-create only; a flip is
   // future-launches-only and never retroactive (BR-1 never-retro).
   "terminal.status_bar",
+  // The managed ~/.tmux.conf block's history-limit; written by `rig setup` (CLI), twin of the CLI key.
+  "terminal.history_limit",
   "terminal.inherit_tmux_environment",
   // Slice 15 (OPR.0.7.0.15) — compact command-output defaults; CLI-read, twin of the CLI key.
   "output.compact",
@@ -300,6 +302,7 @@ const ENV_MAP: Record<SettingsValidKey, { primary: string; legacy?: string }> = 
   "snapshots.periodic.retention_keep": { primary: "OPENRIG_SNAPSHOTS_PERIODIC_RETENTION_KEEP" },
   // OPR.0.4.6.02 S1 — net-new key; OPENRIG_* primary only (no RIGGED_* legacy).
   "terminal.status_bar": { primary: "OPENRIG_TERMINAL_STATUS_BAR" },
+  "terminal.history_limit": { primary: "OPENRIG_TERMINAL_HISTORY_LIMIT" },
   "terminal.inherit_tmux_environment": { primary: "OPENRIG_TERMINAL_INHERIT_TMUX_ENVIRONMENT" },
   "output.compact": { primary: "OPENRIG_OUTPUT_COMPACT" },
   "output.whoami_peers": { primary: "OPENRIG_OUTPUT_WHOAMI_PEERS" },
@@ -388,6 +391,7 @@ const KEY_TO_PATH: Record<SettingsValidKey, string[]> = {
   "snapshots.periodic.interval_seconds": ["snapshots", "periodic", "intervalSeconds"],
   "snapshots.periodic.retention_keep": ["snapshots", "periodic", "retentionKeep"],
   "terminal.status_bar": ["terminal", "statusBar"],
+  "terminal.history_limit": ["terminal", "historyLimit"],
   "terminal.inherit_tmux_environment": ["terminal", "inheritTmuxEnvironment"],
   "output.compact": ["output", "compact"],
   "output.whoami_peers": ["output", "whoamiPeers"],
@@ -671,6 +675,7 @@ function getDefaultValue(key: SettingsValidKey, workspaceRoot: string): string |
     // (herdr's pane label already carries identity; the inner tmux status
     // is redundant chrome). Operator flip is future-launches-only.
     case "terminal.status_bar": return false;
+    case "terminal.history_limit": return 10000;
     case "terminal.inherit_tmux_environment": return false;
     case "output.compact": return false;
     case "output.whoami_peers": return 8;
@@ -764,6 +769,11 @@ const KEY_CONSTRAINTS: Partial<Record<SettingsValidKey, (raw: string, coerced: s
   "runtime.readiness_timeout_seconds": (raw, coerced) => {
     if (!/^\d+$/.test(raw.trim()) || typeof coerced !== "number" || !Number.isInteger(coerced) || coerced < 1 || coerced > 600) {
       throw new Error(`Invalid value for runtime.readiness_timeout_seconds: must be an integer in [1, 600], got "${raw}"`);
+    }
+  },
+  "terminal.history_limit": (raw, coerced) => {
+    if (!/^\d+$/.test(raw.trim()) || typeof coerced !== "number" || !Number.isSafeInteger(coerced) || coerced < 2000 || coerced > 1_000_000) {
+      throw new Error(`Invalid value for terminal.history_limit: must be an integer in [2000, 1000000], got "${raw}"`);
     }
   },
   // Constraint gap fix — lockstep with cli/src/config-store.ts KEY_CONSTRAINTS.
