@@ -105,7 +105,7 @@ export class ContextMonitor {
     this.compactionEnforcer?.reconcilePreparations?.();
     const sessions = this.getEligibleSessions();
     for (const session of sessions) {
-      if (!this.isCurrentSession(session)) continue;
+      if (!this.isCurrentSession(session, true)) continue;
       let observed: ContextUsage | null = null;
       const canReadContextUsage = session.runtime !== "codex" || !!session.resume_token;
       if (canReadContextUsage) {
@@ -205,12 +205,14 @@ export class ContextMonitor {
     }
   }
 
-  /** Readiness normalization changes these two fields itself; all other snapshot
-   * fields, including the launch event sequence, must still describe this seat. */
-  private isCurrentSession(session: EligibleSession): boolean {
+  /** Every field must match the observation, including this poll's own readiness writes.
+   * Usage telemetry passes `ignoreReadiness`: readiness does not change how usage is
+   * read, so an independent readiness change must not drop that tick's sample. */
+  private isCurrentSession(session: EligibleSession, ignoreReadiness = false): boolean {
     const current = this.getEligibleSessions(session.node_id)[0];
     return current !== undefined && Object.entries(session).every(([key, value]) =>
-      key === "startup_status" || key === "startup_completed_at" || current[key as keyof EligibleSession] === value);
+      (ignoreReadiness && (key === "startup_status" || key === "startup_completed_at"))
+      || current[key as keyof EligibleSession] === value);
   }
 
   /** Start polling at the given interval. Idempotent. */
@@ -310,7 +312,7 @@ export class ContextMonitor {
 
     // A poll snapshot is not a lease: lifecycle work can run before or during
     // the probe. The event sequence also distinguishes same-status retries.
-    const isCurrent = () => JSON.stringify(this.getEligibleSessions(session.node_id)[0]) === JSON.stringify(session);
+    const isCurrent = () => this.isCurrentSession(session);
     try {
       if (!isCurrent()) return;
       // A Claude seat is checked with its real binding (pane, session, current occupant) and recorded conversation, so a
@@ -340,21 +342,28 @@ export class ContextMonitor {
           // startup may have reached an attention gate while we were observing.
           if (readPendingStartupContext(this.db, session.node_id, session.session_id)) return;
           if (readiness.provedWithoutLaunch && this.requestedConversationDiffers(session)) return;
-          this.db.prepare(`
+          const completedAt = new Date().toISOString();
+          const updated = this.db.prepare(`
             UPDATE sessions
             SET startup_status = 'ready',
                 startup_completed_at = ?
             WHERE id = ? AND startup_status IN ('failed', 'attention_required')
-          `).run(new Date().toISOString(), session.session_id);
+          `).run(completedAt, session.session_id);
+          if (updated.changes > 0) {
+            // Accept only the readiness changes written by this poll, not a later re-read.
+            session.startup_status = "ready";
+            session.startup_completed_at = completedAt;
+          }
           return;
         }
 
         if (isAttentionRequiredReadinessCode(readiness.code)) {
-          this.db.prepare(`
+          const updated = this.db.prepare(`
             UPDATE sessions
             SET startup_status = 'attention_required'
             WHERE id = ?
           `).run(session.session_id);
+          if (updated.changes > 0) session.startup_status = "attention_required";
         }
       }).immediate();
     } catch {
