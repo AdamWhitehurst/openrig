@@ -10,8 +10,8 @@ import {
   getDaemonUrl,
   startDaemon,
   waitForKernelReady,
-  type LifecycleDeps,
-} from "../daemon-lifecycle.js";
+  type LifecycleDeps, daemonStatusGuard } from "../daemon-lifecycle.js";
+import { shouldAutoStartDaemon } from "../daemon-reachability.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 
@@ -203,7 +203,8 @@ status); a restore that returned without a ready kernel exits 1.
 
       // ---- PHASE 1: ensure daemon is running ----
       let status = await getDaemonStatus(deps.lifecycleDeps);
-      if (status.state !== "running") {
+      // A busy daemon of this home gets the request instead of a start attempt (shouldAutoStartDaemon).
+      if (shouldAutoStartDaemon(status)) {
         if (!opts.json) console.log("Starting daemon...");
         try {
           const { ConfigStore } = await import("../config-store.js");
@@ -258,11 +259,7 @@ status); a restore that returned without a ready kernel exits 1.
         }
       }
 
-      if (status.state !== "running" || status.healthy === false) {
-        console.error("Daemon is not healthy. Check with: rig daemon status");
-        process.exitCode = 1;
-        return;
-      }
+      if (!daemonStatusGuard(status)) return;
 
       const baseUrl = getDaemonUrl(status);
       const client = deps.clientFactory(baseUrl);
@@ -308,7 +305,8 @@ status); a restore that returned without a ready kernel exits 1.
       // Verify UI is actually serving before announcing the URL.
       let uiUrl: string | null = null;
       try {
-        const healthRes = await fetch(`${baseUrl}/healthz`);
+        // Bounded like any request: a daemon that never answers must not hold the start here.
+        const healthRes = await fetch(`${baseUrl}/healthz`, { signal: AbortSignal.timeout(5_000) });
         if (healthRes.ok) {
           uiUrl = baseUrl;
         }

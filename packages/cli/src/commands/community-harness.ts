@@ -3,6 +3,7 @@
 import { Command } from "commander";
 import { DaemonClient } from "../client.js";
 import { getDaemonStatus, getDaemonUrl, statusGuardMessage } from "../daemon-lifecycle.js";
+import { daemonMayAnswer } from "../daemon-reachability.js";
 import { realDeps } from "./daemon.js";
 import type { StatusDeps } from "./status.js";
 
@@ -26,7 +27,7 @@ export function communityHarnessCommand(depsOverride?: StatusDeps): Command {
       try {
         const deps = getDeps();
         const status = await getDaemonStatus(deps.lifecycleDeps);
-        if (status.state !== "running" || status.healthy === false) {
+        if (!daemonMayAnswer(status)) {
           const gm = statusGuardMessage(status); throw new Error(`${gm.fact} ${gm.action}`);
         }
         const res = await deps.clientFactory(getDaemonUrl(status)).get<{ dir: string; harnesses: CommunityHarnessWire[] }>("/api/community-harnesses");
