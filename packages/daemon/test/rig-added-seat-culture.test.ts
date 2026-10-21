@@ -337,6 +337,34 @@ describe("a seat added to an existing pod also gets that pod's startup files, an
     f.db.close();
   });
 
+  it("a rig created with #1632 (rig layers recorded, no pod files): no pod file is delivered or checked, but a gone culture file stops the add", async () => {
+    const { f, rigId } = await podRig();
+    // Rewrite the row to what #1632 stored: the rig's culture file and startup, and no podStartupFiles.
+    const { podStartupFiles: _recordedAfterThat, ...rigLayersOnly } = f.rigRepo.getRigStartupLayers(rigId)!;
+    f.rigRepo.setRigStartupLayers(rigId, rigLayersOnly);
+
+    // Everything present: the add works, the rig layers arrive, and there is no pod layer since none was recorded.
+    const first = await f.addHelper("dev", "helper");
+    expect(first.ok, JSON.stringify(first)).toBe(true);
+    expect(f.rigFile("dev.helper", "CULTURE.md")).toBeDefined();
+    expect(f.rigFile("dev.helper", "RIG-NOTES.md")).toBeDefined();
+    expect(f.rigFile("dev.helper", "DEV-NOTES.md")).toBeUndefined();
+
+    // A required pod file is not checked either: nothing pod-level was recorded.
+    fs.rmSync(nodePath.join(f.rigRoot, "DEV-NOTES.md"));
+    const second = await f.addHelper("dev", "second");
+    expect(second.ok, JSON.stringify(second)).toBe(true);
+
+    // The recorded culture file is gone: the add is refused with the reason and no seat exists.
+    fs.rmSync(nodePath.join(f.rigRoot, "CULTURE.md"));
+    const refused = await f.addHelper("dev", "late");
+    expect(refused.ok).toBe(false);
+    expect(reason(refused)).toContain("CULTURE.md");
+    expect(reason(refused)).toContain('rig "culture-rig"');
+    expect(f.nodeExists("dev.late")).toBe(false);
+    f.db.close();
+  });
+
   it("a required pod file that is gone stops the add before any seat exists, naming the file and the pod", async () => {
     const { f } = await podRig();
     fs.rmSync(nodePath.join(f.rigRoot, "DEV-NOTES.md"));
