@@ -1,12 +1,13 @@
-// A seat swap stops the watchdog jobs the retiring occupant registered, so a stale wake doesn't reach the successor.
-// A blocked row's current park timer is different: it wakes the seat that still owns the row, and the successor
-// inherits that row. It survives the swap; every other job the retiring generation registered still stops.
+// A seat swap stops the watchdog jobs the retiring occupant registered for its own seat, so a stale wake doesn't
+// reach the successor. A blocked row's current park timer is different: it wakes the seat that still owns the row,
+// and the successor inherits that row. It survives the swap; every other job the retiring generation registered for
+// its own seat still stops. Jobs it registered for another seat wake that seat, not the successor, and keep running.
 // Real queue, watchdog and session repositories on a full test DB, wired as startup.ts wires them.
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type Database from "better-sqlite3";
 import { createFullTestDb } from "./helpers/test-app.js";
 import { RigRepository } from "../src/domain/rig-repository.js";
-import { SessionRegistry } from "../src/domain/session-registry.js";
+import { SessionRegistry, physicalSessionName } from "../src/domain/session-registry.js";
 import { EventBus } from "../src/domain/event-bus.js";
 import { QueueRepository } from "../src/domain/queue-repository.js";
 import { WatchdogJobsRepository } from "../src/domain/watchdog-jobs-repository.js";
@@ -48,6 +49,7 @@ describe("#handover-wake: a blocked row's park timer across an occupant swap", (
     queue.attachWatchdogJobsRepository(jobs);
     invalidator = new DefaultOccupantInvalidator({
       enforcer: { invalidateOccupant() {} }, contextUsage: { invalidateOccupantSidecar() {} }, watchdog: jobs, queue,
+      addresses: sessionRegistry,
     });
   });
   afterEach(() => db.close());
@@ -61,7 +63,7 @@ describe("#handover-wake: a blocked row's park timer across an occupant swap", (
     } as never);
     return { qitemId: row.qitemId, wakeRef: (queue.getParkWakeStatus(row.qitemId) as { ref: string }).ref };
   }
-  const swap = () => invalidator.invalidateRetiringOccupant({ retiringSessionName: SEAT, successorSessionName: SEAT, retiringGeneration: gen(SEAT)! });
+  const swap = (session = SEAT) => invalidator.invalidateRetiringOccupant({ retiringSessionName: session, successorSessionName: session, retiringGeneration: gen(session)! });
   const jobState = (jobId: string) => (db.prepare("SELECT state FROM watchdog_jobs WHERE job_id = ?").get(jobId) as { state: string }).state;
   const activeJobsFor = (session: string) => (db.prepare("SELECT COUNT(*) AS n FROM watchdog_jobs WHERE state = 'active' AND target_session = ?").get(session) as { n: number }).n;
   const wakeLive = (qitemId: string) => (queue.getParkWakeStatus(qitemId) as { live: boolean }).live;
@@ -103,6 +105,66 @@ describe("#handover-wake: a blocked row's park timer across an occupant swap", (
 
     expect(jobState(wakeRef)).toBe("active");
     expect(wakeLive(qitemId)).toBe(true);
+  });
+
+  // #1775: a reminder the retiring occupant registered for another seat wakes that seat, never the successor, so it
+  // keeps running, as reminders aimed at a handed-over seat already do.
+  const reminderFor = (target: string, opts: { specTarget?: string; registeredBy?: string } = {}) => jobs.register({
+    policy: "periodic-reminder", targetSession: target, intervalSeconds: 7200, registeredBySession: opts.registeredBy ?? SEAT,
+    specYaml: ["policy: periodic-reminder", "target:", `  session: ${JSON.stringify(opts.specTarget ?? target)}`, 'message: "check CI"', ""].join("\n"),
+  });
+
+  it("a reminder the retiring occupant registered for another seat keeps running and still reaches that seat", async () => {
+    const reminder = reminderFor(OTHER);
+
+    swap();
+
+    expect(jobState(reminder.jobId)).toBe("active");
+    expect((await fireAllActive()).map((d) => d.targetSession)).toEqual([OTHER]);
+  });
+
+  it("a reminder the retiring occupant attached to another seat's blocked row stays that row's live wake", async () => {
+    const reminder = reminderFor(OTHER);
+    const { qitemId } = await park({ destination: OTHER, actor: SEAT, watchdogId: reminder.jobId });
+
+    swap();
+
+    expect(jobState(reminder.jobId)).toBe("active");
+    expect(wakeLive(qitemId)).toBe(true);
+    expect(parkedWhenIdle(OTHER).obligations.unhealthyHeldCount).toBe(0);
+  });
+
+  // The seat a reminder wakes is its delivery target, not its stored string: delivery resolves the name, and a
+  // periodic reminder prefers its spec's target. The swap judges the same value.
+  it("a reminder for the retiring seat's logical address, while it runs under another physical name, still stops", () => {
+    const rigId = (db.prepare("SELECT id FROM rigs WHERE name = 'seat-rig'").get() as { id: string }).id;
+    const node = new RigRepository(db).addNode(rigId, "dev.ops", { runtime: "codex" });
+    sessionRegistry.updateStatus(sessionRegistry.registerSession(node.id, "custom-ops@seat-rig").id, "running");
+    sessionRegistry.updateBinding(node.id, { tmuxSession: "custom-ops@seat-rig", attachmentType: "tmux" });
+    expect(physicalSessionName(db, "dev-ops@seat-rig")).toBe("custom-ops@seat-rig"); // delivery reaches this seat
+    const own = reminderFor("dev-ops@seat-rig", { registeredBy: "custom-ops@seat-rig" });
+
+    swap("custom-ops@seat-rig");
+
+    expect(jobState(own.jobId)).toBe("stopped");
+  });
+
+  it("a reminder stored for another seat whose spec targets the retiring seat still stops", async () => {
+    const own = reminderFor(OTHER, { specTarget: SEAT });
+    expect((await fireAllActive()).map((d) => d.targetSession)).toEqual([SEAT]); // it is delivered to this seat
+
+    swap();
+
+    expect(jobState(own.jobId)).toBe("stopped");
+  });
+
+  it("a reminder stored for the retiring seat whose spec targets another seat keeps running", async () => {
+    const forOther = reminderFor(SEAT, { specTarget: OTHER });
+
+    swap();
+
+    expect(jobState(forOther.jobId)).toBe("active");
+    expect((await fireAllActive()).map((d) => d.targetSession)).toEqual([OTHER]);
   });
 
   it("control: an occupant-only job the retiring generation registered still stops", () => {
