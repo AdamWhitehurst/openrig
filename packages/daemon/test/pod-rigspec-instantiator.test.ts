@@ -412,6 +412,51 @@ profiles:
     }
   });
 
+  it("under a linked state/seats, a Claude member's launch additions are named and the seat starts; a missing source still fails by name (OPR.0.7.0.13)", async () => {
+    const root = fs.mkdtempSync(nodePath.join(os.tmpdir(), "instantiator-linked-additions-"));
+    const savedHome = process.env["OPENRIG_HOME"];
+    let db: ReturnType<typeof createFullTestDb> | undefined;
+    try {
+      const home = nodePath.join(root, "home");
+      const moved = nodePath.join(root, "moved-seats");
+      fs.mkdirSync(nodePath.join(home, "state"), { recursive: true });
+      fs.mkdirSync(moved);
+      fs.symlinkSync(moved, nodePath.join(home, "state", "seats"));
+      process.env["OPENRIG_HOME"] = home;
+      const installed = nodePath.join(root, "installed");
+      const project = nodePath.join(root, "project");
+      for (const dir of ["agents/impl", "claude/plugins/review"]) fs.mkdirSync(nodePath.join(installed, dir), { recursive: true });
+      fs.mkdirSync(project);
+      fs.writeFileSync(nodePath.join(installed, "agents/impl/agent.yaml"), 'name: impl\nversion: "1.0"\nprofiles:\n  default:\n    uses: {}\n');
+      fs.writeFileSync(nodePath.join(installed, "claude/reviewer.md"), "---\nname: reviewer\n---\nReview.\n");
+      fs.writeFileSync(nodePath.join(installed, "claude/house.md"), "House rules.\n");
+      const fixture = setup(undefined, undefined, undefined, undefined, undefined, {
+        fsOps: { readFile: (p: string) => fs.readFileSync(p, "utf8"), exists: fs.existsSync },
+      });
+      db = fixture.db;
+      const member = { id: "impl", agentRef: "local:agents/impl", profile: "default", runtime: "claude-code", cwd: project };
+      const rig = makeRigSpec({ pods: [{ id: "dev", label: "Dev", edges: [], members: [
+        { ...member, agentFile: "claude/reviewer.md", appendSystemPromptFile: "claude/house.md", pluginDirs: ["claude/plugins/review"] },
+        { ...member, id: "qa", agentFile: "claude/missing.md" },
+      ] }] } as never);
+      const result = await fixture.inst.instantiate(RigSpecCodec.serialize(rig), installed);
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      if (!result.ok) return;
+      const impl = result.result.nodes.find((n) => n.logicalId === "dev.impl");
+      expect(impl?.status).toBeDefined();
+      expect(impl?.status).not.toBe("failed");
+      for (const ref of ["claude/reviewer.md", "claude/house.md", "claude/plugins/review"]) {
+        expect(JSON.stringify(result)).toContain(`seat_launch_addition_not_delivered: ${ref}: `);
+      }
+      expect(result.result.nodes.find((n) => n.logicalId === "dev.qa")).toMatchObject({ status: "failed", error: expect.stringMatching(/addition_missing: .*claude\/missing\.md/) });
+      expect(listTree(moved)).toEqual([]);
+      expect(listTree(project)).toEqual([]);
+    } finally {
+      if (savedHome === undefined) delete process.env["OPENRIG_HOME"]; else process.env["OPENRIG_HOME"] = savedHome;
+      db?.close(); fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("a Claude member's agent, prompt file and plugin folder from the spec become its launch additions; a missing one fails that seat by name (OPR.0.7.0.9)", async () => {
     const root = fs.mkdtempSync(nodePath.join(os.tmpdir(), "instantiator-additions-"));
     const savedHome = process.env["OPENRIG_HOME"];
@@ -450,7 +495,10 @@ profiles:
     }
   });
 
-  it("rig up refuses the loadout, and changes nothing, when the seat's storage is linked outside the anchor (OPR.0.7.0.13 F1, round 4)", async () => {
+  it.each([
+    ["a linked seat-storage ancestor starts the seat without its skills, names the loss, and writes nothing through the link or into the project", "link"],
+    ["any other reconciliation error still fails the seat by name", "other"],
+  ] as const)("rig up when the seat's storage is linked outside the anchor: %s (OPR.0.7.0.13 F1)", async (_title, mode) => {
     const root = fs.mkdtempSync(nodePath.join(os.tmpdir(), "instantiator-linked-seat-"));
     let db: ReturnType<typeof createFullTestDb> | undefined;
     try {
@@ -467,7 +515,9 @@ profiles:
       execFileSync("git", ["-C", catalog, "add", "."]);
       execFileSync("git", ["-C", catalog, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "catalog"]);
       let movedBefore: string[] = [];
-      const reconciler = vi.fn((input: Parameters<typeof reconcileSkillLoadout>[0]) => {
+      const reconciler = vi.fn((input: Parameters<typeof reconcileSkillLoadout>[0]): ReturnType<typeof reconcileSkillLoadout> => {
+        if (mode === "other") return { ok: false, applied: false, freshLaunchRequired: false, runtime: input.runtime, targetRoot: "", manifestPath: "",
+          receipts: [], removed: [], errors: [{ code: "skill_conflict", message: "shared differs from the catalog", path: "" }] } as never;
         if (input.location) {
           // The seat's runtime storage (made by the launch just before this) moved out, and a link left in its place.
           const runtimeRoot = nodePath.dirname(nodePath.dirname(input.location.targetRoot));
@@ -487,10 +537,20 @@ profiles:
       ] }] });
       const result = await fixture.inst.instantiate(RigSpecCodec.serialize(rig), installed);
       expect(reconciler).toHaveBeenCalled();
+      const seat = result.ok ? result.result.nodes.find((n) => n.logicalId === "dev.impl") : undefined;
+      if (mode === "other") {
+        expect(seat?.status ?? "failed").toBe("failed"); // a rig whose only seat failed is itself refused
+        expect(JSON.stringify(result)).toContain("skill_conflict: shared differs from the catalog");
+        return;
+      }
       expect(reconciler.mock.results[0]?.value).toMatchObject({ ok: false, errors: [expect.objectContaining({ code: "seat_storage_refused" })] });
-      expect(JSON.stringify(result)).toContain("seat_storage_refused");
-      // The moved tree is exactly as it was: no skill written, no staging folder, no manifest.
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      expect(seat?.status).toBeDefined();
+      expect(seat?.status).not.toBe("failed");
+      expect(JSON.stringify(result)).toContain("seat_skills_not_delivered: shared: seat_storage_refused");
+      // The moved tree is exactly as it was: no skill written, no staging folder, no manifest. Nothing fell back into the project.
       expect(listTree(moved)).toEqual(movedBefore);
+      expect(listTree(project).filter((file) => file.includes("shared"))).toEqual([]);
     } finally { db?.close(); fs.rmSync(root, { recursive: true, force: true }); }
   });
 

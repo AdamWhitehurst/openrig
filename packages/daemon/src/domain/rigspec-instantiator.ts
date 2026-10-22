@@ -2142,8 +2142,15 @@ export class PodRigInstantiator {
         ...(input.member.appendSystemPromptFile ? { appendSystemPromptFile: beside(input.member.appendSystemPromptFile) } : {}),
         ...(input.member.pluginDirs?.length ? { pluginDirs: input.member.pluginDirs.map(beside) } : {}),
       });
-      if (!prepared.ok) return { status: "failed", error: prepared.message, sessionName: canonicalSessionName };
-      keptSkillWarnings.push(...(prepared.notes ?? []));
+      // A linked seat-storage ancestor: the seat starts without its additions, each named; nothing goes through the link.
+      // A missing or refused source still fails the seat.
+      const linked = !prepared.ok && prepared.code === "seat_storage_refused" ? seatSkillLocation(seatSkills).refuseMutation?.() : undefined;
+      if (!prepared.ok && !linked) return { status: "failed", error: prepared.message, sessionName: canonicalSessionName };
+      if (linked) {
+        const asked = [input.member.agentFile, input.member.appendSystemPromptFile, ...(input.member.pluginDirs ?? [])].filter((ref): ref is string => !!ref);
+        for (const ref of asked) keptSkillWarnings.push(`seat_launch_addition_not_delivered: ${ref}: ${linked}; the seat starts without it`);
+      }
+      keptSkillWarnings.push(...(prepared.ok ? prepared.notes ?? [] : []));
     }
     if (seatSkills && seatRuntime === "codex") {
       // A catalog that can't be written is this seat's named result, never an error that escapes the rig's launch.
@@ -2178,7 +2185,12 @@ export class PodRigInstantiator {
           projection = withoutPlugins;
         }
       }
-      if (!projection.ok) {
+      // A seat whose storage a link refuses starts without its seat skills, and says what it lost: nothing is written
+      // through the link and nothing falls back into the project. Any other reconciliation error still fails the seat.
+      const refusedOnly = !projection.ok && projection.errors.every((error) => error.code === "seat_storage_refused");
+      if (refusedOnly) {
+        keptSkillWarnings.push(`seat_skills_not_delivered: ${loadout.entries.map((entry) => entry.id).join(", ")}: ${projection.errors.map((error) => `${error.code}: ${error.message}`).join("; ")}; the seat starts without these selected skills`);
+      } else if (!projection.ok) {
         return {
           status: "failed",
           error: projection.errors.map((error) => `${error.code}: ${error.message}`).join("; "),
@@ -2192,8 +2204,8 @@ export class PodRigInstantiator {
       if (seatSkills && seatRuntime === "claude-code" && projection.ok) {
         keptSkillWarnings.push(...migrateLegacyProjectSkills({ reconcile: this.deps.skillReconciler!, loadout, cwd: configResult.config.cwd, owner: canonicalSessionName }));
       }
-      loadoutReceipts = projection.receipts.length;
-      for (const receipt of projection.receipts.filter(isKeptPluginSkill)) {
+      loadoutReceipts = projection.ok ? projection.receipts.length : 0;
+      for (const receipt of projection.ok ? projection.receipts.filter(isKeptPluginSkill) : []) {
         keptSkillWarnings.push(`plugin_skill_kept: ${receipt.id}: ${receipt.detail.slice("kept: ".length)} (${receipt.target})`);
       }
     }
