@@ -17,6 +17,7 @@ import { ClaudeCodeAdapter, type ClaudeAdapterFsOps } from "../src/adapters/clau
 import type { AgentResolverFsOps } from "../src/domain/agent-resolver.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
+import { communityHarnessesDir } from "../src/domain/community-harness-presets.js";
 
 // A seat added to a running rig (`rig expand`, or add-member under `rig grow`) launches from a synthetic
 // spec that declares no rig-level layers. It must still get the rig's culture file and rig startup block,
@@ -116,7 +117,7 @@ function fixture(opts: { podStartup?: boolean } = {}) {
   const inst = new PodRigInstantiator({
     db, rigRepo, podRepo, sessionRegistry, eventBus, nodeLauncher, startupOrchestrator,
     fsOps: resolverFs, tmuxAdapter: tmux,
-    adapters: { "claude-code": claude, codex: noopAdapter("codex"), terminal: noopAdapter("terminal") },
+    adapters: { "claude-code": claude, codex: noopAdapter("codex"), terminal: noopAdapter("terminal"), "acme-harness": noopAdapter("acme-harness") },
   } as never);
   const expansion = new RigExpansionService({ db, rigRepo, eventBus, nodeLauncher, podInstantiator: inst, sessionRegistry });
 
@@ -184,13 +185,16 @@ function fixture(opts: { podStartup?: boolean } = {}) {
   /** The files of a seat's stored startup context, in delivery order. */
   const order = (logicalId: string) => context(logicalId).files.map((file) => file.path);
   const nodeExists = (logicalId: string) => !!db.prepare("SELECT 1 FROM nodes WHERE logical_id = ?").get(logicalId);
-  const addHelper = (podId: string, id: string) => inst.addMemberToPod(rigIdOf(), podId,
-    { id, agent_ref: "local:agents/impl", profile: "default", runtime: "claude-code", cwd: cwd(`${id}-repo`) }, otherRoot);
+  /** The member fragment a runtime takes: a terminal seat has no agent. */
+  const memberAs = (id: string, runtime: string) => runtime === "terminal"
+    ? { id, agent_ref: "builtin:terminal", profile: "none", runtime, cwd: cwd(`${id}-repo`) }
+    : { id, agent_ref: "local:agents/impl", profile: "default", runtime, cwd: cwd(`${id}-repo`) };
+  const addHelper = (podId: string, id: string, runtime = "claude-code") => inst.addMemberToPod(rigIdOf(), podId, memberAs(id, runtime), otherRoot);
   let currentRigId = "";
   const rigIdOf = () => currentRigId;
   const setRigId = (id: string) => { currentRigId = id; };
 
-  return { db, rigRepo, inst, expansion, yaml, rigRoot, otherRoot, cwd, context, rigFile, claudeMd, order, nodeExists, addHelper, setRigId };
+  return { db, rigRepo, inst, expansion, yaml, rigRoot, otherRoot, cwd, context, rigFile, claudeMd, order, nodeExists, addHelper, memberAs, setRigId };
 }
 
 /** The reason an add gave for stopping, as one string. */
@@ -424,5 +428,69 @@ describe("a seat added to an existing pod also gets that pod's startup files, an
     expect(reason(result)).toContain("RIG-NOTES.md");
     expect(f.nodeExists("ux.designer")).toBe(false);
     f.db.close();
+  });
+  describe("a member whose runtime takes no startup files is added as on main, even with inherited files gone", () => {
+    /** A community harness preset for `acme-harness` in this test's own OpenRig home. */
+    function installCommunityPreset(): void {
+      const dir = communityHarnessesDir();
+      // Only ever write into the throwaway OpenRig home the test setup made, never a real one.
+      expect(nodePath.basename(nodePath.dirname(dir)), `preset dir ${dir}`).toMatch(/^\.openrig-test-fixture-home-/);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(nodePath.join(dir, "acme-harness.yaml"), "format: 1\nname: acme-harness\ncommand: node -e 0\nmaintainer: Example Maintainer\n");
+      tmpDirs.push(nodePath.join(dir, "acme-harness.yaml"));
+    }
+    function goneFiles(f: ReturnType<typeof fixture>): void {
+      for (const file of ["CULTURE.md", "RIG-NOTES.md", "DEV-NOTES.md"]) fs.rmSync(nodePath.join(f.rigRoot, file));
+    }
+
+    it("a terminal member is added when the culture file, a required rig file and a required pod file are all gone", async () => {
+      const { f } = await podRig();
+      goneFiles(f);
+      const outcome = await f.addHelper("dev", "shell", "terminal");
+      expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
+      expect(f.nodeExists("dev.shell")).toBe(true);
+      f.db.close();
+    });
+
+    it("a community-harness member is added the same way", async () => {
+      installCommunityPreset();
+      const { f } = await podRig();
+      goneFiles(f);
+      const outcome = await f.addHelper("dev", "guest", "acme-harness");
+      expect(outcome.ok, JSON.stringify(outcome)).toBe(true);
+      expect(f.nodeExists("dev.guest")).toBe(true);
+      f.db.close();
+    });
+
+    it("rig grow --new-pod with only such members is added with a rig file gone", async () => {
+      installCommunityPreset();
+      const { f, rigId } = await podRig();
+      goneFiles(f);
+      const result = await f.expansion.expand({
+        rigId,
+        pod: { id: "side", label: "Side", members: [f.memberAs("shell", "terminal"), f.memberAs("guest", "acme-harness")].map((m) => ({ id: m.id, agentRef: m.agent_ref, profile: m.profile, runtime: m.runtime, cwd: m.cwd })), edges: [] },
+        rigRoot: f.otherRoot,
+      } as never);
+      expect(result.ok, JSON.stringify(result)).toBe(true);
+      expect(f.nodeExists("side.shell")).toBe(true);
+      expect(f.nodeExists("side.guest")).toBe(true);
+      f.db.close();
+    });
+
+    it("rig grow --new-pod with one member that takes startup files still stops, and creates no seat", async () => {
+      const { f, rigId } = await podRig();
+      goneFiles(f);
+      const members = [f.memberAs("shell", "terminal"), f.memberAs("coder", "claude-code")];
+      const result = await f.expansion.expand({
+        rigId,
+        pod: { id: "side", label: "Side", members: members.map((m) => ({ id: m.id, agentRef: m.agent_ref, profile: m.profile, runtime: m.runtime, cwd: m.cwd })), edges: [] },
+        rigRoot: f.otherRoot,
+      } as never);
+      expect(result.ok).toBe(false);
+      expect(reason(result)).toContain("CULTURE.md");
+      expect(f.nodeExists("side.shell")).toBe(false);
+      expect(f.nodeExists("side.coder")).toBe(false);
+      f.db.close();
+    });
   });
 });
