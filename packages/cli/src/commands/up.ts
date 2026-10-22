@@ -44,6 +44,9 @@ function isFilesystemRoot(cwd: string): boolean {
   return resolved === nodePath.parse(resolved).root;
 }
 
+const RENAME_REFUSAL = "--name applies to a new launch from a rig spec or bundle. An existing rig is restored under its own name; renaming an existing rig is not supported.";
+const HOST_RENAME_REFUSAL = "--name over --host needs a spec path or bundle file, not a bare spec or rig name: pass the spec path or bundle file with --name.";
+
 /** The mistakes the daemon would refuse in an env: block, caught before anything is sent. */
 function checkEnvAssignment(assignment: string): string | null {
   const eq = assignment.indexOf("=");
@@ -108,6 +111,7 @@ export function upCommand(
 Examples:
   rig up secrets-manager
   rig up ./rig.yaml
+  rig up ./rig.yaml --name alpha
   rig up ./demo.rigbundle --target ~/work
 
 An existing rig's name restores that rig from its automatically selected usable
@@ -126,6 +130,7 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
     .option("--yes", "Auto-approve trusted actions")
     .option("--cwd <path>", "Override launch working directory for all members for this run only")
     .option("--env <KEY=VALUE>", "Set a launch environment variable on every seat for this run only; repeatable. Not saved: a later restore uses the spec's env: block. Values are visible to local processes, so never pass secrets", (v: string, all: string[]) => [...all, v], [] as string[])
+    .option("--name <rig>", "Launch the spec as a rig with this name instead of its name: field; the rig keeps it for --existing, snapshots and restore. The spec file is not changed")
     .option("--target <root>", "Install target for a .rigbundle (default: current directory). A v2 bundle is materialized there and relative member cwds resolve against it; --cwd still overrides launch cwd")
     .option("--preset <name>", "For a GitHub bundle link, choose a declared configuration")
     .option("--seat <member=runtime>", "For a GitHub bundle link, choose a declared seat runtime; repeatable", (v: string, all: string[]) => [...all, v], [] as string[])
@@ -133,7 +138,7 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
     .option("--fresh <seats...>", "Deliberately fresh-prime the named seats (logical ids) instead of resuming their original sessions (operation B; reported as fresh-primed)")
     .option("--json", "JSON output for agents")
     .option("--host <id>", "Run on a remote host declared in ~/.openrig/hosts.yaml")
-    .action(async (source: string, opts: { nonInterruptive?: boolean; plan?: boolean; yes?: boolean; cwd?: string; env?: string[]; target?: string; existing?: boolean; fresh?: string[]; json?: boolean; host?: string; preset?: string; seat?: string[] }) => {
+    .action(async (source: string, opts: { nonInterruptive?: boolean; plan?: boolean; yes?: boolean; cwd?: string; env?: string[]; name?: string; target?: string; existing?: boolean; fresh?: string[]; json?: boolean; host?: string; preset?: string; seat?: string[] }) => {
       // OPR.0.4.6.MH1 FR-2: selected-host routing — explicit --host wins;
       // else the persisted selection feeds the SHIPPED --host path; no
       // selection = today exactly. Topology
@@ -158,6 +163,18 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
         console.error("--env applies to a new launch from one rig spec or bundle. A topology launches several rigs from their own specs; put env: in each rig's spec instead.");
         process.exitCode = 1;
         return;
+      }
+      const rigName = opts.name;
+      if (rigName !== undefined) {
+        const problem = rigName === "" ? "--name needs a rig name."
+          : sourceLooksLikeTopology(source) ? "--name applies to a new launch from one rig spec or bundle. A topology launches several rigs from their own specs; each takes its spec's name."
+          : isGitHubBundleLink(source) ? "--name is not supported for a GitHub bundle link yet. Download the bundle and run rig up <file>.rigbundle --name <rig>, or launch without --name."
+          : null;
+        if (problem) {
+          console.error(problem);
+          process.exitCode = 1;
+          return;
+        }
       }
 
       // Link preparation verifies the effective endpoint before fetch or local auto-start.
@@ -221,6 +238,11 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
           process.exitCode = 1;
           return;
         }
+        if (rigName !== undefined && !source.includes("/") && !/\.(ya?ml|rigbundle|rigtopology)$/i.test(source)) {
+          console.error(HOST_RENAME_REFUSAL);
+          process.exitCode = 1;
+          return;
+        }
         const { runRemoteHttpOp } = await import("../remote-host-ops.js");
         const body = {
           sourceRef: source,
@@ -228,6 +250,7 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
           autoApprove: opts.yes, nonInterruptive: opts.nonInterruptive,
           cwdOverride: opts.cwd,
           envOverride: envOverrideBody,
+          rigName,
           targetRoot: opts.target,
           existing: opts.existing,
           freshLogicalIds: opts.fresh,
@@ -375,7 +398,18 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
         process.exitCode = 1;
         return true;
       };
-      if (isRigName && await refuseArchivedName(source)) return;
+      // A restore brings the rig back under its own name; renaming an existing rig is out of scope.
+      const refuseNameOnRestore = (): boolean => {
+        if (rigName === undefined) return false;
+        console.error(RENAME_REFUSAL);
+        process.exitCode = 1;
+        return true;
+      };
+      if (isRigName && opts.existing && refuseNameOnRestore()) return;
+      // With --name a bare name can only mean a library spec to launch under the new name, so a rig of the
+      // same name, running or archived, does not make it ambiguous; with no library match the restore refuses --name.
+      const launchingUnderNewName = rigName !== undefined;
+      if (isRigName && !launchingUnderNewName && await refuseArchivedName(source)) return;
       if (isRigName && !opts.existing) {
         try {
           const { resolveLibrarySpec } = await import("./specs.js");
@@ -386,8 +420,8 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
           // An alias must not bypass the canonical name's existing/archive checks.
           const resolvedName = source === "first-project" && entry.name === "starter" && entry.sourceType === "builtin"
             ? entry.name : source;
-          if (resolvedName !== source && await refuseArchivedName(resolvedName)) return;
-          const rigMatches = rigSummaries.filter((r) => r.name === source || r.name === resolvedName);
+          if (!launchingUnderNewName && resolvedName !== source && await refuseArchivedName(resolvedName)) return;
+          const rigMatches = launchingUnderNewName ? [] : rigSummaries.filter((r) => r.name === source || r.name === resolvedName);
           if (rigMatches.length > 0) {
             console.error(`'${source}' is ambiguous — it matches both an existing rig restore target and a library spec.`);
             console.error(`  To launch the library spec: rig up ${entry.sourcePath}`);
@@ -415,7 +449,7 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
         // "Turning on ..." per the rig's derived lifecycleState. Help text honesty:
         // "Recover" describes what `rig up` does; it does not promise success before
         // tester L4 VM proof completes.
-        if (sourceRef === source && refuseEnvOnRestore()) return;
+        if (sourceRef === source && (refuseEnvOnRestore() || refuseNameOnRestore())) return;
         if (sourceRef === source && !opts.json) {
           const summaries = await fetchRigSummaries();
           const match = summaries.find((r) => r.name === source);
@@ -511,6 +545,7 @@ team back with its conversations, run rig up <rig-name> --existing, not the spec
           autoApprove: opts.yes ?? false, nonInterruptive: opts.nonInterruptive,
           cwdOverride: opts.cwd ? nodePath.resolve(opts.cwd) : defaultLibraryCwdOverride,
           envOverride: envOverrideBody,
+          rigName,
           targetRoot,
           // OPR.0.3.4.2 — operation B opt-in seats (deliberate fresh-prime).
           freshLogicalIds: opts.fresh,
