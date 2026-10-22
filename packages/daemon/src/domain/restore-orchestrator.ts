@@ -86,6 +86,7 @@ import { effectiveRestorePolicy, type RestoreSeatFacts } from "./restore-policy.
 import { communityHarnessOf } from "./built-in-runtimes.js";
 import { seatAdapter } from "../adapters/community-harness-runtime-adapter.js";
 import { pluginPathsOf } from "./claude-core-plugin-env.js";
+import { seatLaunchAdditionsForLaunch, systemPromptPendingNoteForNode, type SeatLaunchAdditions } from "./seat-launch-additions.js";
 export { resolveActiveSnapshotSession } from "./active-occupant.js";
 export type { ActiveSnapshotSessionResolution } from "./active-occupant.js";
 
@@ -1918,10 +1919,19 @@ export class RestoreOrchestrator {
       ? [effort, nonInterruptive, true] : nonInterruptive ? [effort, true] : effort !== undefined ? [effort] : [];
     if (this.claudeResume.canResume(resumeType, resumeToken)) {
       // Advisor is Claude-specific; preserve the existing tail for other runtimes and unconfigured seats.
-      const claudeTail: [...typeof launchTail, advisor?: string] = advisor
+      const claudeTail: unknown[] = advisor
         ? [effort, nonInterruptive, kernelAuthority, teamPermissionDefault, advisor] : launchTail;
-      const result = await this.claudeResume.resume(sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId, ...claudeTail);
+      // OPR.0.7.0.9: the seat's own launch additions follow the Advisor.
+      const launch = nodeId ? seatLaunchAdditionsForLaunch(this.db, nodeId) : { missing: [] as string[], refused: [] as string[] };
+      for (const file of launch.missing) warnings?.push(`${sessionName}: seat_launch_addition_missing: ${file} is not in this seat's storage; launched without it`);
+      for (const reason of launch.refused) warnings?.push(`${sessionName}: seat_launch_addition_refused: ${reason}; launched without it`);
+      const tail: unknown[] = launch.additions ? [...claudeTail, ...Array(5 - claudeTail.length).fill(undefined), launch.additions] : claudeTail;
+      const result = await this.claudeResume.resume(sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId,
+        ...(tail as [...typeof launchTail, advisor?: string, launchAdditions?: SeatLaunchAdditions]));
       if (result.ok) {
+        // OPR.0.7.0.9: the resumed conversation's own start, as on the pod-aware path.
+        const promptNote = launch.additions?.appendSystemPromptFile && nodeId && resumeToken ? systemPromptPendingNoteForNode(this.db, nodeId, resumeToken) : undefined;
+        if (promptNote) warnings?.push(`${sessionName}: ${promptNote}`);
         const notice = nonInterruptiveNotice("claude-code", { nonInterruptive, launchPosture: resolvedPosture, permissionMode });
         if (notice) warnings?.push(`${sessionName}: ${notice}`);
         if (result.appliedLaunch && launchGeneration) this.appliedLaunchStore.recordGeneration(launchGeneration, result.appliedLaunch);

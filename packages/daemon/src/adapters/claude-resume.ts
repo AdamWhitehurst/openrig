@@ -10,6 +10,7 @@ import { verifyClaudePaneProcess, verifyPaneIdleShell, witnessedClaudeVersionLab
 import { observeClaudePermission, type AppliedLaunchObservation } from "../domain/permission-drift.js";
 import { unresolvedClaudePermissionModes } from "../domain/native-permission-selection.js";
 import type { ClaudeManagedLaunch } from "../domain/claude-managed-launch.js";
+import { seatLaunchAdditionArgs, type SeatLaunchAdditions } from "../domain/seat-launch-additions.js";
 
 export type ResumeResult =
   // `launchedProcess` (Claude): the process this resume's own identity check observed (#1077).
@@ -66,6 +67,8 @@ export class ClaudeResumeAdapter {
     kernelAuthority?: boolean,
     teamPermissionDefault?: boolean,
     advisor?: string | null,
+    // OPR.0.7.0.9: the seat's own launch additions (copies in its seat storage); absent → byte-identical.
+    launchAdditions?: SeatLaunchAdditions,
   ): Promise<ResumeResult> {
     if (!this.canResume(resumeType, resumeToken)) {
       return { ok: false, code: "no_resume", message: "Claude resume not available" };
@@ -78,6 +81,8 @@ export class ClaudeResumeAdapter {
     const effortArg = effort ? ` --effort ${shellQuote(effort)}` : "";
     advisor = advisor?.trim();
     const advisorArg = advisor ? ` --advisor ${shellQuote(advisor)}` : "";
+    const additionArgs = seatLaunchAdditionArgs(launchAdditions);
+    const additionArg = additionArgs.map((arg, index) => ` ${index % 2 === 0 ? arg : shellQuote(arg)}`).join(""); // flag, value pairs
     let managed: Awaited<ReturnType<ClaudeManagedLaunch["prepare"]>> | undefined;
     if (selectedPermissionMode !== undefined) {
       try {
@@ -89,8 +94,8 @@ export class ClaudeResumeAdapter {
     const posture = claudePostureFlag(process.env, resolvedPosture, selectedPermissionMode);
     const appliedLaunch = observeClaudePermission(posture);
     const permissionMode = posture + operationalLaunchArg("claude-code", choice);
-    const cmd = managed ? managed.command(["--permission-mode", selectedPermissionMode!, ...operationalLaunchArgs("claude-code", choice), ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []), ...(advisor ? ["--advisor", advisor] : []), "--resume", resumeToken!], claudeResumeLaunchEnv(resumeToken!))
-      : `${claudeResumeLaunchPrefix(resumeToken!)}${claudeClassicRendererEnvPrefix(process.env)}claude ${permissionMode}${modelArg}${effortArg}${advisorArg} --resume ${shellQuote(resumeToken!)}`;
+    const cmd = managed ? managed.command(["--permission-mode", selectedPermissionMode!, ...operationalLaunchArgs("claude-code", choice), ...(model ? ["--model", model] : []), ...(effort ? ["--effort", effort] : []), ...(advisor ? ["--advisor", advisor] : []), ...additionArgs, "--resume", resumeToken!], claudeResumeLaunchEnv(resumeToken!))
+      : `${claudeResumeLaunchPrefix(resumeToken!)}${claudeClassicRendererEnvPrefix(process.env)}claude ${permissionMode}${modelArg}${effortArg}${advisorArg}${additionArg} --resume ${shellQuote(resumeToken!)}`;
 
     const textResult = managed ? await this.tmux.sendShellCommand(tmuxSessionName, cmd, managed.assertCurrent)
       : this.options.seatLaunchEnvironment
