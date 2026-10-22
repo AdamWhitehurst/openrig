@@ -17,6 +17,10 @@ interface EdgeSuccess {
   outcome: "would_add" | "added" | "present" | "would_remove" | "removed";
   edge: { id?: string; kind: string; from: EdgeEnd; to: EdgeEnd };
   rollback?: string;
+  routing?: {
+    orchestrator?: { seat: string; from: string | null; to: string | null };
+    representative?: { from: string | null; to: string | null };
+  };
 }
 
 type EdgeOpResult =
@@ -52,6 +56,13 @@ function report(result: EdgeOpResult, opts: { json?: boolean }): void {
       case "removed":
         console.log(`removed  ${line}${id}`);
         break;
+    }
+    const { orchestrator, representative } = result.routing ?? {};
+    if (orchestrator) {
+      console.log(`         routing: ${orchestrator.seat}'s orchestrator (its stuck-row findings and recovery) is now ${orchestrator.to ?? "none"}, was ${orchestrator.from ?? "none"}`);
+    }
+    if (representative) {
+      console.log(`         routing: the rig's representative (where a person's Slack message in the rig's mapped channel goes, unless that channel names an inbound seat) is now ${representative.to ?? "none, so such a message goes to Slack's inbound destination"}, was ${representative.from ?? "none"}`);
     }
     if (result.outcome === "added" || result.outcome === "removed") {
       console.log(`         capture this topology with \`rig snapshot ${result.rigId}\`; restore uses the selected snapshot`);
