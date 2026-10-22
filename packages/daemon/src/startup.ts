@@ -2345,7 +2345,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     // hardcoded); oversight = the fleet judgment seat, locally resolvable or a NAMED deferral
     // (no daemon-side cross-host send seam exists yet — the deferral names that, never silence).
     {
-      const { ModelDivergenceMonitor } = await import("./domain/model-divergence/model-divergence-monitor.js");
+      const { ModelDivergenceMonitor, proclaimedInEventLog } = await import("./domain/model-divergence/model-divergence-monitor.js");
       const OVERSIGHT_SEAT = "watch-lead@oversight";
       const modelDivergenceMonitor = new ModelDivergenceMonitor({
         processCensus: modelCensus,
@@ -2396,9 +2396,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
             pinnedModel: proclamation.pinnedModel,
             effectiveModel: proclamation.effectiveModel,
             diagnosis: proclamation.diagnosis,
+            occurrenceId: proclamation.occurrenceId,
             channels: proclamation.channels,
           });
         },
+        wasProclaimed: proclaimedInEventLog(db),
       });
       modelDivergenceMonitor.startPolling(60_000);
       deps.modelDivergenceMonitor = modelDivergenceMonitor;
