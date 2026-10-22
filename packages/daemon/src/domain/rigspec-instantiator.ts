@@ -333,6 +333,7 @@ import { rigPreflight, preflightValidatedSpec } from "./rigspec-preflight.js";
 import { resolveAgentRef, type AgentResolverFsOps } from "./agent-resolver.js";
 import { resolveNodeConfig, selectedPluginPaths } from "./profile-resolver.js";
 import { resolveStartup } from "./startup-resolver.js";
+import { isCommunityHarnessRuntime } from "./built-in-runtimes.js";
 import { planProjection, claudeConflictTargetPath, projectionConflictWarnings, filterProtectedProjections, type ProjectionPlan } from "./projection-planner.js";
 import { ProjectionManifestStore } from "./projection-manifest-store.js";
 import { StartupOrchestrator } from "./startup-orchestrator.js";
@@ -630,8 +631,9 @@ export class PodRigInstantiator {
     if (!preflight.ready) {
       return { ok: false, code: "preflight_failed", errors: preflight.errors, warnings: preflight.warnings };
     }
-    // A pod added to a running rig inherits the rig's layers; stop before it exists if a required one is gone.
-    if (opts?.targetRigId && targetRig) {
+    // A pod added to a running rig inherits the rig's layers; stop before it exists if a required one is gone,
+    // when at least one added member reads startup files.
+    if (opts?.targetRigId && targetRig && rigSpec.pods.some((pod) => pod.members.some((m) => this.runtimeTakesStartupFiles(m.runtime)))) {
       const missingInherited = this.inheritedStartupFileErrors(opts.targetRigId, targetRig.rig.name);
       if (missingInherited.length > 0) {
         return { ok: false, code: "preflight_failed", errors: missingInherited, warnings: preflight.warnings };
@@ -1082,8 +1084,10 @@ export class PodRigInstantiator {
       return { ok: false, code: "preflight_failed", errors: preflight.errors, warnings: preflight.warnings };
     }
 
-    // 6b. Stop before a seat exists if a required file the rig or this pod declared is gone.
-    const missingInherited = this.inheritedStartupFileErrors(rigId, rig.rig.name, podNamespace);
+    // 6b. Stop before a seat exists if a required file the rig or this pod declared is gone, for a runtime that reads startup files.
+    const missingInherited = this.runtimeTakesStartupFiles(member.runtime)
+      ? this.inheritedStartupFileErrors(rigId, rig.rig.name, podNamespace)
+      : [];
     if (missingInherited.length > 0) {
       return { ok: false, code: "preflight_failed", errors: missingInherited, warnings: preflight.warnings };
     }
@@ -2013,6 +2017,12 @@ export class PodRigInstantiator {
       startup: rigSpec.startup,
       ...(hasPodFiles ? { podStartupFiles } : {}),
     });
+  }
+
+  /** Whether a runtime reads startup files at all. A terminal seat's adapter delivers nothing, and a community harness
+   *  takes none (it only warns), so a missing file can't fail either; main adds them today and keeps doing so. */
+  private runtimeTakesStartupFiles(runtime: string): boolean {
+    return runtime !== "terminal" && !isCommunityHarnessRuntime(runtime);
   }
 
   /** Why an add must stop: a startup file the rig or the pod declared as required, or the rig's declared `culture_file`,
