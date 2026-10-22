@@ -228,6 +228,7 @@ export type LaunchFreshResult =
       generation: string;
       model: string | null;
       effort?: string | null;
+      advisor?: string | null;
       startupPolicyHash: string;
       supersededSessionIds: string[];
       warnings?: string[];
@@ -942,7 +943,7 @@ export class SeatLifecycleService {
       || !this.stillPending(node.id, session.id, pending)) return { ok: false as const, code: "continuation_unavailable", message: "Startup changed during the readiness check. Refresh." };
     const result = await this.startupOrchestrator.startNode({
       rigId: seat.rigId, nodeId: node.id, sessionId: session.id,
-      binding: { ...binding, cwd: node.cwd ?? ".", model: node.model ?? undefined, effort: resolveSeatEffort(node).effective ?? undefined, codexConfigProfile: node.codexConfigProfile ?? undefined },
+      binding: { ...binding, cwd: node.cwd ?? ".", model: node.model ?? undefined, effort: resolveSeatEffort(node).effective ?? undefined, advisor: node.advisor ?? undefined, codexConfigProfile: node.codexConfigProfile ?? undefined },
       adapter, plan: startup.context.plan, resolvedStartupFiles: startup.context.resolvedStartupFiles,
       startupActions: startup.context.startupActions, isRestore: pending.mode === "fork" && pending.isRestore,
       sessionName: session.session_name, skipHarnessLaunch: true, continueFreshStartup: pending.mode === "fresh", includeDurableObligations: true, allowFreshFallback: false,
@@ -1297,6 +1298,7 @@ export class SeatLifecycleService {
         startupPolicyHash: startup.hash,
         model: node.model,
         effort: resolveSeatEffort(node).effective,
+        advisor: node.advisor ?? null,
         reason: input.reason,
         operator: input.operator,
         errors: ["new occupant generation was not persisted"],
@@ -1319,6 +1321,7 @@ export class SeatLifecycleService {
         cwd: node.cwd ?? ".",
         model: node.model ?? undefined,
         effort: resolveSeatEffort(node).effective ?? undefined,
+        advisor: node.advisor ?? undefined,
         codexConfigProfile: node.codexConfigProfile ?? undefined,
         launchPosture,
       },
@@ -1342,6 +1345,7 @@ export class SeatLifecycleService {
         startupPolicyHash: startup.hash,
         model: node.model,
         effort: resolveSeatEffort(node).effective,
+        advisor: node.advisor ?? null,
         reason: input.reason,
         operator: input.operator,
         errors: startupResult.errors,
@@ -1405,6 +1409,7 @@ export class SeatLifecycleService {
         ...(nativeSessionId ? {} : { nativeSessionIdReason: "scrape_miss" }),
         model: node.model,
         effort: resolveSeatEffort(node).effective,
+        advisor: node.advisor ?? null,
         startupPolicyHash: startup.hash,
         reason: input.reason.trim(),
         operator: input.operator ?? null,
@@ -1438,6 +1443,7 @@ export class SeatLifecycleService {
       generation,
       model: node.model,
       effort: resolveSeatEffort(node).effective ?? undefined,
+      advisor: node.advisor ?? undefined,
       startupPolicyHash: startup.hash,
       supersededSessionIds,
       warnings: startupResult.warnings,
@@ -1764,6 +1770,7 @@ export class SeatLifecycleService {
     startupPolicyHash: string;
     model: string | null;
     effort?: string | null;
+    advisor?: string | null;
     reason: string;
     operator?: string | null;
     errors: string[];
@@ -1799,6 +1806,7 @@ export class SeatLifecycleService {
         newGeneration: input.newGeneration,
         model: input.model,
         effort: input.effort ?? null,
+        advisor: input.advisor ?? null,
         startupPolicyHash: input.startupPolicyHash,
         reason: input.reason.trim(),
         operator: input.operator ?? null,

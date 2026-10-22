@@ -1387,7 +1387,7 @@ export class RestoreOrchestrator {
             this.sessionRegistry.recordResumeLaunch(launchedSessionId, resumeToken);
           } catch { /* best-effort: without it a rotation stays unproved, as before */ }
         }
-        const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", node.codexConfigProfile, node.model, this.resolveRestorePosture(node.id, rigId), effortForRestore(), warnings);
+        const resumeOutcome = await this.attemptResume(node.id, sessionName, resumeType, resumeToken, node.cwd ?? "/", node.codexConfigProfile, node.model, this.resolveRestorePosture(node.id, rigId), effortForRestore(), warnings, node.advisor);
         if (resumeOutcome.kind === "resumed") {
           baseStatus = "resumed";
           if (launchedSessionId && this.claudeResume.canResume(resumeType, resumeToken)) {
@@ -1580,6 +1580,7 @@ export class RestoreOrchestrator {
             // their -m/--model on restore the same way.
             model: node.model ?? undefined,
             effort: effortForRestore() ?? undefined,
+            advisor: node.advisor ?? undefined,
           };
 
           try {
@@ -1890,6 +1891,7 @@ export class RestoreOrchestrator {
     resolvedPosture?: "floor" | "full_bypass" | "auto",
     effort?: string | null,
     warnings?: string[],
+    advisor?: string | null,
   ): Promise<
     | { kind: "resumed"; launchedProcess?: ClaudeLaunchedProcess }
     | { kind: "retry_fresh" }
@@ -1915,7 +1917,10 @@ export class RestoreOrchestrator {
       ? [effort, nonInterruptive, false, true] : kernelAuthority
       ? [effort, nonInterruptive, true] : nonInterruptive ? [effort, true] : effort !== undefined ? [effort] : [];
     if (this.claudeResume.canResume(resumeType, resumeToken)) {
-      const result = await this.claudeResume.resume(sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId, ...launchTail);
+      // Advisor is Claude-specific; preserve the existing tail for other runtimes and unconfigured seats.
+      const claudeTail: [...typeof launchTail, advisor?: string] = advisor
+        ? [effort, nonInterruptive, kernelAuthority, teamPermissionDefault, advisor] : launchTail;
+      const result = await this.claudeResume.resume(sessionName, resumeType, resumeToken, cwd, resolvedPosture, model, permissionMode, nodeId, ...claudeTail);
       if (result.ok) {
         const notice = nonInterruptiveNotice("claude-code", { nonInterruptive, launchPosture: resolvedPosture, permissionMode });
         if (notice) warnings?.push(`${sessionName}: ${notice}`);
