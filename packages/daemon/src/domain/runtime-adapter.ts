@@ -10,7 +10,11 @@ export interface NodeBinding extends Binding {
   cwd: string;
   model?: string;
   effort?: string;
+  /** Claude-only, session-scoped Advisor model. */
+  advisor?: string;
   codexConfigProfile?: string;
+  /** Rebuild only: a process/conversation-bound native predecessor policy. */
+  codexRebuildPermissions?: import("./codex-rebuild-permissions.js").CodexPermissionEnvelope;
   /** OPR.0.4.8.3 Seam B: the seat's RESOLVED launch posture from its permission_policy
    * attachment (member > rig precedence, resolved by the core resolver at materialize /
    * restore). Absent = no policy attached → the env-driven floor/YOLO decision stands.
@@ -26,6 +30,14 @@ export interface NodeBinding extends Binding {
   teamPermissionDefault?: boolean;
   /** Reserved successor generation; current tenure remains the input fence until commit. */
   launchGeneration?: string;
+  /** OPR.0.7.0.13: where this seat's skills go, its own storage outside the project (the plugin there is already on the
+   *  seat's CLAUDE_CODE_PLUGIN_DIRS). Absent = the project, as before. Only the Claude adapter reads it. */
+  seatSkillsRoot?: string;
+  /** OPR.0.7.0.13: set when `seatSkillsRoot` is a seat's storage that a link refused: why. Every skill meant for it is then
+   *  refused and named (none is written there or into the project), and a selected plugin's bundled skills are named lost. */
+  seatSkillsRefused?: string;
+  /** OPR.0.7.0.9: this seat's own launch additions, copies in its seat storage. Only the Claude adapters read them. */
+  launchAdditions?: import("./seat-launch-additions.js").SeatLaunchAdditions;
   /** #25: the rig's `managed_blocks.claude-code` file. Absent = CLAUDE.md. Only the Claude adapter reads it. */
   claudeManagedBlockFile?: import("./managed-blocks.js").ClaudeManagedBlockFile;
 }

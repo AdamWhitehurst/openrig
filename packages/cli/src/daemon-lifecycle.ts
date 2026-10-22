@@ -39,6 +39,7 @@ export interface DaemonEventLoopEvidence {
 }
 
 export interface DaemonStatus {
+  databaseWarnings?: string[];
   /** RULING 1ae863d2 — C3 3-state semantics (canonical: daemon crash-cart-detect.ts, kept in
    *  lockstep): "stopped" requires POSITIVE evidence (connection refused); a probe TIMEOUT or
    *  other non-refusal failure is "unverified" — never a down assertion. */
@@ -556,7 +557,7 @@ export async function verifyRequiredListeners(input: {
 }): Promise<
   | { ok: true; verified: string[] }
   | { ok: false; missing: string[]; reason: string }
-  | { ok: "indeterminate"; reason: string }
+  | { ok: "indeterminate"; hosts: string[]; reason: string }
 > {
   const required = new Set(input.bind.hosts);
   required.add("127.0.0.1"); // loopback is required in EVERY mode's floor... except explicit
@@ -584,19 +585,19 @@ export async function verifyRequiredListeners(input: {
     else if (outcome === "unhealthy") missing.push(host);
     else indeterminate.push(host);
   }
-  if (indeterminate.length > 0) {
-    // Indeterminate beats missing in precedence: with ANY listener unverifiable, the
-    // gate has no complete evidence set and must not authorize a kill.
-    return {
-      ok: "indeterminate",
-      reason: `listener state could not be checked for ${indeterminate.join(", ")} (transient probe failure) — the gate acts only on positive evidence and takes no action.`,
-    };
-  }
   if (missing.length > 0) {
+    // A refused or unhealthy listener is positive evidence, whatever else could not be checked.
     return {
       ok: false,
       missing,
       reason: `required listener(s) not answering /healthz: ${missing.join(", ")} — binding evidence beats config echo; a reported host must prove itself.`,
+    };
+  }
+  if (indeterminate.length > 0) {
+    return {
+      ok: "indeterminate",
+      hosts: indeterminate,
+      reason: `listener state could not be checked for ${indeterminate.join(", ")} (transient probe failure) — the gate acts only on positive evidence and takes no action.`,
     };
   }
   return { ok: true, verified };
@@ -732,7 +733,7 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
     if (hasExited()) throw new Error(`Daemon child ${pid} exited before startup completed`);
   };
   const healthzUrl = `http://${formatDaemonHostForUrl(probeHost)}:${port}/healthz`;
-  type StartHealth = { pid?: unknown; bind?: { mode: "explicit" | "default"; hosts: string[]; tailscaleDetected: boolean } };
+  type StartHealth = { databaseWarnings?: unknown; pid?: unknown; bind?: { mode: "explicit" | "default"; hosts: string[]; tailscaleDetected: boolean } };
   const readOwnedHealth = async (url: string): Promise<StartHealth | null> => {
     assertChild();
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -764,11 +765,15 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
     assertChild();
     lock.recordChild(pid!);
     let healthy = false;
+    let databaseWarnings: string[] = [];
     let lastProbe = "health endpoint not responding";
+    let unverified: string[] | null = null;
     for (let i = 0; i < HEALTHZ_RETRIES; i++) {
+      unverified = null;
       try {
         const body = await readOwnedHealth(healthzUrl);
         if (body) {
+          databaseWarnings = readDatabaseWarnings(body.databaseWarnings);
           const bind = body.bind;
           if (!bind || !["explicit", "default"].includes(bind.mode) || !Array.isArray(bind.hosts)
             || bind.hosts.length === 0 || !bind.hosts.every((host) => typeof host === "string" && host.length > 0)
@@ -786,6 +791,7 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
           } });
           if (gate.ok === false) throw new StartupIdentityError(`Daemon child ${pid} FAILED the listener adoption gate: ${gate.reason}`);
           if (gate.ok === true) { healthy = true; break; }
+          unverified = gate.hosts;
           lastProbe = gate.reason;
         }
       } catch (error) {
@@ -795,7 +801,14 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
       }
       await Promise.race([new Promise((resolve) => setTimeout(resolve, HEALTHZ_DELAY_MS)), failed]);
     }
-    if (!healthy) {
+    // In the last round the child's own endpoint named its PID, and only another listener's check stayed
+    // uncertain: start, and say which listener is unverified.
+    const unverifiedSecondary = unverified !== null
+      && !unverified.some((host) => formatDaemonHostForUrl(host) === formatDaemonHostForUrl(probeHost));
+    if (!healthy && !unverifiedSecondary) {
+      if (unverified) {
+        throw new StartupChildPendingError(`Daemon child ${pid} responds at ${healthzUrl}, but listener verification is incomplete: ${lastProbe} Child left running; startup reservation retained. Inspect 'rig daemon status', daemon-start.lock and daemon.log before recovery.`);
+      }
       throw new Error(`${summarizeDaemonStartFailure(healthzUrl, deps.readFile(resolveLifecycleFile(deps, "daemon.log")))}. Last probe: ${lastProbe}`);
     }
     assertChild();
@@ -811,8 +824,13 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
       removeMatchingState(deps, STATE_FILE, state);
       throw error;
     }
+    for (const warning of databaseWarnings) console.error(`Warning: ${warning}`);
+    if (unverifiedSecondary) {
+      console.error(`Warning: daemon started (pid ${pid}), but its listener on ${unverified!.join(", ")} could not be verified: the check got no clear answer, not a refusal. Check /healthz on that address before relying on it.`);
+    }
     return state;
   } catch (error) {
+    if (error instanceof StartupChildPendingError) throw error;
     // Only this launch's child may be cleaned up. A retained child also retains
     // the reservation so a retry cannot run another pre-bind initialization.
     // A failed ps is not exit evidence. This is our unreaped child: signal only
@@ -1002,7 +1020,7 @@ export async function getDaemonStatus(
       const res = await probeHealthzWithSettle(deps, `${openrigUrl}/healthz`);
       const ev = await readHealthEvidence(res);
       const url = new URL(openrigUrl);
-      return { state: "running", port: Number(url.port) || DEFAULT_PORT, host: url.hostname || DEFAULT_HOST, healthy: ev.healthy, reason: ev.reason, eventLoop: ev.eventLoop };
+      return { state: "running", port: Number(url.port) || DEFAULT_PORT, host: url.hostname || DEFAULT_HOST, healthy: ev.healthy, reason: ev.reason, eventLoop: ev.eventLoop, ...(ev.databaseWarnings ? { databaseWarnings: ev.databaseWarnings } : {}) };
     } catch (err) {
       // 1ae863d2: refusal = positive down; anything else (timeout/wedged/blocked) = unverified.
       return isRefusedError(err) ? { state: "stopped" } : { state: "unverified", ...endpoint, ...probeErrorCodeOf(err) };
@@ -1022,6 +1040,7 @@ export async function getDaemonStatus(
         healthy: ev.healthy,
         reason: ev.reason,
         eventLoop: ev.eventLoop,
+        ...(ev.databaseWarnings ? { databaseWarnings: ev.databaseWarnings } : {}),
       };
     } catch (err) {
       // 1ae863d2: the resolved home has NO daemon state — before asserting anything,
@@ -1054,7 +1073,7 @@ export async function getDaemonStatus(
     try {
       const res = await probeHealthzWithSettle(deps, `http://${formatDaemonHostForUrl(host)}:${state.port}/healthz`);
       const ev = await readHealthEvidence(res);
-      return { state: "running", port: state.port, host, pid: state.pid, healthy: ev.healthy, reason: ev.reason, eventLoop: ev.eventLoop };
+      return { state: "running", port: state.port, host, pid: state.pid, healthy: ev.healthy, reason: ev.reason, eventLoop: ev.eventLoop, ...(ev.databaseWarnings ? { databaseWarnings: ev.databaseWarnings } : {}) };
     } catch (err) {
       // 1ae863d2: refusal = positive down; anything else (timeout/wedged/blocked) = unverified.
       return isRefusedError(err) ? { state: "stopped" } : { state: "unverified", pid: state.pid, port: state.port, host, ...probeErrorCodeOf(err) };
@@ -1065,6 +1084,7 @@ export async function getDaemonStatus(
   let healthy = false;
   let reason: DaemonStatus["reason"];
   let eventLoop: DaemonEventLoopEvidence | undefined;
+  let databaseWarnings: string[] | undefined;
   let probeFailure: Pick<DaemonStatus, "probeErrorCode"> = {};
   try {
     const res = await probeHealthzWithSettle(deps, `http://${formatDaemonHostForUrl(host)}:${state.port}/healthz`);
@@ -1072,6 +1092,7 @@ export async function getDaemonStatus(
     healthy = ev.healthy;
     reason = ev.reason;
     eventLoop = ev.eventLoop;
+    databaseWarnings = ev.databaseWarnings;
   } catch (err) {
     // OPR.0.4.3.21 — pid alive but healthz timed out: the honest wedged-loop
     // signal. Report process-present/unhealthy (NOT "stopped") with the
@@ -1081,7 +1102,7 @@ export async function getDaemonStatus(
   }
 
   // pid alive = running (state file preserved either way)
-  return { state: "running", port: state.port, host, pid: state.pid, healthy, reason, eventLoop, ...probeFailure };
+  return { state: "running", port: state.port, host, pid: state.pid, healthy, reason, eventLoop, ...(databaseWarnings ? { databaseWarnings } : {}), ...probeFailure };
 }
 
 /** #275 — keep the OS code of a failed health probe (absent for a timeout). */
@@ -1109,6 +1130,10 @@ export function tailLogs(deps: LifecycleDeps, opts: { follow: boolean }): void {
   child.unref();
 }
 
+function readDatabaseWarnings(value: unknown): string[] {
+  return Array.isArray(value) && value.every(item => typeof item === "string") ? value : [];
+}
+
 /**
  * OPR.0.4.3.21 — read event-loop wedge evidence from a healthz probe result.
  * A plain `{ ok: true }` (mocks, or a monitor-less daemon) → healthy with no
@@ -1118,11 +1143,13 @@ export function tailLogs(deps: LifecycleDeps, opts: { follow: boolean }): void {
  */
 async function readHealthEvidence(
   res: { ok: boolean; json?: () => Promise<unknown> },
-): Promise<{ healthy: boolean; reason?: DaemonStatus["reason"]; eventLoop?: DaemonEventLoopEvidence }> {
+): Promise<{ healthy: boolean; reason?: DaemonStatus["reason"]; eventLoop?: DaemonEventLoopEvidence; databaseWarnings?: string[] }> {
   if (!res.ok) return { healthy: false };
   if (!res.json) return { healthy: true };
   try {
-    const body = (await res.json()) as { eventLoop?: Partial<DaemonEventLoopEvidence> } | null;
+    const body = (await res.json()) as { eventLoop?: Partial<DaemonEventLoopEvidence>; databaseWarnings?: unknown } | null;
+    const warnings = readDatabaseWarnings(body?.databaseWarnings);
+    const context = warnings.length ? { databaseWarnings: warnings } : {};
     const el = body?.eventLoop;
     if (el && typeof el.healthy === "boolean" && typeof el.lagMeanMs === "number") {
       const eventLoop: DaemonEventLoopEvidence = {
@@ -1133,9 +1160,10 @@ async function readHealthEvidence(
         healthy: el.healthy,
       };
       return el.healthy
-        ? { healthy: true, eventLoop }
-        : { healthy: false, reason: "event-loop-starved", eventLoop };
+        ? { healthy: true, eventLoop, ...context }
+        : { healthy: false, reason: "event-loop-starved", eventLoop, ...context };
     }
+    return { healthy: true, ...context };
   } catch {
     // Body absent / not JSON — treat as plain healthy (res.ok already true).
   }

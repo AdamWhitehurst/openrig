@@ -652,7 +652,8 @@ function missingSessionGuidance(node: NodeEntry): string | null {
 // SPEC-DECLARED model (nodes.model), NOT the model the seat is running. The
 // last observed native model is reported separately, with its provenance and time.
 /** One line per seat, except that a runtime's seats with no model reader share one line (#1680). It keeps every
- *  configured model with its count; `--full` and `--json` still give each seat's own. */
+ *  configured model with its count. Each seat's own configured model stays in `--full`'s MODEL(DECLARED) column and in
+ *  `--json`; the lines themselves collapse in every human view. */
 export function modelLines(nodes: NodeEntry[]): string[] {
   const lines: string[] = [];
   const unsupported = new Map<string, NodeEntry[]>();
@@ -905,7 +906,8 @@ default applied; the remote host's rigs are shown).
 
 Exit codes:
   0  Success
-  1  Daemon not running, or invalid --filter / --limit / --fields
+  1  Daemon not running, --rig names no rig (human output; --json keeps its empty result),
+     or invalid --filter / --limit / --fields
   2  Failed to fetch data from daemon`);
   const getDepsF = (): PsDeps => depsOverride ?? { lifecycleDeps: realDeps(), clientFactory: (url: string) => new DaemonClient(url) };
 
@@ -1047,6 +1049,18 @@ Exit codes:
       const rigScoped = opts.rig
         ? visible.filter((e) => (e.rigName ?? e.name) === opts.rig)
         : visible;
+
+      // A --rig that names no rig is a lookup that missed, not an empty fleet: say so (as rig chatroom,
+      // env and parked do) instead of "No rigs" or a zero summary. --json keeps its empty result.
+      if (!opts.json && opts.rig && rigScoped.length === 0) {
+        if (all.some((e) => (e.rigName ?? e.name) === opts.rig)) {
+          console.error(`Rig '${opts.rig}' is archived. Show it with: rig ps --rig ${opts.rig} --include-archived`);
+        } else {
+          console.error(`Rig '${opts.rig}' not found. List rigs with: rig ps`);
+        }
+        process.exitCode = 1;
+        return;
+      }
 
       // Apply CLI-side filter (Amendment A: prefer CLI shaping).
       const filtered = parsedFilter ? applyRigFilter(rigScoped, parsedFilter) : rigScoped;
@@ -1220,6 +1234,29 @@ async function handleNodes(
   let narrowed = allNodes;
   if (opts.rig) narrowed = narrowed.filter((n) => n.rigName === opts.rig);
   if (opts.session) narrowed = narrowed.filter((n) => n.canonicalSessionName === opts.session);
+
+  // A --rig that names no rig is a lookup that missed, not a rig without seats (or a zero summary).
+  // --json keeps its empty result.
+  if (!opts.json && opts.rig && effectiveRigs.length === 0) {
+    // The list above leaves archived rigs out unless asked; look once more so an archived rig's name gets
+    // the same --include-archived pointer as the rig view.
+    let archived = false;
+    if (!opts.includeArchived) {
+      const withArchived = await client.get<PsEntry[]>("/api/ps?includeArchived=true", requestHeaders ? { headers: requestHeaders } : undefined);
+      // A failed lookup hasn't shown the rig is missing: report it as the first rig-list read does.
+      if (withArchived.status >= 400) {
+        console.error(`Failed to fetch rig list from daemon (HTTP ${withArchived.status}). Check daemon status with: rig status`);
+        process.exitCode = 2;
+        return;
+      }
+      archived = Array.isArray(withArchived.data) && withArchived.data.some((r) => (r.rigName ?? r.name) === opts.rig);
+    }
+    console.error(archived
+      ? `Rig '${opts.rig}' is archived. Show it with: rig ps --nodes --rig ${opts.rig} --include-archived`
+      : `Rig '${opts.rig}' not found. List rigs with: rig ps`);
+    process.exitCode = 1;
+    return;
+  }
 
   const filtered = parsedFilter ? applyNodeFilter(narrowed, parsedFilter) : narrowed;
 
@@ -1406,6 +1443,9 @@ function padRigRow(cells: string[], widths: number[]): string {
   return cells.map((cell, i) => i < widths.length ? fitRigCell(cell, widths[i]!) : cell).join(RIG_COLUMN_SEPARATOR);
 }
 
+// A cell filled to its width, or cut to it, still ends before the next column begins.
+const NODE_COLUMN_SEPARATOR = " ";
+
 export function padNodeRow(rig: string, pod: string, member: string, session: string, runtime: string, model: string, status: string, startup: string, oriented: string, lifecycle: string, terminal: string, work: string, activity: string, ctx: string, restore: string, error: string): string {
   return [
     fitCell(rig, 30),
@@ -1422,11 +1462,12 @@ export function padNodeRow(rig: string, pod: string, member: string, session: st
     // Slice 15 — distinct TERMINAL + WORK columns.
     fitCell(terminal, 9),
     fitCell(work, 6),
-    fitCell(activity, 12),
+    // Wide enough for a needs-input count, as in the compact table.
+    fitCell(activity, 17),
     fitCell(ctx, 6),
     fitCell(restore, 10),
     error,
-  ].join("");
+  ].join(NODE_COLUMN_SEPARATOR);
 }
 
 export function padCompactNodeRow(rig: string, session: string, lifecycle: string, activity: string, work: string, reason: string): string {
@@ -1434,10 +1475,10 @@ export function padCompactNodeRow(rig: string, session: string, lifecycle: strin
     fitCell(rig, 22),
     fitCell(session, 38),
     fitCell(lifecycle, 11),
-    fitCell(activity, 14),
+    fitCell(activity, 17),
     fitCell(work, 6),
     reason,
-  ].join("");
+  ].join(NODE_COLUMN_SEPARATOR);
 }
 
 // Slice 15 — render the terminal-active primitive honestly.
@@ -1594,7 +1635,32 @@ async function runHttpPs(
     }
 
     const all = Array.isArray(res.data) ? res.data : [];
-    const filtered = parsedFilter ? applyRigFilter(all, parsedFilter) : all;
+    const rigScoped = opts.rig
+      ? all.filter((e) => (e.rigName ?? e.name) === opts.rig)
+      : all;
+
+    // The same not-found answer as the local rig view, for human output; --json keeps its empty result.
+    if (!opts.json && opts.rig && rigScoped.length === 0) {
+      let archived = false;
+      if (!opts.includeArchived) {
+        const withArchived = await client.get<PsEntry[]>("/api/ps?includeArchived=true", { headers });
+        // A failed lookup hasn't shown the rig is missing: report it as the first remote read does.
+        const lookupStep = classifyHttpFailedStep(withArchived.status);
+        if (lookupStep !== "none") {
+          emitCrossHostError(host.id, lookupStep, `HTTP ${withArchived.status}`, opts.json);
+          process.exitCode = 1;
+          return;
+        }
+        archived = Array.isArray(withArchived.data) && withArchived.data.some((r) => (r.rigName ?? r.name) === opts.rig);
+      }
+      console.error(archived
+        ? `Rig '${opts.rig}' is archived on host ${host.id}. Show it with: rig ps --host ${host.id} --rig ${opts.rig} --include-archived`
+        : `Rig '${opts.rig}' not found on host ${host.id}. List rigs with: rig ps --host ${host.id}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const filtered = parsedFilter ? applyRigFilter(rigScoped, parsedFilter) : rigScoped;
 
     if (opts.summary) {
       const summary = summarizeRigs(filtered);

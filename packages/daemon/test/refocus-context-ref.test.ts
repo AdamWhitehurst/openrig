@@ -41,6 +41,7 @@ function runHook(options: {
   whoamiStdout?: string;
   whoamiStatus?: number;
   capturePython?: boolean;
+  nodeRig?: boolean;
 }) {
   if (root) rmSync(root, { recursive: true, force: true });
   root = mkdtempSync(join(tmpdir(), "refocus-context-ref-"));
@@ -65,7 +66,15 @@ function runHook(options: {
   // The fake answers two verbs. `queue whoami` is dispatched first and returns its own
   // stdout/status, so a whoami failure can be exercised without disturbing the context-get
   // contract below, which stays byte-identical to keep the existing suites unaffected.
-  writeFileSync(rig, `#!/bin/sh
+  writeFileSync(rig, options.nodeRig ? `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.RIG_VERB_LOG, args.join(" ") + "\\n");
+if (args.includes("--work-candidates")) { process.stderr.write("unknown option --work-candidates"); process.exit(1); }
+if (args[0] === "queue") process.stdout.write(process.env.RIG_WHOAMI_STDOUT);
+else if (args[0] === "config") process.stdout.write(JSON.stringify({ workspace: { root: process.env.OPENRIG_HOME } }));
+else process.stdout.write(process.env.RIG_STDOUT);
+` : `#!/bin/sh
 printf '%s %s %s\\n' "$1" "$2" "$3" >> "$RIG_VERB_LOG"
 if [ "$1" = "queue" ] && [ "$2" = "whoami" ]; then
   printf '%s' "$RIG_WHOAMI_STDOUT"
@@ -96,7 +105,7 @@ exit 0
 
   const env = {
     ...process.env,
-    PATH: `${bin}:${process.env.PATH || ""}`,
+    PATH: options.nodeRig ? bin : `${bin}:${process.env.PATH || ""}`,
     OPENRIG_HOME: home,
     OPENRIG_SESSION_NAME: "seat@test",
     OPENRIG_REFOCUS_CONTENT_REF: options.ref,
@@ -141,6 +150,18 @@ exit 0
 }
 
 describe("openrig-core refocus hook — context library refs", () => {
+  it("reads work, legacy CLI fallback, roots and content through an env-node rig with no Node on PATH", () => {
+    const bundle = "# Minimal-PATH context\n";
+    const result = runHook({ nodeRig: true, ref: REF, capturePython: true, rigStdout: bundle,
+      whoamiStdout: JSON.stringify({ currentWorkBasis: "fixture has no current work" }),
+      extraEnv: { OPENRIG_REFOCUS_WORK_NODE: undefined, OPENRIG_WORKSPACE_ROOT: undefined, OPENRIG_REFOCUS_WORK_PACKET: "1" } });
+    expect(result.status).toBe(0);
+    expect(result.payload?.hookSpecificOutput.additionalContext.endsWith(bundle)).toBe(true);
+    expect(result.rigVerbs().trim().split("\n")).toEqual([
+      "queue whoami --json --work-candidates", "queue whoami --json", "config --json", `context get ${REF}`,
+    ]);
+  });
+
   it("REF wins over FILE and delivers the exact rig context get bytes", () => {
     const bundle = "# OpenRig Context Pack: proof v1\n\nassembled bytes\n";
     const result = runHook({ ref: REF, fileContent: "FILE MUST NOT WIN", rigStdout: bundle });

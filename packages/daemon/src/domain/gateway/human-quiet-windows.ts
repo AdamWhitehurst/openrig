@@ -47,7 +47,9 @@ export interface QuietBoundary {
 export type QuietState =
   | { active: false; nextBoundary: null }
   | { active: false; windowId: string; revision: number; nextBoundary: QuietBoundary | null }
-  | { active: true; windowId: string; revision: number; occurrence: string; nextBoundary: QuietBoundary };
+  /** occurrenceStart: when the occurrence that is on now began (a daily window's start that day; an until-window's
+   *  single occurrence begins when its rule was set). */
+  | { active: true; windowId: string; revision: number; occurrence: string; occurrenceStart: string; nextBoundary: QuietBoundary };
 
 interface Row {
   entity_id: string; window_id: string; revision: number; kind: "daily" | "until"; timezone: string;
@@ -91,6 +93,14 @@ export class HumanQuietStore {
     return { windowId: state.windowId, revision: state.revision, occurrence: state.occurrence };
   }
 
+  /** Put an occurrence's ended mark back on the current revision, as end() writes it (no new revision, no source change):
+   *  for a window restored over one whose occurrence the person had already ended, so restoring it doesn't start that
+   *  occurrence's quiet again. Applies only while the revision is still the given one. */
+  restoreEnded(entityId: string, revision: number, ended: { occurrence: string; by: string; at: string }): void {
+    this.db.prepare(`UPDATE human_quiet_windows SET ended_occurrence = ?, ended_by = ?, ended_at = ? WHERE entity_id = ? AND revision = ?`)
+      .run(ended.occurrence, ended.by, ended.at, entityId, revision);
+  }
+
   /** Remove the rule. The row stays, with a new revision, so an older revision is still recognisably stale. */
   clear(entityId: string, input: { clearedBy: string; now: Date }): { windowId: string; revision: number } {
     const row = this.row(entityId);
@@ -118,7 +128,7 @@ export class HumanQuietStore {
     if (row.kind === "until") {
       const untilMs = Date.parse(row.until_at!);
       if (nowMs < untilMs && row.ended_occurrence !== "until") {
-        return { active: true, ...base, occurrence: "until", nextBoundary: { kind: "end", at: new Date(untilMs).toISOString() } };
+        return { active: true, ...base, occurrence: "until", occurrenceStart: row.set_at, nextBoundary: { kind: "end", at: new Date(untilMs).toISOString() } };
       }
       return { active: false, ...base, nextBoundary: null };
     }
@@ -133,7 +143,7 @@ export class HumanQuietStore {
       // A window wholly inside a skipped hour resolves both ends to the same instant: that night has no quiet at all.
       if (endMs <= startMs) continue;
       if (startMs <= nowMs && nowMs < endMs && row.ended_occurrence !== day) {
-        return { active: true, ...base, occurrence: day, nextBoundary: { kind: "end", at: new Date(endMs).toISOString() } };
+        return { active: true, ...base, occurrence: day, occurrenceStart: new Date(startMs).toISOString(), nextBoundary: { kind: "end", at: new Date(endMs).toISOString() } };
       }
       if (startMs > nowMs && (nextStart === null || startMs < nextStart)) nextStart = startMs;
     }

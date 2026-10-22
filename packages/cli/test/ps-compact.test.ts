@@ -607,9 +607,37 @@ describe("OPR.0.4.0.25 — rig ps token-safe defaults", () => {
     expect(output).toContain("dev1-driver@openrig-velocity");
     const assignedLine = output.split("\n").find((line) => line.includes("dev1-design@openrig-build"));
     expect(assignedLine).toBeDefined();
-    // WORK begins after the fixed RIG/SESSION/LIFECYCLE/ACTIVITY columns.
+    // WORK begins after the fixed RIG/SESSION/LIFECYCLE/ACTIVITY columns, each followed by a one-space separator.
     // It renders the total active assignment count (6), never the pending-only count (3).
-    expect(assignedLine!.slice(22 + 38 + 11 + 14, 22 + 38 + 11 + 14 + 6).trim()).toBe("6");
+    expect(assignedLine!.slice(22 + 38 + 11 + 17 + 4, 22 + 38 + 11 + 17 + 4 + 6).trim()).toBe("6");
+  });
+
+  it("compact human table allows for count suffix in ACTIVITY without overflowing into WORK", async () => {
+    const node = RIG_A_NODES.find((n) => n.logicalId === "dev1.impl")!;
+    const previousActivityState = (node as unknown as Record<string, unknown>).activityState;
+    const previousHasWork = node.hasAssignedWork;
+    (node as unknown as Record<string, unknown>).activityState = {
+      activity: "needs_input",
+      display: "needs-input",
+      needsInput: { count: 1, reason: null },
+      decidedBy: null,
+    };
+    node.hasAssignedWork = true;
+    try {
+      const { logs } = await captureLogs(async () => {
+        await makeCmd().parseAsync(["node", "rig", "ps", "--nodes", "-A"]);
+      });
+      const output = logs.join("\n");
+      const line = output.split("\n").find((l) => l.includes("dev1-impl@openrig-build"));
+      expect(line).toBeDefined();
+      expect(line).not.toContain("needs-input x1yes");
+      expect(line).toMatch(/needs-input x1\s+yes/);
+      expect(line!.slice(22 + 38 + 11 + 3, 22 + 38 + 11 + 3 + 17)).toBe("needs-input x1   ");
+      expect(line!.slice(22 + 38 + 11 + 17 + 4, 22 + 38 + 11 + 17 + 4 + 6)).toBe("yes   ");
+    } finally {
+      (node as unknown as Record<string, unknown>).activityState = previousActivityState;
+      node.hasAssignedWork = previousHasWork;
+    }
   });
 
   it("human node views explain a missing tmux session and the recovery path", async () => {
@@ -636,8 +664,8 @@ describe("OPR.0.4.0.25 — rig ps token-safe defaults", () => {
     expect(output).toContain("MEMBER");
     const assignedLine = output.split("\n").find((line) => line.includes("dev1-design@openrig-build"));
     expect(assignedLine).toBeDefined();
-    // WORK begins after the fixed columns through TERMINAL in the full table.
-    expect(assignedLine!.slice(30 + 10 + 14 + 34 + 12 + 17 + 10 + 10 + 9 + 11 + 9,
-      30 + 10 + 14 + 34 + 12 + 17 + 10 + 10 + 9 + 11 + 9 + 6).trim()).toBe("6");
+    // WORK begins after the fixed columns through TERMINAL in the full table, each followed by a one-space separator.
+    expect(assignedLine!.slice(30 + 10 + 14 + 34 + 12 + 17 + 10 + 10 + 9 + 11 + 9 + 11,
+      30 + 10 + 14 + 34 + 12 + 17 + 10 + 10 + 9 + 11 + 9 + 11 + 6).trim()).toBe("6");
   });
 });

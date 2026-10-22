@@ -13,6 +13,9 @@ const crypto = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 const { recordRefocusResult } = require("./refocus-health.cjs");
 
+// Keep the operator's command lookup order; env-node CLI scripts can also use this hook's Node.
+const childEnv = { ...process.env, PATH: [process.env.PATH, path.dirname(process.execPath)].filter(Boolean).join(path.delimiter) };
+
 const DEFAULT_THRESHOLD = 2_600_000;
 const FALSE_VALUES = new Set(["0", "false", "off", "no"]);
 // The issue report after a failed attempt gets this long once the attempt's lookups are done.
@@ -73,7 +76,7 @@ function readConfiguredContent(home) {
     if (timeout <= MIN_LOOKUP_MS) return { content: null, contentRef, failure: "no time left in the refocus budget" };
     const result = spawnSync("rig", ["context", "get", contentRef], {
       encoding: "utf8",
-      env: process.env,
+      env: childEnv,
       timeout,
       maxBuffer: 16 * 1024 * 1024,
     });
@@ -141,7 +144,7 @@ function readQueueWhoami(timeout = lookupTimeout()) {
   if (timeout <= MIN_LOOKUP_MS) return { unknown: "no time left in the refocus budget" };
   const args = ["queue", "whoami", "--json", ...(workPacketEnabled() ? ["--work-candidates"] : [])];
   let result = spawnSync("rig", args, {
-    encoding: "utf8", env: process.env, timeout, maxBuffer: 16 * 1024 * 1024,
+    encoding: "utf8", env: childEnv, timeout, maxBuffer: 16 * 1024 * 1024,
   });
   // A rig CLI older than this hook rejects the flag. Ask again without it, inside what is left of
   // the budget, so the role and the strict answer still arrive (just without candidates).
@@ -150,7 +153,7 @@ function readQueueWhoami(timeout = lookupTimeout()) {
     const remaining = remainingLookupBudget();
     if (remaining > 250) {
       result = spawnSync("rig", ["queue", "whoami", "--json"], {
-        encoding: "utf8", env: process.env, timeout: remaining, maxBuffer: 16 * 1024 * 1024,
+        encoding: "utf8", env: childEnv, timeout: remaining, maxBuffer: 16 * 1024 * 1024,
       });
     }
   }
@@ -208,7 +211,7 @@ function renderRole(result) {
 // start, after reserving python's cap and, when a content ref is configured, the content lookup
 // that runs after python; with 250 ms or less left it is skipped.
 function traceEnv(trees) {
-  const env = { ...process.env };
+  const env = { ...childEnv };
   const missing = [
     ["OPENRIG_TOPOLOGY_ROOT", "topology", "topology"],
     ["OPENRIG_WORKSPACE_ROOT", "workspace", "work"],
@@ -218,7 +221,7 @@ function traceEnv(trees) {
   if (timeout <= 250) return env;
   const result = spawnSync("rig", ["config", "--json"], {
     encoding: "utf8",
-    env: process.env,
+    env: childEnv,
     timeout,
     maxBuffer: 16 * 1024 * 1024,
   });
@@ -552,7 +555,7 @@ function runsForThisSeatsProject(env = process.env) {
   process.stdout.write(output, (error) => {
     // The report gets its own window after the attempt's lookups, however long they actually took (default lookups keep
     // their fixed caps, so a default attempt can run past its 4.5 s budget).
-    recordRefocusResult({ home, seat, identity, failed: failed || Boolean(error),
+    recordRefocusResult({ home, seat, identity, failed: failed || Boolean(error), env: childEnv,
       deadlineMs: Math.max(BUDGET_MS, Math.floor(process.uptime() * 1_000)) + REPORT_MS });
     if (failed || error) {
       state.pendingOn ||= event;

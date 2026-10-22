@@ -33,6 +33,7 @@ import { ThreadSeatMap, formatPostedStamp } from "./thread-seat-map.js";
 import { makeThreadRouteResolver } from "./thread-routing.js";
 import { resolveInboundChannelDestination, resolveOutboundChannel, unsupportedChannelMapFields } from "./channel-map.js";
 import { resolveRigRepresentative } from "../../queue-owner.js";
+import { recoveryTag } from "../../queue-recovery.js";
 import { getSelfHostId } from "../../hosts/fanout-contract.js";
 import { envelopeChannel, forwardChannelProblems, makeEnvelopeForwarder } from "./forwarding.js";
 import type { HostRegistryLoadResult } from "../../hosts/hosts-registry-reader.js";
@@ -233,22 +234,21 @@ function stateDir(home: string): string {
 }
 
 /** The status fields for the retry pass's durable custody. Counts RECORDS across the
- *  inbound-event and click dead-letter files — the event file also carries reactions,
+ *  inbound-event, click and relay dead-letter files — the event file also carries reactions,
  *  and a message that left more than one record is counted once per record, so the
  *  retry pass owns exactly these records. When any file cannot be read the count is
  *  `null`, not 0: a number (or a zero) beside an unknown state still reads as "nothing
  *  stuck" to a consumer that only looks at the count, so the state and the reason tell
- *  the truth and the number says it does not know. Absent when inbound is not configured
- *  (no stores), keeping an inert connector silent. */
+ *  the truth and the number says it does not know. An inert connector reports the same
+ *  retained records without starting retries. */
 function deadLetterBacklogFields(
-  dead: DeadLetterStore<SlackEvent> | undefined,
-  deadActions: DeadLetterStore<SlackBlockActions> | undefined,
-  deadForwards?: DeadLetterStore<unknown>,
+  dead: DeadLetterStore<SlackEvent>,
+  deadActions: DeadLetterStore<SlackBlockActions>,
+  deadForwards: DeadLetterStore<unknown>,
 ): Record<string, unknown> {
-  if (!dead || !deadActions) return {};
   let records = 0;
   let reason: string | undefined;
-  for (const store of [dead, deadActions, ...(deadForwards ? [deadForwards] : [])] as DeadLetterStore<unknown>[]) {
+  for (const store of [dead, deadActions, deadForwards]) {
     const result = store.readResult();
     if (result.ok) records += result.entries.length;
     else reason = reason ?? result.reason;
@@ -270,6 +270,12 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
 
   const outboundReady = cfg.enabled && bot !== null && cfg.channel !== null;
   const inboundReady = cfg.enabled && app !== null;
+  const inboundRouting = { fallback: "local", destination: cfg.inboundDestination };
+  const dead = new DeadLetterStore<SlackEvent>(path.join(stateDir(opts.home), "slack-inbound-deadletter.jsonl"));
+  const deadActions = new DeadLetterStore<SlackBlockActions>(path.join(stateDir(opts.home), "slack-inbound-action-deadletter.jsonl"));
+  // Retained relays belong to their original host, even after forwarding configuration changes.
+  const deadForwards = new DeadLetterStore<{ host: string; envelope: SocketEnvelope }>(
+    path.join(stateDir(opts.home), "slack-inbound-forward-deadletter.jsonl"));
 
   if (!outboundReady && !inboundReady) {
     const missing = !cfg.enabled ? "connector disabled (rig slack enable)" : !bot ? "SLACK_BOT_TOKEN unresolved" : "channel unconfigured";
@@ -280,7 +286,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       deliver: async () => ({ ok: false, class: "slack-not-configured", detail: missing }),
       log,
     });
-    return { ...inert, status: () => ({ platform: "slack", configurationDigest: channelStateDigest(cfg), outboundReady: false, inboundReady: false, recovery: { state: "unavailable", reason: "inbound-not-configured" }, inbound: { state: "not-configured" } }) };
+    return { ...inert, status: () => ({ platform: "slack", configurationDigest: channelStateDigest(cfg), outboundReady: false, inboundReady: false, inboundRouting, recovery: { state: "unavailable", reason: "inbound-not-configured" }, inbound: { state: "not-configured" }, ...deadLetterBacklogFields(dead, deadActions, deadForwards) }) };
   }
 
   const registrySurface: RegistrySurface = opts.registry ?? { loadHumanRegistry, resolveSlackHandle };
@@ -331,12 +337,16 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   // sees it. Tell the seat that asked, once: the notice's id derives from the ask's, so a replay
   // returns the same row instead of a second one.
   // A retry that can't post the rest of an ask some of which may already be in Slack says so.
-  const notifySourceUndeliverable = (p: OutboundPostPayload, detail: string, partlyPosted = false): void => {
+  const notifySourceUndeliverable = (p: OutboundPostPayload, detail: string, partlyPosted = false, invalidBlocks = false): void => {
     const seat = p.sourceSession;
     if (!p.qitemId || !seat) return;
     const human = p.destinationSession ?? "the person";
+    // A prior episode's notice must not hide this explicit Slack rejection.
+    const noticeId = invalidBlocks
+      ? `${p.notificationKey ?? p.qitemId}-invalid-blocks-undeliverable`
+      : `${p.qitemId}-undeliverable`;
     opts.queueRepo.create({
-      qitemId: `${p.qitemId}-undeliverable`,
+      qitemId: noticeId,
       sourceSession: seat,
       destinationSession: seat,
       summary: `Not delivered to ${human}: ${p.summary ?? p.qitemId}`,
@@ -347,22 +357,30 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
         "",
         `Reason: ${detail}`,
         "",
-        partlyPosted
+        invalidBlocks
+          ? "Slack rejected the message blocks. OpenRig will not retry this payload. Check its evidence links and message content, then send a corrected ask as a new queue item. The original row remains undelivered; close it when you have handled it."
+          : partlyPosted
           ? "Check the thread in Slack and send what's missing as a new ask. The original row stays open until you close it."
           : "Shorten it and send it as a new ask. The original row stays open until you close it.",
       ].join("\n"),
       evidenceRef: `rig queue show ${p.qitemId}`,
-      tags: ["slack-undeliverable"],
+      tags: ["slack-undeliverable", recoveryTag(p.qitemId)],
     }).catch((e) => log(`undeliverable notice FAILED for ${p.qitemId}: ${(e as Error).message}`));
   };
 
   const recordTransportFailed = (p: OutboundPostPayload, failureClass: string, detail: string, partlyPosted?: boolean): void => {
     if (!p.qitemId) return;
-    if (failureClass === "human-message-unrenderable") notifySourceUndeliverable(p, detail, partlyPosted);
+    if (failureClass === "human-message-unrenderable" || failureClass === "slack-invalid-blocks") {
+      notifySourceUndeliverable(p, detail, partlyPosted, failureClass === "slack-invalid-blocks");
+    }
     const key = p.notificationKey ?? p.qitemId;
-    const alreadyRecorded = opts.queueRepo.transitionLog.listForQitem(p.qitemId).some((transition) =>
+    const previousFailure = opts.queueRepo.transitionLog.listForQitem(p.qitemId).filter((transition) =>
       transition.transitionNote?.startsWith("slack-owner-notification-transport-failed ")
-        && transition.transitionNote.split(/\s+/).includes(`notification_key=${key}`));
+        && transition.transitionNote.split(/\s+/).includes(`notification_key=${key}`)).at(-1);
+    // A corrected attempt can fail transiently after a permanent rejection, and a
+    // transient failure can be followed by a definite rejection. Preserve both changes.
+    const alreadyRecorded = previousFailure &&
+      previousFailure.transitionNote!.includes("class=slack-invalid-blocks ") === (failureClass === "slack-invalid-blocks");
     if (alreadyRecorded) return;
     opts.queueRepo.update({
       qitemId: p.qitemId,
@@ -669,17 +687,13 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   // or ack it (instead of handing it to delivery) resolves that first, through the reconciler. Found goes to delivery
   // unchanged, which records receipts for what was posted and never posts it again in another form. A post confirmed
   // partly in Slack (its first part found, the post not complete) also goes to delivery: only its own remaining parts
-  // post, under its own part ids and in its own thread and channel, even during quiet hours. A scan that can't be read
-  // retains the decision. Never-attempted and absent attempts, and a scan that couldn't finish, haven't started: they
-  // go on through the gate like any other post. Where the gate posts,
+  // post, under its own part ids and in its own thread and channel, even during quiet hours. Never-attempted and absent
+  // attempts, and a scan that couldn't finish or be read, haven't started: they go on through the gate like any other post. Where the gate posts,
   // delivery reconciles (keeping its at-least-once post for an unfinished scan); where it holds, the release posts it
   // after quiet. A decision that goes straight to delivery skips this.
   const resolveEarlierAttempt = async (decision: Parameters<SubsystemDeliverFn>[0]): Promise<Awaited<ReturnType<SubsystemDeliverFn>> | null> => {
     const landing = "landing" in deliver ? await (deliver as { landing: (d: typeof decision) => Promise<unknown> }).landing(decision) : "unattempted";
     if (landing === "found" || landing === "partial") return deliver(decision);
-    if (typeof landing === "object" && landing !== null) {
-      return { ok: false as const, class: "reconcile-unreadable", detail: (landing as { unreadable: string }).unreadable };
-    }
     return null;
   };
 
@@ -930,16 +944,6 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
     stops.push(() => driver.stop());
   }
 
-  // Hoisted out of the inbound block so status() can report the durable backlog.
-  // Both files are the retry pass's custody: the event dead-letter
-  // (`slack-inbound-deadletter.jsonl`) and the click dead-letter
-  // (`slack-inbound-action-deadletter.jsonl`), which retryActionDeadLetters owns.
-  // An inert wire omits the fields rather than inventing a count for a connector
-  // that is not running.
-  let dead: DeadLetterStore<SlackEvent> | undefined;
-  let deadActions: DeadLetterStore<SlackBlockActions> | undefined;
-  // The hub's relays that failed, kept with their host (forwarding.ts).
-  let deadForwards: DeadLetterStore<{ host: string; envelope: SocketEnvelope }> | undefined;
   // A machine of a shared app receives its channels' events from the hub (routes/gateway.ts).
   let acceptForwarded: ((env: SocketEnvelope) => Promise<{ status: string; reason?: string }>) | undefined;
   let relayedReceived = 0; // envelopes a hub relayed here since this wire was built
@@ -953,7 +957,6 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
   let router: InboundRouter | undefined;
   if (inboundReady || outboundReady) {
     const inboundSeen = new SeenStore(path.join(stateDir(opts.home), "slack-inbound-seen.jsonl"));
-    dead = new DeadLetterStore<SlackEvent>(path.join(stateDir(opts.home), "slack-inbound-deadletter.jsonl"));
     const registry: RegistrySurface = registrySurface;
     const built = (router = new InboundRouter({
       queue: ports,
@@ -990,7 +993,7 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       // a failed hand-back is retried with the event dead-letters, and each click is confirmed
       // in the decision's thread (a bot post, so inbound never ingests it).
       recordHumanAnswer: (input) => opts.queueRepo.recordHumanAnswer(input),
-      actionDeadLetter: (deadActions = new DeadLetterStore<SlackBlockActions>(path.join(stateDir(opts.home), "slack-inbound-action-deadletter.jsonl"))),
+      actionDeadLetter: deadActions,
       ...(bot ? {
         // A stopped run posts nothing, and its rate-limit wait ends with the run: after a restart the click's
         // redelivery belongs to the new router, which must not race a stale retry from this one.
@@ -1024,14 +1027,11 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
           lookupBot: (botId: string) => lookupBotApp(bot, botId, opts.fetchImpl),
         },
       } : {}),
-      ...(forwarding ? {
-        forward: {
-          hostFor: (channel: string | undefined) => cfg.forwardChannels!.find((f) => f.channel === channel)?.host ?? null,
-          send: makeEnvelopeForwarder({ fetchImpl: opts.fetchImpl as typeof fetch | undefined, loadRegistry: opts.loadHostRegistry }),
-        },
-        forwardDeadLetter: (deadForwards = new DeadLetterStore<{ host: string; envelope: SocketEnvelope }>(
-          path.join(stateDir(opts.home), "slack-inbound-forward-deadletter.jsonl"))),
-      } : {}),
+      forward: {
+        hostFor: (channel: string | undefined) => forwarding ? cfg.forwardChannels!.find((f) => f.channel === channel)?.host ?? null : null,
+        send: makeEnvelopeForwarder({ fetchImpl: opts.fetchImpl as typeof fetch | undefined, loadRegistry: opts.loadHostRegistry }),
+      },
+      forwardDeadLetter: deadForwards,
       log,
     }));
     if (cfg.botInbox && (!bot || botInboxProblems(cfg).length > 0)) {
@@ -1105,14 +1105,11 @@ export function buildSlackGatewayWire(opts: SlackWireOpts): GatewayWire {
       platform: "slack", configurationDigest: channelStateDigest(cfg),
       outboundReady,
       inboundReady,
+      inboundRouting,
       recovery: recovery?.status() ?? { state: "unavailable", reason: "inbound-not-configured" },
       inbound: inboundHandle?.status() ?? { state: inboundReady ? "not-started" : "not-configured", generation: 0, reconnects: 0 },
-      // The retry pass's durable custody, counted from both dead-letter files:
-      // inbound events plus click answers. Records, not distinct messages — a
-      // message that left more than one record is counted once per record, which
-      // is why the field is named for records. Present iff inbound is configured;
-      // an unreadable file reports state "unknown" with a reason instead of a
-      // false zero.
+      // Durable inbound custody across event, click and relay files, even when inert.
+      // Count records, not distinct messages; unreadable storage is null/unknown.
       ...deadLetterBacklogFields(dead, deadActions, deadForwards),
       // A machine with no connection of its own can take events a hub relays here; whether a hub does is
       // the hub's configuration, so this says only that it can, and how many have arrived.

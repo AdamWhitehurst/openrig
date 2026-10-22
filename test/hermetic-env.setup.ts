@@ -31,6 +31,10 @@ import os from "node:os";
 import path from "node:path";
 import { realRuntimesRequested, writeRuntimeStubs } from "./stub-runtimes.js";
 
+export function fixtureUserHomeEnv(userHome: string, platform: NodeJS.Platform = process.platform): NodeJS.ProcessEnv {
+  return { HOME: userHome, ...(platform === "win32" ? { USERPROFILE: userHome } : {}) };
+}
+
 // Scrub inherited instance selectors before product modules capture their defaults.
 // Tests can still set explicit overrides after setup; test/provider opt-in flags
 // are not instance selectors and remain untouched.
@@ -123,7 +127,7 @@ delete process.env["CLAUDE_CONFIG_DIR"];
 if (!realCodexTest) {
   const userHome = `${fixtureHome}-user-home`;
   fs.mkdirSync(userHome, { recursive: true });
-  process.env["HOME"] = userHome;
+  Object.assign(process.env, fixtureUserHomeEnv(userHome));
   delete process.env["CODEX_HOME"];
   for (const [key, suffix] of Object.entries({
     XDG_CONFIG_HOME: ".config", XDG_STATE_HOME: ".local/state",

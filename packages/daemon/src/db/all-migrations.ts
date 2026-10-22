@@ -122,6 +122,10 @@ import { providerAccountReadingsSchema } from "./migrations/117_provider_account
 import { humanQuietWindowsSchema } from "./migrations/118_human_quiet_windows.js";
 import { seatIdentityPanePidSchema } from "./migrations/119_seat_identity_pane_pid.js";
 import { rigStartupLayersSchema } from "./migrations/121_rig_startup_layers.js";
+import { humanOperatingModesSchema } from "./migrations/122_human_operating_modes.js";
+import { queueDelegatedDecisionSchema } from "./migrations/123_queue_delegated_decision.js";
+import { contextUsageWatchdogUnitsSchema } from "./migrations/124_context_usage_watchdog_units.js";
+import { nodeAdvisorSchema } from "./migrations/125_node_advisor.js";
 
 /** Ordered migrations; numbers may be reserved by independent changes. */
 
@@ -243,4 +247,8 @@ export const ALL_MIGRATIONS: Migration[] = [
   humanQuietWindowsSchema,
   seatIdentityPanePidSchema,
   rigStartupLayersSchema,
+  humanOperatingModesSchema,
+  queueDelegatedDecisionSchema,
+  contextUsageWatchdogUnitsSchema,
+  nodeAdvisorSchema,
 ];

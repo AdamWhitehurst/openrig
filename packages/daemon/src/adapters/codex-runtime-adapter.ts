@@ -1,3 +1,4 @@
+import { codexEnvelopeArgs } from "../domain/codex-rebuild-permissions.js";
 import { operationalLaunchArg } from "./kernel-authority.js";
 import nodePath from "node:path";
 import fs from "node:fs";
@@ -63,6 +64,7 @@ const codexHookTrust = createRequire(import.meta.url)("../../assets/plugins/open
 };
 
 import { listNativeProcesses, observeCodexPaneProcess, observeCodexForkProcess, verifyPaneIdleShell, type NativeProcessRow } from "../domain/native-process-lineage.js";
+import { recordSeatSkillWrite, seatPluginSkillsLossNote, seatProjectionComplete, seatSkillWriteRefusal } from "../domain/seat-skill-storage.js";
 
 // Shared by all probes of ONE launch, never reset by a delayed screen or an
 // ambiguous transport result. A separately requested launch gets a new attempt.
@@ -502,7 +504,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
 
   async listInstalled(binding: NodeBinding): Promise<InstalledResource[]> {
     const results: InstalledResource[] = [];
-    const skillsDir = nodePath.join(binding.cwd, ".agents", "skills");
+    const skillsDir = binding.seatSkillsRoot ?? nodePath.join(binding.cwd, ".agents", "skills");
     if (this.fs.exists(skillsDir) && this.fs.listFiles) {
       for (const file of this.fs.listFiles(skillsDir)) {
         results.push({ effectiveId: file, category: "skill", installedPath: nodePath.join(skillsDir, file) });
@@ -524,7 +526,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       }
 
       try {
-        const didProject = this.projectEntry(entry, binding.cwd, warnings);
+        const didProject = this.projectEntry(entry, binding.cwd, warnings, binding.seatSkillsRoot, binding.seatSkillsRefused);
         if (didProject) {
           projected.push(entry.effectiveId);
         } else {
@@ -560,9 +562,14 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
             break;
           }
           case "skill_install": {
-            const targetDir = nodePath.join(binding.cwd, ".agents", "skills", nodePath.basename(nodePath.dirname(file.absolutePath)));
+            const targetDir = nodePath.join(binding.seatSkillsRoot ?? nodePath.join(binding.cwd, ".agents", "skills"), nodePath.basename(nodePath.dirname(file.absolutePath)));
+            const skillTarget = nodePath.join(targetDir, nodePath.basename(file.path));
+            // OPR.0.7.0.13: never write through a link out of the seat's storage.
+            const refusal = binding.seatSkillsRoot ? binding.seatSkillsRefused ?? seatSkillWriteRefusal(binding.seatSkillsRoot, skillTarget) : undefined;
+            if (refusal) { warnings.push(`skill_install: ${refusal}`); continue; }
             this.fs.mkdirp(targetDir);
-            this.fs.writeFile(nodePath.join(targetDir, nodePath.basename(file.path)), content);
+            this.fs.writeFile(skillTarget, content);
+            if (binding.seatSkillsRoot) recordSeatSkillWrite(binding.seatSkillsRoot, skillTarget, file.absolutePath, content);
             break;
           }
           case "send_text": {
@@ -657,7 +664,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     // -s danger-full-access (overrides even a named profile); otherwise the named profile, or
     // OpenRig's explicit -s workspace-write floor flag.
     // Issue #121: only the fresh launch adds git metadata dirs; resume and fork never did.
-    const gitDirArg = opts.resumeToken
+    const gitDirArg = opts.resumeToken || binding.codexRebuildPermissions
       ? ""
       : (await this.resolveGitAddDirs(binding.cwd)).map((dir) => ` --add-dir ${shellQuote(dir)}`).join("");
     const cmd = opts.resumeToken
@@ -740,8 +747,13 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     const effortArg = effort ? ` -c ${shellQuote(`model_reasoning_effort="${effort}"`)}` : "";
     const profile = binding.codexConfigProfile?.trim();
     const profileArg = profile ? ` -p ${shellQuote(profile)}` : "";
-    const posture = codexPostureArg(profileArg, process.env, binding.launchPosture);
-    const appliedLaunch = observeCodexSandbox(posture);
+    const posture = binding.codexRebuildPermissions
+      ? profileArg + codexEnvelopeArgs(binding.codexRebuildPermissions)
+      : codexPostureArg(profileArg, process.env, binding.launchPosture);
+    const appliedLaunch: AppliedLaunchObservation = binding.codexRebuildPermissions
+      ? { runtime: "codex", axis: "sandbox", state: "observed", value: binding.codexRebuildPermissions.sandboxPolicy.type,
+          reason: "emitted_launch_arguments", ...(binding.codexRebuildPermissions.approvalPolicy === "never" ? { approvalPolicy: "never" } : {}) }
+      : observeCodexSandbox(posture);
     const postureArg = posture + operationalLaunchArg(this.runtime, binding);
 
     if (running) {
@@ -765,10 +777,10 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
         };
       }
     }
-    const teamWorkspaceArg = binding.teamPermissionDefault && !profile
+    const teamWorkspaceArg = !binding.codexRebuildPermissions && binding.teamPermissionDefault && !profile
       && appliedLaunch.state === "observed" && appliedLaunch.value === "workspace-write"
       ? codexTeamWorkspaceArg(this.prepareTeamWorkspace, name) : "";
-    const queueStateDirArg = teamWorkspaceArg || this.buildQueueStateAddDirArg(name);
+    const queueStateDirArg = binding.codexRebuildPermissions ? "" : teamWorkspaceArg || this.buildQueueStateAddDirArg(name);
     // #69: one daemon-support decision for this launch, for the Codex the seat pane runs
     // (its cwd, the launch PATH), applied to fresh, fork and resume.
     const daemonSupport = this.detectDaemonSupport ? await this.detectDaemonSupport(binding.cwd) : undefined;
@@ -778,7 +790,8 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     const daemonOptOut = daemonSupport?.kind === "supported";
     const daemonArg = daemonOptOut ? " --no-daemon" : "";
     // #275: on the plain floor, network access unless Codex reports an opt-out or policy.
-    const networkArg = await codexNetworkDefaultArg(this.readNetworkDefault, appliedLaunch, binding.cwd, name);
+    const networkArg = binding.codexRebuildPermissions ? ""
+      : await codexNetworkDefaultArg(this.readNetworkDefault, appliedLaunch, binding.cwd, name);
 
     // The launch facts keep the probed daemon choice, so a printed recovery command can repeat it; no probe, no fact.
     const launchFacts = daemonSupport ? { ...appliedLaunch, daemonOptOut } : appliedLaunch;
@@ -932,7 +945,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     this.provisionWorkspaceTrust(binding.cwd ?? null);
   }
 
-  private projectEntry(entry: ProjectionEntry, cwd: string, warnings: string[]): boolean {
+  private projectEntry(entry: ProjectionEntry, cwd: string, warnings: string[], seatSkillsRoot?: string, seatSkillsRefused?: string): boolean {
     if (entry.category === "runtime_resource" && this.applyRuntimeResource(entry)) {
       return true;
     }
@@ -951,8 +964,19 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
       return false;
     }
 
-    const targetDir = this.resolveTargetDir(entry, cwd);
+    const targetDir = this.resolveTargetDir(entry, cwd, seatSkillsRoot);
     if (!targetDir) return true;
+    // OPR.0.7.0.13: never write through a link out of the seat's storage.
+    // A refused seat storage refuses every skill meant for it, named; otherwise each destination is checked.
+    const refusal = seatSkillsRoot && entry.category === "skill"
+      ? seatSkillsRefused ?? seatSkillWriteRefusal(seatSkillsRoot, nodePath.join(targetDir, "SKILL.md")) : undefined;
+    if (refusal) { warnings.push(`${entry.effectiveId}: ${refusal}`); return false; }
+    // OPR.0.7.0.13: destinations refused below (a link on the way); an entry with any is reported incomplete, not projected.
+    const notProjected: string[] = [];
+    // OPR.0.7.0.13: a skill written to the seat's own storage is recorded, so cleanup and restore know it as OpenRig's.
+    const record = seatSkillsRoot && entry.category === "skill"
+      ? (dest: string, src: string, content: string) => recordSeatSkillWrite(seatSkillsRoot, dest, src, content)
+      : () => {};
 
     this.fs.mkdirp(targetDir);
     let isDir = false;
@@ -969,10 +993,19 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     const createdFiles: string[] = [];
     try {
       if (isDir && this.fs.listFiles) {
+        let skippedPluginSkills = 0;
         for (const file of this.fs.listFiles(entry.absolutePath)) {
+          // OPR.0.7.0.13: a seat with its own storage gets a selected plugin's bundled skills there, through its loadout, so
+          // the project's copy of the plugin leaves its skills out; its manifest, hooks and settings are copied as before.
+          if (seatSkillsRoot && entry.category === "plugin" && file.split(/[\\/]/)[0] === "skills") { skippedPluginSkills++; continue; }
           const src = nodePath.join(entry.absolutePath, file);
           const dest = nodePath.join(targetDir, file);
+          // OPR.0.7.0.13: each destination in a seat's storage is checked before it's recorded, written or re-moded, so a
+          // helper folder or file found to be a link is not written through (the identical-content, mode-only branch included).
+          const refusedDest = seatSkillsRoot && entry.category === "skill" ? seatSkillWriteRefusal(seatSkillsRoot, dest) : undefined;
+          if (refusedDest) { warnings.push(`${entry.effectiveId}: ${refusedDest}`); notProjected.push(dest); continue; }
           const content = this.fs.readFile(src);
+          record(dest, src, content);
           // Reconcile mode even when the content write is skipped: a byte-identical dest
           // projected earlier may still carry the wrong (default) mode.
           if (this.fs.exists(dest) && hashContent(content) === hashContent(this.fs.readFile(dest))) {
@@ -985,9 +1018,14 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
           if (!existed) createdFiles.push(dest);
           this.preserveMode(src, dest);
         }
+        const pluginLoss = seatSkillsRefused ? seatPluginSkillsLossNote(entry.effectiveId, skippedPluginSkills, seatSkillsRefused) : undefined;
+        if (pluginLoss) warnings.push(pluginLoss);
       } else {
-        const content = this.fs.readFile(entry.absolutePath);
         const destFile = nodePath.join(targetDir, nodePath.basename(entry.absolutePath));
+        const refusedFile = seatSkillsRoot && entry.category === "skill" ? seatSkillWriteRefusal(seatSkillsRoot, destFile) : undefined;
+        if (refusedFile) { warnings.push(`${entry.effectiveId}: ${refusedFile}`); return false; }
+        const content = this.fs.readFile(entry.absolutePath);
+        record(destFile, entry.absolutePath, content);
         if (this.fs.exists(destFile) && hashContent(content) === hashContent(this.fs.readFile(destFile))) {
           this.preserveMode(entry.absolutePath, destFile);
           return true;
@@ -1000,7 +1038,7 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     } finally {
       if (entry.category === "plugin") warnings.push(...excludeNewGeneratedFiles(cwd, createdFiles));
     }
-    return true;
+    return seatProjectionComplete(entry.effectiveId, notProjected, warnings);
   }
 
   /**
@@ -1024,9 +1062,9 @@ export class CodexRuntimeAdapter implements RuntimeAdapter {
     return this.fs.exists(nodePath.join(entry.absolutePath, ".codex-plugin", "plugin.json"));
   }
 
-  private resolveTargetDir(entry: ProjectionEntry, cwd: string): string | null {
+  private resolveTargetDir(entry: ProjectionEntry, cwd: string, seatSkillsRoot?: string): string | null {
     switch (entry.category) {
-      case "skill": return nodePath.join(cwd, ".agents", "skills", entry.effectiveId);
+      case "skill": return nodePath.join(seatSkillsRoot ?? nodePath.join(cwd, ".agents", "skills"), entry.effectiveId);
       case "guidance": return null; // handled via merge
       case "subagent": return nodePath.join(cwd, ".agents"); // .agents/{id}.yaml per preserved contract
       case "plugin": return nodePath.join(cwd, ".codex", "plugins", entry.effectiveId);

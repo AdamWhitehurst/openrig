@@ -14,6 +14,7 @@ import type {
 } from "./activity-taxonomy.js";
 import { COMMUNITY_HARNESS_RUNG_INVENTORY, EVIDENCE_RUNG_RANK, runtimeRungInventory } from "./activity-taxonomy.js";
 import { sessionCommunityHarnessSelect } from "./session-registry.js";
+import { hookPrecedes } from "./agent-activity-store.js";
 
 /** Default polling cadence: 1Hz. The default silence window is 3s, so
  *  1Hz polling gives at-most ~1s freshness lag on the cached observation. */
@@ -48,6 +49,9 @@ export interface SeatActivityServiceDeps {
   permissionPromptChanged?: (sessionName: string, confirmed: boolean, runtime: string) => void;
   /** Claude pid.json, consulted for seats declaring self-report. */
   selfReportReader?: (sessionName: string, seatNodeId: string) => ActivityEvidence | null;
+  /** A runner seat's last recorded hook, restored when its inventory is declared with no hook evidence yet (after a
+   *  daemon restart). Null when nothing qualifies: another generation or session, or nothing recorded. */
+  restoreHookEvidence?: (seat: { seatNodeId: string; sessionName: string }, runtime: string) => ActivityEvidence | null;
 }
 
 export interface PollSeatOptions {
@@ -69,6 +73,8 @@ export class SeatActivityService {
 
   private readonly selfReportReader: ((sessionName: string, seatNodeId: string) => ActivityEvidence | null) | null;
 
+  private readonly restoreHookEvidence: SeatActivityServiceDeps["restoreHookEvidence"] | null;
+
   constructor(deps: SeatActivityServiceDeps) {
     this.permissionPromptReader = deps.permissionPromptReader;
     this.permissionPromptChanged = deps.permissionPromptChanged;
@@ -77,6 +83,7 @@ export class SeatActivityService {
     this.eventBus = deps.eventBus ?? null;
     this.now = deps.now ?? (() => new Date());
     this.selfReportReader = deps.selfReportReader ?? null;
+    this.restoreHookEvidence = deps.restoreHookEvidence ?? null;
   }
 
   /**
@@ -97,12 +104,14 @@ export class SeatActivityService {
     return this.observeSeat(paneId, opts, null);
   }
 
-  /** pollSeat with the sweep's batched read: the seat's timestamp comes from `batch` when it has one, and
-   *  only a seat missing from it is read per target, so a sweep costs one tmux spawn instead of one per seat. */
+  /** pollSeat with the sweep's batched read: the seat's timestamp comes from `batch` when it has one, so a sweep costs
+   *  one tmux spawn instead of one per seat. A seat missing from a batch that was read is not asked about by target:
+   *  its session is gone, or its value is the same malformed one a per-target read returns, and tmux 3.2a (Ubuntu
+   *  22.04's) exits its whole server when asked about a vanished target. Only with no batch is each seat read per target. */
   private async observeSeat(paneId: string, opts: PollSeatOptions | undefined, batch: Map<string, number> | null): Promise<SeatActivity | null> {
     const silenceWindowSeconds = opts?.silenceWindowSeconds ?? this.defaultWindowSeconds;
     let lastActivityEpochSeconds: number | null = batch?.get(paneId) ?? null;
-    if (lastActivityEpochSeconds === null) {
+    if (lastActivityEpochSeconds === null && batch === null) {
       try {
         lastActivityEpochSeconds = await this.tmux.readPaneLastActivity(paneId);
       } catch {
@@ -286,11 +295,12 @@ export class SeatActivityService {
         const communityHarnessChanged = !!known && (known.inventory === COMMUNITY_HARNESS_RUNG_INVENTORY) !== (inventory === COMMUNITY_HARNESS_RUNG_INVENTORY);
         if (!known || known.inventory === null || known.sessionName !== r.session_name || communityHarnessChanged) {
           this.declareRungInventory({ seatNodeId: r.node_id, sessionName: r.session_name }, inventory);
+          this.restoreDurableHook({ seatNodeId: r.node_id, sessionName: r.session_name }, inventory);
         }
       }
 
-      // One tmux call reads every session's window activity for this tick; a seat missing from it (or no
-      // batch at all) falls back to its own read, exactly as before.
+      // One tmux call reads every session's window activity for this tick; only with no batch at all does each seat
+      // fall back to its own read, as before.
       let batch: Map<string, number> | null = null;
       if (tmuxRows.length > 0 && this.tmux.readAllSessionWindowActivity) {
         try { batch = await this.tmux.readAllSessionWindowActivity(); } catch { batch = null; }
@@ -369,6 +379,10 @@ export class SeatActivityService {
     this.sessionToSeat.set(evidence.sessionName, evidence.seatNodeId);
     const prior = seat.sources.get(evidence.sourceId);
     if (prior && evidence.seq <= prior.latest.seq) return; // stale/reordered — dropped
+    // A durable source's posts can arrive out of their own order: an older boundary arriving later is dropped.
+    if (prior && this.durableBoundaries(seat, evidence.rung)
+        && hookPrecedes({ eventAt: evidence.observedAt, sourceSequence: evidence.sourceSequence },
+          { eventAt: prior.latest.observedAt, sourceSequence: prior.latest.sourceSequence })) return;
     const runtime = seat.inventory?.runtime ?? "codex";
     const claude = runtime === "claude-code";
     const wasConfirmed = seat.arbitrated.needsInput.count > 0;
@@ -591,10 +605,36 @@ export class SeatActivityService {
       if (!evd || evd.activity === undefined) continue;
       // A positive-only rung answers only "working"; its silence leaves the state to the rungs below, or unknown.
       if (trust === "positive-only" && evd.activity !== "working") continue;
-      if (rung === "lifecycle-hooks" && nowMs - Date.parse(evd.observedAt) > HOOK_AUTHORITY_WINDOW_MS) continue;
+      // A durable rung's idle or attention boundary holds; a bare working boundary still expires, then falls to the
+      // rungs below, so a turn whose end was lost can't read working forever.
+      if (rung === "lifecycle-hooks" && !(this.durableBoundaries(seat, rung) && (evd.activity !== "working"
+          || (this.latestByRung(seat, rung)?.needsInput?.count ?? 0) > 0))
+          && nowMs - Date.parse(evd.observedAt) > HOOK_AUTHORITY_WINDOW_MS) continue;
+      // An idle boundary whose source promised to keep reporting holds for two reports. A source that goes quiet (a runner
+      // killed or out of memory) stops reading idle, but only when nothing is waiting on a person: attention holds.
+      if (rung === "lifecycle-hooks" && evd.activity === "idle-at-prompt" && evd.livenessSeconds
+          && (this.latestByRung(seat, rung)?.needsInput?.count ?? 0) === 0
+          && nowMs - Date.parse(evd.observedAt) > 2 * 1000 * evd.livenessSeconds) continue;
       return evd;
     }
     return null;
+  }
+
+  /** A runner seat declared with no hook evidence (after a daemon restart) takes its last recorded hook, so an idle seat
+   *  that posts nothing still reads idle. Its seq is 0: any live hook outranks it. */
+  private restoreDurableHook(seat: { seatNodeId: string; sessionName: string }, inventory: AdapterRungInventory): void {
+    if (!this.restoreHookEvidence || !inventory.rungs.some((r) => r.rung === "lifecycle-hooks" && r.durableBoundaries)) return;
+    const ladder = this.ladder.get(seat.seatNodeId);
+    if (!ladder || this.latestByRung(ladder, "lifecycle-hooks")) return;
+    let evidence: ActivityEvidence | null = null;
+    try { evidence = this.restoreHookEvidence(seat, inventory.runtime); } catch { evidence = null; }
+    if (evidence && evidence.seatNodeId === seat.seatNodeId && evidence.sessionName === seat.sessionName
+        && evidence.rung === "lifecycle-hooks") this.reportEvidence({ ...evidence, seq: 0 });
+  }
+
+  /** Whether the seat's declared inventory says this rung's last boundary holds until the next one. */
+  private durableBoundaries(seat: SeatLadderState, rung: EvidenceRungId): boolean {
+    return seat.inventory?.rungs.some((r) => r.rung === rung && r.durableBoundaries === true) ?? false;
   }
 
   private emitRungHealth(

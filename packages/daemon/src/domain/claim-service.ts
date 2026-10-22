@@ -1,3 +1,5 @@
+import { shellQuote } from "../adapters/shell-quote.js";
+import { resumeTypeForRuntime, validateResumeToken } from "./resume-token-validation.js";
 import { OutboxHandler } from "./outbox-handler.js";
 import type Database from "better-sqlite3";
 import type { RigRepository } from "./rig-repository.js";
@@ -8,7 +10,7 @@ import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { startTmuxTranscriptCapture } from "./transcript-capture.js";
 import { deriveResumeToken, type ResumeTokenCaptureDeps } from "./resume-token-capture.js";
-import { verifyClaudePaneRuntime, verifyCodexPaneProcess, type NativeProcessLister } from "./native-process-lineage.js";
+import { verifyClaudePaneRuntime, verifyCodexPaneProcess, witnessedClaudeVersionLabel, type NativeProcessLister } from "./native-process-lineage.js";
 import {
   observeSolePane,
   paneObservationVerdict,
@@ -20,6 +22,18 @@ import { DeliveryGuardError } from "./seat-delivery-guard.js";
 export type ClaimResult =
   | { ok: true; nodeId: string; sessionId: string }
   | { ok: false; code: string; error: string };
+
+export interface AdoptionCaptureOutcome {
+  outcome: "captured" | "preserved" | "skipped" | "exempt" | "noop" | "error";
+  reason?: string;
+}
+
+export interface ReconcileResumeMetadata {
+  capture: AdoptionCaptureOutcome;
+  /** Recorded metadata is not proof of conversation continuity or resumability. */
+  status: "recorded" | "missing" | "unknown" | "not_applicable";
+  guidance?: string;
+}
 
 /**
  * OPR.0.3.4.3 — outcome of the no-launch reconcile (adopt a hand-resumed
@@ -40,6 +54,8 @@ export interface ReconcileSessionResult {
   projectionDrift: string[];
   /** Provider-session conversation continuity is never verified by reconcile. */
   continuity: "unverified";
+  /** Absent for the binding-only missing-pane repair, which does not capture. */
+  resumeMetadata?: ReconcileResumeMetadata;
 }
 
 export interface MissingPaneRepairResult extends ReconcileSessionResult {
@@ -81,7 +97,7 @@ interface ClaimServiceDeps {
   };
   /** #421 — start time of the pane's current Claude process; a sidecar sampled earlier is skipped. */
   claudeProcessStartedAt?: ResumeTokenCaptureDeps["claudeProcessStartedAt"];
-  /** Process census for the runtime proof in `reconcileSession`; defaults to the live process table. */
+  /** Process census for the runtime proof in `reconcileSession` and #86's native version-label witness; defaults to the live process table. */
   listProcesses?: NativeProcessLister;
   resumeTokenCapturer?: {
     captureCodexThreadId(sessionName: string): Promise<string | undefined>;
@@ -213,7 +229,7 @@ export class ClaimService {
     if (guard) await guard.operation(tmuxSession, write, async target => {
       new OutboxHandler(this.db).retain({ outboxId: `guard-claim-${target.nodeId}-${target.occupant ?? "unknown"}`,
         senderSession: "claim@system", destinationSession: tmuxSession, body: hint }, target);
-    });
+    }, { source: "openrig", urgent: false });
     else await write();
   }
 
@@ -247,7 +263,7 @@ export class ClaimService {
    */
   private async captureResumeTokenOnAdoption(input: {
     rigId: string; nodeId: string; sessionId: string; sessionName: string; runtime: string | null;
-  }): Promise<void> {
+  }): Promise<AdoptionCaptureOutcome> {
     try {
       // Derivation is the shared PURE helper (OPR.0.4.3.04 B2 — reused by the
       // seat-handover discovered-mode capture); persistence + events stay here so
@@ -256,11 +272,12 @@ export class ClaimService {
         { runtime: input.runtime, sessionName: input.sessionName },
         { contextUsageStore: this.contextUsageStore, claudeProcessStartedAt: this.claudeProcessStartedAt, resumeTokenCapturer: this.resumeTokenCapturer, piRunnerStateStore: this.piRunnerStateStore, ompRunnerStateStore: this.ompRunnerStateStore },
       );
-      if (derived.outcome === "exempt" || derived.outcome === "noop") return;
+      if (derived.outcome === "exempt" || derived.outcome === "noop") return { outcome: derived.outcome };
       const runtime = input.runtime as string; // non-null past exempt
       if (derived.outcome === "skipped") {
         this.emitCaptureSkip(input, runtime, derived.reason);
-        return;
+        // The legacy capture reason also covers an absent result before a deadline.
+        return { outcome: "skipped", reason: derived.reason === "probe_timeout" ? "not_obtained" : derived.reason };
       }
       const validation = { resumeType: derived.resumeType, token: derived.token };
 
@@ -283,8 +300,10 @@ export class ClaimService {
               runtime, outcome: "preserved", resumeType: validation.resumeType, reason: "higher_rank_present", redacted: true,
             });
       } catch { /* best-effort */ }
+      return { outcome: wrote ? "captured" : "preserved" };
     } catch {
-      // best-effort — capture never fails or blocks the adoption (PRD Rule 7)
+      // No exception text or native token crosses the result boundary.
+      return { outcome: "error", reason: "capture_failed" };
     }
   }
 
@@ -527,11 +546,10 @@ export class ClaimService {
     const projectionDrift: string[] = [];
     const paneObservation = await this.observeBindingPane(sessionName);
     if (!paneObservation.ok) projectionDrift.push(paneObservation.detail);
+    const paneTarget = paneObservation.ok ? paneObservation.pane : sessionName;
     let paneCommand: string | null = null;
     try {
-      paneCommand = await this.tmuxAdapter.getPaneCommand(
-        paneObservation.ok ? paneObservation.pane : sessionName,
-      );
+      paneCommand = await this.tmuxAdapter.getPaneCommand(paneTarget);
     } catch { paneCommand = null; }
     if (nodeRow.runtime) {
       const expectation: Record<string, string[]> = {
@@ -543,7 +561,10 @@ export class ClaimService {
       if (!paneCommand) {
         projectionDrift.push(`runtime unverified: pane command unreadable; node declares runtime "${nodeRow.runtime}"`);
       } else if (expected && expected.length > 0 && !expected.includes(paneCommand)
-        && !await this.runtimeProvenInPane(nodeRow.runtime, paneObservation.ok ? paneObservation.pane : sessionName)) {
+        // #86: a native install's version label confirms claude-code only with its OS executable witness.
+        && !(nodeRow.runtime === "claude-code" && await witnessedClaudeVersionLabel(paneCommand,
+          { target: paneTarget, tmux: this.tmuxAdapter, listProcesses: this.listProcesses }))
+        && !await this.runtimeProvenInPane(nodeRow.runtime, paneTarget)) {
         // A script-launched runtime reads as its launcher (`sh`); only a pane whose process tree shows no such runtime is drift.
         projectionDrift.push(`runtime unverified: pane command "${paneCommand}" does not confirm runtime "${nodeRow.runtime}"`);
       }
@@ -600,10 +621,25 @@ export class ClaimService {
       // Pure reads only (sidecar file / pid-keyed log) — consistent with the
       // no-launch/no-input contract above; does NOT touch `continuity`
       // (FR-3 captures a token, it does not assert conversation continuity).
-      await this.captureResumeTokenOnAdoption({
+      const capture = await this.captureResumeTokenOnAdoption({
         rigId: nodeRow.rig_id, nodeId: nodeRow.id, sessionId, sessionName,
         runtime: nodeRow.runtime,
       });
+      const expectedType = resumeTypeForRuntime(nodeRow.runtime);
+      let status: ReconcileResumeMetadata["status"] = expectedType ? "unknown" : "not_applicable";
+      if (expectedType) {
+        try {
+          const row = this.db.prepare("SELECT resume_type, resume_token FROM sessions WHERE id=?").get(sessionId) as
+            { resume_type: string | null; resume_token: string | null } | undefined;
+          status = row?.resume_type === expectedType && validateResumeToken(nodeRow.runtime, row.resume_token).ok ? "recorded" : "missing";
+        } catch { /* Reporting cannot turn an already committed binding into failure. */ }
+      }
+      const resumeMetadata: ReconcileResumeMetadata = { capture, status };
+      if (status === "missing" || status === "unknown") {
+        resumeMetadata.guidance = `The seat is bound, but future resume metadata is ${status === "missing" ? "missing" : "unconfirmed"}. ` +
+          `After confirming the live conversation identity, pipe its verified token to rig seat set-resume-token ${shellQuote(sessionName)} --token-stdin --reason "verified live conversation". ` +
+          "The token must come from stdin, never a command argument. No prior token was copied.";
+      }
 
       return {
         ok: true,
@@ -616,6 +652,7 @@ export class ClaimService {
           sessionId,
           projectionDrift,
           continuity: "unverified",
+          resumeMetadata,
         },
       };
     } catch (err) {

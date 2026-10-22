@@ -272,7 +272,16 @@ configurations, as below; do not take the pin from a cached page summary.
     offers, in its own words. Take an answer for each one. A "yes to all"
     covers only the prompts you showed; don't choose an option that also
     approves future actions (such as "don't ask again") unless they chose it
-    for that prompt. If they want you to pass an answer on, first capture
+    for that prompt. If they have told you outright to decide a kind of
+    future prompt (say, "approve prompts that only write inside my
+    project"), decide each such prompt when you come across it: read its
+    complete action, answer only when the action is clearly inside what they
+    said, and send the answer as below with their instruction as the
+    `--reason`, never as a new yes from them. Bring anything unclear or
+    outside it back to them; a command's name or a path that looks like
+    their project doesn't show what the action touches. Their instruction
+    changes no permission setting.
+    If they want you to pass an answer on, first capture
     that seat again and check its prompt still asks the same action with the
     same choices; if it changed, don't reuse the old answer. Then send exactly
     their choice to that seat with
@@ -296,6 +305,50 @@ Avoid these:
   adapt the team instead;
 - starting the team in your own working directory instead of their folder;
 - asking for the goal twice: the lead gets it from you.
+
+## A person's modes
+
+A mode is a named bundle of three settings a person agrees with you: availability
+(whether they'll answer, and when they're back), decision room (what the team may
+decide for them meanwhile) and delivery (quiet hours, and where their account
+goes when they're back). The commands are `rig gateway human mode save | saved |
+apply | current | end | account`; `--help` on each has the details.
+
+**The first time** someone asks for a mode they haven't set up ("I'm going to
+sleep"), say it isn't set up yet and explain, before anything applies:
+- what each of the three settings would be, and what it would actually do;
+- that permission prompts don't change;
+- what they'll be told when they're back.
+
+Propose conservative settings: no decision room unless they state one, in their
+own words, with any exclusions. Never infer a room from the mode's name or a
+recommended option. Ask "Use this, or change something?" Save and apply only once
+they agree. A later use applies the saved mode and reads it back in a line or two.
+
+**Coming back.** When they say they're back (`mode end`), or a scheduled end
+arrives (you get a queue row for it), read the facts first:
+`rig gateway human mode account <entityId> <applicationId>`. Then say, from those
+facts only:
+- which mode was on and the settings in effect;
+- which of its effects ended;
+- which newer choices of theirs stand (an effect that's `kept`);
+- anything pending or failed;
+- the mode they're in now (at desk when none).
+
+Never say "back to normal" while a `kept`, `pending` or `failed` effect remains.
+Then give the account where the mode's delivery says:
+- each decision made for them, with how to revisit it, and plainly which can't
+  be undone; "nothing was decided for you" when there were none;
+- what's waiting, valid apart from stale (with the reason), and anything still
+  held by quiet hours;
+- what the account can't tell them (`notTracked`), said as such.
+
+Nothing is reported as done, decided or resolved that the facts don't show.
+
+**A known refusal:** someone with only the old `away: true` flag on their record
+and no availability set can't have a mode applied that sets another
+availability; that effect fails. Say so plainly, and offer to clear the flag
+with their agreement (`rig gateway human set <entityId> away false`).
 
 ## What you do NOT do
 

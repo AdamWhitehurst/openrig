@@ -4,11 +4,13 @@ import path from "node:path";
 import type Database from "better-sqlite3";
 import { publicSeatEnvironment } from "./seat-launch-environment.js";
 import { SEAT_ENV_KEYS_VAR, parseStoredSeatEnv, validateSeatEnvName } from "./seat-env.js";
-import { CLAUDE_PLUGIN_DIRS_ENV, SEAT_PROJECT_DIR_ENV, seatCorePluginDir } from "./claude-core-plugin-env.js";
+import { CLAUDE_PLUGIN_DIRS_ENV, SEAT_NODE_ENV, SEAT_PROJECT_DIR_ENV, seatCorePluginDir } from "./claude-core-plugin-env.js";
+import { seatSkillPluginDirForNode } from "./seat-skill-storage.js";
 import { shellQuote } from "../adapters/shell-quote.js";
 import { claudeClassicRendererEnvPrefix } from "../adapters/yolo-mode.js";
 import { parseClaudePermissionModes } from "./permission-drift.js";
 import { validateNativePermissionSelection } from "./native-permission-selection.js";
+import { seatLaunchAdditionsForLaunch } from "./seat-launch-additions.js";
 
 export interface ClaudeLaunchTarget {
   nodeId: string;
@@ -89,7 +91,9 @@ export class ClaudeManagedLaunch {
     } catch { /* A database from before seat env has no columns to read. */ }
     // A seat that selected the shipped openrig-core plugin has the plugin variable in its pane (the launch, or a
     // handover's respawned pane, put it there). The session's own name list can predate that, so name it here too.
-    if (seatCorePluginDir({ id: nodeId, runtime: "claude-code" }, this.db, undefined, this.pluginsDir)) keys.add(CLAUDE_PLUGIN_DIRS_ENV);
+    if (seatCorePluginDir({ id: nodeId, runtime: "claude-code" }, this.db, undefined, this.pluginsDir)
+      || seatSkillPluginDirForNode(this.db, nodeId)
+      || (seatLaunchAdditionsForLaunch(this.db, nodeId).additions?.pluginDirs.length ?? 0) > 0) keys.add(CLAUDE_PLUGIN_DIRS_ENV);
     if (session && this.readSessionEnv) {
       // A one-off name is a convenience on top of the declared ones. If tmux can't be read, the
       // launch proceeds as it would for a seat with no one-off names.
@@ -213,7 +217,8 @@ export class ClaudeManagedLaunch {
     // A seat that loads the openrig-core plugin has its launch project in its pane (OPENRIG_SEAT_PROJECT_DIR): the plugin's
     // hooks use it to tell the seat from a Claude started elsewhere inside it. Forwarded by name; the pane supplies the value.
     const loadsCorePlugin = seatCorePluginDir({ id: target.nodeId, runtime: "claude-code" }, this.db, undefined, this.pluginsDir) !== undefined;
-    const projectForwarded = loadsCorePlugin ? [`\${${SEAT_PROJECT_DIR_ENV}+"${SEAT_PROJECT_DIR_ENV}=$${SEAT_PROJECT_DIR_ENV}"}`] : [];
+    const projectForwarded = loadsCorePlugin ? [SEAT_PROJECT_DIR_ENV, SEAT_NODE_ENV]
+      .map(key => `\${${key}+"${key}=$${key}"}`) : [];
     // Expand in the target pane shell, whose terminal can differ from the daemon.
     // Empty and absent values remain absent after env -i. TERM_PROGRAM is how Claude tells it runs
     // inside tmux; without it Claude never asks tmux for extended keys, and Shift+Enter reaches it

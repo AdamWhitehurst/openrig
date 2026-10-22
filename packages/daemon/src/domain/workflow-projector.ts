@@ -64,10 +64,9 @@ const WORKFLOW_CONTEXT_SHORTCUT =
 export function renderWorkflowProjectCommand(input: {
   instanceId: string;
   packetId: string;
-  ownerSession: string;
   step?: Pick<WorkflowStepSpec, "acceptance">;
 }): string {
-  const base = `rig workflow project --instance ${input.instanceId} --current-packet ${input.packetId} --exit <handoff|waiting|done|failed> --actor-session ${input.ownerSession}`;
+  const base = `rig workflow project --instance ${input.instanceId} --current-packet ${input.packetId} --exit <handoff|waiting|done|failed>`;
   const acceptance = input.step?.acceptance;
   if (!acceptance) return base;
   const verdict = acceptance.verdicts.length === 1
@@ -169,8 +168,10 @@ export interface ProjectStepInput {
   blockedOn?: string;
   /** Operator-supplied evidence for the closure record (audit). */
   closureEvidence?: Record<string, unknown>;
-  /** Session that closed the packet (owner-as-author). */
+  /** The agent that projected the step: the caller, derived from its transport identity when it has one. */
   actorSession: string;
+  /** How actorSession was known (the P21 era-stamp), recorded on the queue rows this projection writes. */
+  identityProvenance?: string | null;
   /**
    * Optional explicit override for the next-step destination session.
    * When omitted, the projector resolves from the next step's
@@ -202,6 +203,8 @@ export interface ProjectStepResult {
    * what this result reflects.
    */
   absorbedReplay?: boolean;
+  /** Non-fatal notices for the caller, such as projecting a packet another seat owns. */
+  advisories?: string[];
 }
 
 export class WorkflowProjector {
@@ -527,6 +530,7 @@ export class WorkflowProjector {
       const queueUpdate = this.queueRepo.updateWithinTransaction({
         qitemId: input.currentPacketId,
         actorSession: input.actorSession,
+        identityProvenance: input.identityProvenance ?? null,
         viaWorkflowVerb: true,
         state: closure.state,
         closureReason: closure.closureReason,
@@ -606,6 +610,7 @@ export class WorkflowProjector {
         createdNext = this.queueRepo.createWithinTransaction({
           qitemId: nextPacketId,
           sourceSession: input.actorSession,
+          identityProvenance: input.identityProvenance ?? null,
           destinationSession: resolvedNextOwner,
           body: workflowHandoffBody({
             library: this.guidanceLibrary,
@@ -644,7 +649,7 @@ export class WorkflowProjector {
           createdNext.qitemId,
           input.actorSession,
           createdNext.destinationSession,
-          null,
+          input.identityProvenance ?? null,
           createdNext.nudge,
         );
         // OPR.0.4.6.WF2 FR-5 (guard blocker 1): a HUMAN gate packet PARKS
@@ -656,6 +661,7 @@ export class WorkflowProjector {
           const parked = this.queueRepo.updateWithinTransaction({
             qitemId: createdNext.qitemId,
             actorSession: input.actorSession,
+            identityProvenance: input.identityProvenance ?? null,
             state: "blocked",
             closureReason: "blocked_on",
             closureTarget: gateCompile.parkOn,
@@ -951,6 +957,7 @@ export class WorkflowProjector {
     const createExceptionItem = (destination: string, tier: string) =>
       this.queueRepo.createWithinTransaction({
         sourceSession: input.actorSession,
+        identityProvenance: input.identityProvenance ?? null,
         destinationSession: destination,
         body: itemBody,
         priority: "urgent",
@@ -975,7 +982,7 @@ export class WorkflowProjector {
     }
     registerEvent(createdException.persistedEvent);
     this.queueRepo.stageWakeIntent(createdException.qitemId, input.actorSession,
-      createdException.destinationSession, null, createdException.nudge);
+      createdException.destinationSession, input.identityProvenance ?? null, createdException.nudge);
     return { qitemId: createdException.qitemId, destinationSession: createdException.destinationSession, nudge: createdException.nudge };
   }
 
@@ -1104,6 +1111,7 @@ export class WorkflowProjector {
       const updated = this.queueRepo.updateWithinTransaction({
         qitemId: input.currentPacketId,
         actorSession: input.actorSession,
+        identityProvenance: input.identityProvenance ?? null,
         viaWorkflowVerb: true,
         state: closure.state,
         closureReason: closure.closureReason,
@@ -1146,6 +1154,7 @@ export class WorkflowProjector {
         const created = this.queueRepo.createWithinTransaction({
           qitemId: plan.packetId,
           sourceSession: input.actorSession,
+          identityProvenance: input.identityProvenance ?? null,
           destinationSession: plan.owner,
           body: workflowHandoffBody({
             library: this.guidanceLibrary,
@@ -1167,11 +1176,12 @@ export class WorkflowProjector {
           chainOfRecord: [input.currentPacketId],
         });
         addEvent(created.persistedEvent);
-        this.queueRepo.stageWakeIntent(created.qitemId, input.actorSession, created.destinationSession, null, created.nudge);
+        this.queueRepo.stageWakeIntent(created.qitemId, input.actorSession, created.destinationSession, input.identityProvenance ?? null, created.nudge);
         if (plan.gate?.parkOn) {
           const parked = this.queueRepo.updateWithinTransaction({
             qitemId: created.qitemId,
             actorSession: input.actorSession,
+            identityProvenance: input.identityProvenance ?? null,
             state: "blocked",
             closureReason: "blocked_on",
             closureTarget: plan.gate.parkOn,
@@ -1560,8 +1570,9 @@ export function reconcileExplicitOwnerHarness(
  * queue closure shape (state + closure_reason + closure_target +
  * handed_off_to / blocked_on metadata). Phase A's hot-potato closure
  * validation enforces the rules:
- *   - state=done requires closure_reason from CLOSURE_REASONS
- *   - handed_off_to / blocked_on / escalation also require closure_target
+ *   - state=done requires closure_reason from DONE_CLOSURE_REASONS
+ *   - handed_off_to / escalation also require closure_target
+ *   - blocked_on records an active state=blocked park, never a done closure
  *
  * Mappings:
  *   handoff → state=handed-off, closure_reason=handed_off_to,

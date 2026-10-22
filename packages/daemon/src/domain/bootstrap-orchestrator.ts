@@ -31,6 +31,7 @@ import { bundleInstallContext, bundleInstallContextLines, isExistingBundleTarget
 import { confirmStoppedGenerations } from "./running-name-guard.js";
 import { inspectBundleBehaviour } from "./bundle-behaviour-inspect.js";
 import { getDaemonVersion } from "./daemon-version.js";
+import { rigNameComposeProjectConflict, withRigName } from "./rig-name-override.js";
 
 /** Bootstrap mode */
 export type BootstrapMode = "plan" | "apply";
@@ -43,6 +44,8 @@ export interface BootstrapOptions {
   cwdOverride?: string;
   /** One-off launch env from `rig up --env`; used for this launch only and not saved. */
   envOverride?: SeatEnv;
+  /** Rig name from `rig up --name`; replaces the spec's `name:` for this rig, which keeps it from then on. */
+  rigName?: string;
   autoApprove?: boolean;
   nonInterruptive?: boolean;
   approvedActionKeys?: string[];
@@ -182,13 +185,16 @@ export class BootstrapOrchestrator {
         let podBundleTempDir: string | null = null;
         try {
           const podSource = await this.deps.podBundleSourceResolver.resolve(sourceRef);
-          const rawYaml = this.deps.fsOps.readFile(podSource.specPath);
-          specDir = nodePath.dirname(podSource.specPath);
-          let installRoot: string | undefined;
           podBundleTempDir = podSource.tempDir;
-          stages.push({ stage: "resolve_spec", status: "ok", detail: { specName: podSource.manifest.name, source: "pod_bundle" } });
-
           try {
+            const sourceYaml = this.deps.fsOps.readFile(podSource.specPath);
+            const sharedProject = rigNameComposeProjectConflict(sourceYaml, opts.rigName);
+            if (sharedProject) return this.refuseRigName(run, stages, warnings, sharedProject);
+            const rawYaml = withRigName(sourceYaml, opts.rigName);
+            specDir = nodePath.dirname(podSource.specPath);
+            let installRoot: string | undefined;
+            stages.push({ stage: "resolve_spec", status: "ok", detail: { specName: podSource.manifest.name, source: "pod_bundle" } });
+
             const parsedSpec = parsePodBundleManifest(rawYaml) as Record<string, unknown>;
             const serviceBundleTarget = Boolean(opts.targetRoot && parsedSpec?.services && typeof parsedSpec.services === "object"
               && new SettingsStore().resolveOne("bundle.services_enabled").value === true);
@@ -289,7 +295,7 @@ export class BootstrapOrchestrator {
         bundleSource = await this.deps.bundleSourceResolver.resolve(sourceRef);
         bundleTempDir = bundleSource.tempDir;
         specDir = nodePath.dirname(bundleSource.specPath);
-        const rawYaml = this.deps.fsOps.readFile(bundleSource.specPath);
+        const rawYaml = withRigName(this.deps.fsOps.readFile(bundleSource.specPath), opts.rigName);
         const raw = RigSpecCodec.parse(rawYaml);
         const validation = RigSpecSchema.validate(raw);
         if (!validation.valid) {
@@ -310,7 +316,10 @@ export class BootstrapOrchestrator {
       // Direct rig_spec path — detect format BEFORE legacy validation
       try {
         specDir = nodePath.dirname(nodePath.resolve(sourceRef));
-        const rawYaml = this.deps.fsOps.readFile(nodePath.resolve(sourceRef));
+        const sourceYaml = this.deps.fsOps.readFile(nodePath.resolve(sourceRef));
+        const sharedProject = rigNameComposeProjectConflict(sourceYaml, opts.rigName);
+        if (sharedProject) return this.refuseRigName(run, stages, warnings, sharedProject);
+        const rawYaml = withRigName(sourceYaml, opts.rigName);
         const raw = RigSpecCodec.parse(rawYaml) as Record<string, unknown> | null;
 
         // Pod-aware format detection: if has pods[], delegate to PodRigInstantiator
@@ -640,12 +649,7 @@ export class BootstrapOrchestrator {
     const instantiateOutcome = await this.deps.rigInstantiator.instantiate(spec, { nonInterruptive, ...(opts.envOverride ? { env: opts.envOverride } : {}) });
     if ((instantiateOutcome.ok || "rigId" in instantiateOutcome) && (nonInterruptive || opts.nonInterruptive === false)) warnings.push(nonInterruptiveSummary(nonInterruptive));
 
-    const envCleanupErrors = instantiateOutcome.ok ? instantiateOutcome.result.envCleanupErrors
-      : instantiateOutcome.code === "instantiate_error" ? instantiateOutcome.envCleanupErrors : undefined;
-    const cleanupFailed = Boolean(envCleanupErrors?.length);
-    if (envCleanupErrors) errors.push(...envCleanupErrors);
-
-    this.deps.bootstrapRepo.journalAction(run.id, seqCounter++, "rig_import", null, spec.name, instantiateOutcome.ok && !cleanupFailed ? "completed" : "failed", {
+    this.deps.bootstrapRepo.journalAction(run.id, seqCounter++, "rig_import", null, spec.name, instantiateOutcome.ok ? "completed" : "failed", {
       detailJson: JSON.stringify(instantiateOutcome),
     });
 
@@ -654,16 +658,16 @@ export class BootstrapOrchestrator {
       stages.push({ stage: "import_rig", status: "failed", detail: instantiateOutcome });
       const finalStatus: BootstrapStatus = hasExecFailures || packageInstallFailed ? "partial" : "failed";
       this.deps.bootstrapRepo.updateRunStatus(run.id, finalStatus);
-      return { runId: run.id, status: finalStatus, stages, errors, warnings, ...(cleanupFailed ? { code: "seat_env_cleanup_failed" as const } : {}) };
+      return { runId: run.id, status: finalStatus, stages, errors, warnings };
     }
 
-    stages.push({ stage: "import_rig", status: cleanupFailed ? "failed" : "ok", detail: instantiateOutcome.result });
+    stages.push({ stage: "import_rig", status: "ok", detail: instantiateOutcome.result });
     if (instantiateOutcome.result.warnings?.length) {
       warnings.push(...instantiateOutcome.result.warnings);
     }
 
     // --- DONE ---
-    const finalStatus: BootstrapStatus = hasExecFailures || packageInstallFailed || cleanupFailed ? "partial" : "completed";
+    const finalStatus: BootstrapStatus = hasExecFailures || packageInstallFailed ? "partial" : "completed";
     this.deps.bootstrapRepo.updateRunStatus(run.id, finalStatus, { rigId: instantiateOutcome.result.rigId });
 
     return {
@@ -671,13 +675,18 @@ export class BootstrapOrchestrator {
       status: finalStatus,
       stages,
       rigId: instantiateOutcome.result.rigId,
-      ...(cleanupFailed ? { code: "seat_env_cleanup_failed" as const } : {}),
       errors,
       warnings,
     };
   }
 
   // -- Pod-aware bootstrap path --
+
+  private refuseRigName(run: { id: string }, stages: BootstrapStageResult[], warnings: string[], message: string): BootstrapResult {
+    stages.push({ stage: "resolve_spec", status: "failed", detail: { code: "rig_name_compose_project", error: message } });
+    this.deps.bootstrapRepo.updateRunStatus(run.id, "failed");
+    return { runId: run.id, status: "failed", stages, errors: [message], warnings };
+  }
 
   private async handlePodAwareSpec(
     opts: BootstrapOptions,
@@ -812,13 +821,10 @@ export class BootstrapOrchestrator {
       const outWarnings = (outcome as { warnings?: string[] }).warnings ?? [];
       stages.push({ stage: "import_rig", status: "failed", detail: { code: outcome.code } });
       this.deps.bootstrapRepo.updateRunStatus(run.id, "failed");
-      return withRouting({ runId: run.id, status: "failed", stages, errors: outErrors, warnings: [...warnings, ...outWarnings],
-        ...(outcome.code === "instantiate_error" && outcome.envCleanupErrors?.length ? { code: "seat_env_cleanup_failed" as const } : {}),
-      });
+      return withRouting({ runId: run.id, status: "failed", stages, errors: outErrors, warnings: [...warnings, ...outWarnings] });
     }
 
     const result = outcome.result;
-    const cleanupFailed = Boolean(result.envCleanupErrors?.length);
     const anyFailed = result.nodes.some((n) => n.status === "failed");
     const anyAttention = result.nodes.some((n) => n.status === "attention_required");
 
@@ -873,7 +879,6 @@ export class BootstrapOrchestrator {
       status: finalStatus,
       stages,
       rigId: result.rigId,
-      ...(cleanupFailed ? { code: "seat_env_cleanup_failed" as const } : {}),
       errors: result.nodes.filter((n) => n.error).map((n) => n.error!),
       warnings,
     });

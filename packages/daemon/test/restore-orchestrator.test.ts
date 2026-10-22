@@ -3534,6 +3534,51 @@ describe("RestoreOrchestrator", () => {
     expect(result.result.warnings.some((w) => w.includes("stale-skill") || w.includes(missingEntry))).toBe(true);
   });
 
+  it("a missing required startup file holds only its own seat; the rest of the rig restores", async () => {
+    const tmux = mockTmux();
+    const snap = seedRigAndSnapshot({
+      nodes: [
+        { logicalId: "agent-a", role: "worker", runtime: "claude-code" },
+        { logicalId: "agent-b", role: "worker", runtime: "claude-code" },
+      ],
+      resumeType: "none",
+      edges: [],
+    });
+    const nodeA = snap.data.nodes.find((n) => n.logicalId === "agent-a")!;
+    const missingPath = "/tmp/openrig-missing-required-startup-agent-a.md";
+    const snapshot = updateSnapshotData(snap, (data) => {
+      data.nodeStartupContext[nodeA.id] = {
+        projectionEntries: [],
+        resolvedStartupFiles: [{
+          path: "startup.md", absolutePath: missingPath, ownerRoot: "/tmp",
+          deliveryHint: "guidance_merge", required: true, appliesOn: ["restore"],
+        }],
+        startupActions: [],
+        runtime: "claude-code",
+      };
+    });
+
+    const result = await createOrchestrator({ tmux }).restore(snapshot.id, {
+      fsOps: { exists: (p) => p !== missingPath },
+      freshLogicalIds: ["agent-a", "agent-b"],
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.result.rigResult).toBe("partially_restored");
+    const a = result.result.nodes.find((n) => n.logicalId === "agent-a")!;
+    const b = result.result.nodes.find((n) => n.logicalId === "agent-b")!;
+    expect(a.status).toBe("failed");
+    expect(a.error).toContain("Not launched");
+    expect(a.error).toContain(missingPath);
+    expect(a.error).toContain("Restore the missing startup file");
+    expect(b.status).not.toBe("failed");
+    // The held seat never got a session; the other seat did.
+    const created = vi.mocked(tmux.createSession).mock.calls.map((call) => String(call[0]));
+    expect(created.some((name) => name.includes("agent-a"))).toBe(false);
+    expect(created.some((name) => name.includes("agent-b"))).toBe(true);
+  });
+
   it("OPR.0.3.4.5 (09): missing REQUIRED startup file STILL fails (preserve the genuinely-fatal blocker)", async () => {
     const snap = seedRigAndSnapshot({
       nodes: [{ logicalId: "agent-a", role: "worker", runtime: "claude-code" }],
@@ -4535,6 +4580,46 @@ describe("RestoreOrchestrator", () => {
       const allSent = (tmux.sendText as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[1] ?? ""));
       expect(allSent.every((s) => !s.includes("OpenRig session identity:"))).toBe(true);
       expect((db.prepare("SELECT startup_actions_json FROM node_startup_context WHERE node_id=?").get(node.id) as {startup_actions_json:string}).startup_actions_json).toContain("guard03-test-identity");
+    });
+
+    it("(03b) OPR.0.7.0.13: a natively resumed Codex seat is not sent its skill catalog again", async () => {
+      const rig = rigRepo.createRig("test-rig");
+      db.prepare("INSERT INTO pods (id, rig_id, label) VALUES (?, ?, ?)").run("pod-guard03b", rig.id, "Dev");
+      const node = rigRepo.addNode(rig.id, "dev.impl", { runtime: "codex", podId: "pod-guard03b" });
+      const session = sessionRegistry.registerSession(node.id, "dev-impl@test-rig");
+      sessionRegistry.updateStatus(session.id, "running");
+      sessionRegistry.updateResumeToken(session.id, "codex_id", "resume-token-guard03b");
+      const catalog = { path: "openrig-seat-skills.md", absolutePath: "/seat/storage/catalog.md", ownerRoot: "/seat/storage",
+        deliveryHint: "send_text", required: false, appliesOn: ["fresh_start", "restore"] };
+      db.prepare("INSERT INTO node_startup_context (node_id, projection_entries_json, resolved_files_json, startup_actions_json, runtime) VALUES (?, ?, ?, ?, ?)").run(
+        node.id, "[]", JSON.stringify([catalog]), "[]", "codex",
+      );
+      const snap = snapshotCapture.captureSnapshot(rig.id, "test");
+      sessionRegistry.updateStatus(session.id, "exited");
+      db.prepare("DELETE FROM bindings WHERE node_id = ?").run(node.id);
+
+      const mockAdapter = {
+        runtime: "codex",
+        listInstalled: vi.fn(async () => []),
+        project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
+        deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })),
+        checkReady: vi.fn(async () => ({ ready: true })),
+        launchHarness: vi.fn(async () => ({ ok: true as const, resumeToken: "resume-token-guard03b", resumeType: "codex_id" })),
+      };
+      const tmux = mockTmux();
+      const orch = createOrchestrator({ tmux, listProcesses: nativeLineage("codex", "resume-token-guard03b") });
+      const result = await orch.restore(snap.id, { adapters: { codex: mockAdapter } });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      // (This harness ends a Codex resume as attention_required for reasons of its own; the replay rule depends only on
+      // a resume being requested with a token, which it is.)
+      expect(result.result.nodes[0]!.status).not.toBe("fresh-primed");
+      // Nothing of the startup text reaches the resumed seat: the catalog file is never handed to the adapter.
+      const handed = mockAdapter.deliverStartup.mock.calls.flatMap((call) => (call as unknown as [Array<{ absolutePath: string }>])[0] ?? []);
+      expect(handed.map((f) => f.absolutePath)).not.toContain(catalog.absolutePath);
+      // It stays saved for a later fresh start.
+      expect((db.prepare("SELECT resolved_files_json FROM node_startup_context WHERE node_id=?").get(node.id) as { resolved_files_json: string }).resolved_files_json).toContain("catalog.md");
     });
   });
 

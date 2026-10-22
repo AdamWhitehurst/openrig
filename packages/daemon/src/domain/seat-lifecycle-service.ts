@@ -46,6 +46,8 @@ import {
 } from "./seat-restart-in-place.js";
 import { CommunityHarnessRuntimeAdapter, seatAdapter } from "../adapters/community-harness-runtime-adapter.js";
 import { sessionCommunityHarnessSelect } from "./session-registry.js";
+import { seatLaunchAdditionsReport } from "./seat-launch-additions.js";
+import { seatSkillPaths } from "./seat-skill-storage.js";
 
 /**
  * S5 (OPR.0.5.4.7) — the seat-lifecycle verb surface: set-model, single-seat stop,
@@ -228,6 +230,7 @@ export type LaunchFreshResult =
       generation: string;
       model: string | null;
       effort?: string | null;
+      advisor?: string | null;
       startupPolicyHash: string;
       supersededSessionIds: string[];
       warnings?: string[];
@@ -699,7 +702,9 @@ export class SeatLifecycleService {
         if (currentRuntime?.runtime !== runtime) throw new Error("Seat runtime changed while checking native options; selection was not changed.");
         const from = store.read(seat.nodeId);
         const changed = from?.runtime !== to?.runtime || from?.mode !== to?.mode;
-        if (changed) {
+        // A Codex re-selection is intent for its next rebuild, even when the saved value is
+        // unchanged. Audit inherit too: a cleared selection has no row to carry its timestamp.
+        if (changed || runtime === "codex") {
           store.write(seat.nodeId, to, input.actor.trim(), input.reason.trim());
           persisted = this.eventBus.persistWithinTransaction({ type: "node.permissions_changed", rigId: seat.rigId,
             nodeId: seat.nodeId, from, to, actor: input.actor.trim(), reason: input.reason.trim(), source: "seat_selection", effect: "future_launches_only" });
@@ -752,7 +757,8 @@ export class SeatLifecycleService {
     const before = this.rigRepo.getNodePolicyProvenance(seat.nodeId);
     const changed = from !== ref || !before || before.origin !== provenance.origin || before.resolvedTarget !== provenance.resolvedTarget
       || before.declaringDir !== provenance.declaringDir || before.launchPosture !== provenance.launchPosture;
-    if (changed) {
+    // Reaffirming the same Codex policy is also a deliberate choice for the next rebuild.
+    if (changed || resolved.entry.runtime === "codex") {
       let persisted: PersistedEvent | null = null;
       this.db.transaction(() => {
         this.rigRepo.setNodePermissionPolicy(seat.nodeId, ref);
@@ -942,7 +948,7 @@ export class SeatLifecycleService {
       || !this.stillPending(node.id, session.id, pending)) return { ok: false as const, code: "continuation_unavailable", message: "Startup changed during the readiness check. Refresh." };
     const result = await this.startupOrchestrator.startNode({
       rigId: seat.rigId, nodeId: node.id, sessionId: session.id,
-      binding: { ...binding, cwd: node.cwd ?? ".", model: node.model ?? undefined, effort: resolveSeatEffort(node).effective ?? undefined, codexConfigProfile: node.codexConfigProfile ?? undefined },
+      binding: { ...binding, cwd: node.cwd ?? ".", model: node.model ?? undefined, effort: resolveSeatEffort(node).effective ?? undefined, advisor: node.advisor ?? undefined, codexConfigProfile: node.codexConfigProfile ?? undefined },
       adapter, plan: startup.context.plan, resolvedStartupFiles: startup.context.resolvedStartupFiles,
       startupActions: startup.context.startupActions, isRestore: pending.mode === "fork" && pending.isRestore,
       sessionName: session.session_name, skipHarnessLaunch: true, continueFreshStartup: pending.mode === "fresh", includeDurableObligations: true, allowFreshFallback: false,
@@ -1138,6 +1144,9 @@ export class SeatLifecycleService {
       sessionName: canonicalSessionName, currentOccupant,
       stopRequired, wouldStop: blockers.length > 0 ? false : tmuxUnknown ? null : owned && input.stop === true,
       blockers, warnings, siblings,
+      // OPR.0.7.0.9: what this seat's launch passes of its own additions (null when none).
+      launchAdditions: node.runtime === "claude-code"
+        ? seatLaunchAdditionsReport(seatSkillPaths({ rigId: seat.rigId, logicalId: node.logicalId, runtime: "claude-code" })) : null,
       startup: { projectionCount: startup.plan.entries.length,
         fileCount: startup.resolvedStartupFiles.filter(f => f.appliesOn.includes("fresh_start")).length,
         actionCount: startup.startupActions.filter(a => a.appliesOn.includes("fresh_start")).length },
@@ -1297,6 +1306,7 @@ export class SeatLifecycleService {
         startupPolicyHash: startup.hash,
         model: node.model,
         effort: resolveSeatEffort(node).effective,
+        advisor: node.advisor ?? null,
         reason: input.reason,
         operator: input.operator,
         errors: ["new occupant generation was not persisted"],
@@ -1319,6 +1329,7 @@ export class SeatLifecycleService {
         cwd: node.cwd ?? ".",
         model: node.model ?? undefined,
         effort: resolveSeatEffort(node).effective ?? undefined,
+        advisor: node.advisor ?? undefined,
         codexConfigProfile: node.codexConfigProfile ?? undefined,
         launchPosture,
       },
@@ -1342,6 +1353,7 @@ export class SeatLifecycleService {
         startupPolicyHash: startup.hash,
         model: node.model,
         effort: resolveSeatEffort(node).effective,
+        advisor: node.advisor ?? null,
         reason: input.reason,
         operator: input.operator,
         errors: startupResult.errors,
@@ -1405,6 +1417,7 @@ export class SeatLifecycleService {
         ...(nativeSessionId ? {} : { nativeSessionIdReason: "scrape_miss" }),
         model: node.model,
         effort: resolveSeatEffort(node).effective,
+        advisor: node.advisor ?? null,
         startupPolicyHash: startup.hash,
         reason: input.reason.trim(),
         operator: input.operator ?? null,
@@ -1438,6 +1451,7 @@ export class SeatLifecycleService {
       generation,
       model: node.model,
       effort: resolveSeatEffort(node).effective ?? undefined,
+      advisor: node.advisor ?? undefined,
       startupPolicyHash: startup.hash,
       supersededSessionIds,
       warnings: startupResult.warnings,
@@ -1764,6 +1778,7 @@ export class SeatLifecycleService {
     startupPolicyHash: string;
     model: string | null;
     effort?: string | null;
+    advisor?: string | null;
     reason: string;
     operator?: string | null;
     errors: string[];
@@ -1799,6 +1814,7 @@ export class SeatLifecycleService {
         newGeneration: input.newGeneration,
         model: input.model,
         effort: input.effort ?? null,
+        advisor: input.advisor ?? null,
         startupPolicyHash: input.startupPolicyHash,
         reason: input.reason.trim(),
         operator: input.operator ?? null,

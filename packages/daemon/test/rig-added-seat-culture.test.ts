@@ -18,6 +18,7 @@ import type { AgentResolverFsOps } from "../src/domain/agent-resolver.js";
 import type { RuntimeAdapter } from "../src/domain/runtime-adapter.js";
 import type { TmuxAdapter } from "../src/adapters/tmux.js";
 import { communityHarnessesDir } from "../src/domain/community-harness-presets.js";
+import { seatSkillPaths } from "../src/domain/seat-skill-storage.js";
 
 // A seat added to a running rig (`rig expand`, or add-member under `rig grow`) launches from a synthetic
 // spec that declares no rig-level layers. It must still get the rig's culture file and rig startup block,
@@ -111,7 +112,7 @@ function fixture(opts: { podStartup?: boolean } = {}) {
   const eventBus = new EventBus(db);
   const tmux = mockTmux();
   const nodeLauncher = new NodeLauncher({ db, rigRepo, sessionRegistry, eventBus, tmuxAdapter: tmux });
-  const startupOrchestrator = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux });
+  const startupOrchestrator = new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux, sleep: async () => {} });
   const claude = new ClaudeCodeAdapter({ tmux, fsOps: realFs(home), sleep: async () => {} });
   const resolverFs: AgentResolverFsOps = { readFile: (p) => fs.readFileSync(p, "utf-8"), exists: (p) => fs.existsSync(p) };
   const inst = new PodRigInstantiator({
@@ -194,7 +195,7 @@ function fixture(opts: { podStartup?: boolean } = {}) {
   const rigIdOf = () => currentRigId;
   const setRigId = (id: string) => { currentRigId = id; };
 
-  return { db, rigRepo, inst, expansion, yaml, rigRoot, otherRoot, cwd, context, rigFile, claudeMd, order, nodeExists, addHelper, memberAs, setRigId };
+  return { db, rigRepo, inst, expansion, tmux, yaml, rigRoot, otherRoot, cwd, context, rigFile, claudeMd, order, nodeExists, addHelper, memberAs, setRigId };
 }
 
 /** The reason an add gave for stopping, as one string. */
@@ -492,5 +493,37 @@ describe("a seat added to an existing pod also gets that pod's startup files, an
       expect(f.nodeExists("side.coder")).toBe(false);
       f.db.close();
     });
+  });
+});
+
+// OPR.0.7.0.13 with the above: an added seat gets its own skill storage, its plugin on the launch and the saved seat-skills
+// line exactly as an original seat does, beside the rig's culture and startup; neither feature replaces the other's input.
+describe("an added seat's own skill storage composes with the rig's culture and startup layers", () => {
+  it("original, expanded and added-member seats: the same storage, plugin dir and saved line, beside the rig layers", async () => {
+    const f = fixture();
+    const rigId = await launched(f);
+    const expanded = await f.expansion.expand({
+      rigId,
+      pod: { id: "ux", label: "UX", members: [{ id: "designer", agentRef: "local:agents/impl", profile: "default", runtime: "claude-code", cwd: f.cwd("ux-repo") }], edges: [] },
+      rigRoot: f.otherRoot,
+    } as never);
+    expect(expanded.ok, JSON.stringify(expanded)).toBe(true);
+    const added = await f.inst.addMemberToPod(rigId, "dev",
+      { id: "helper", agent_ref: "local:agents/impl", profile: "default", runtime: "claude-code", cwd: f.cwd("helper-repo") }, f.otherRoot);
+    expect(added.ok, JSON.stringify(added)).toBe(true);
+    const launchEnvs = vi.mocked(f.tmux.createSession).mock.calls.map((call) => (call[2] ?? {}) as Record<string, string>);
+    for (const logicalId of ["dev.impl", "ux.designer", "dev.helper"]) {
+      const paths = seatSkillPaths({ rigId, logicalId, runtime: "claude-code" });
+      expect(fs.existsSync(paths.pluginManifestPath), `${logicalId}: its own plugin manifest`).toBe(true);
+      // This seat's own launch carries its own plugin dir (the list is ":"-joined).
+      const { id: nodeId } = f.db.prepare("SELECT id FROM nodes WHERE rig_id = ? AND logical_id = ?").get(rigId, logicalId) as { id: string };
+      const own = launchEnvs.filter((env) => env["OPENRIG_NODE_ID"] === nodeId);
+      expect(own, `${logicalId}: one launch`).toHaveLength(1);
+      expect((own[0]!["CLAUDE_CODE_PLUGIN_DIRS"] ?? "").split(":"), `${logicalId}: its plugin on its launch`).toContain(paths.pluginDir);
+      const saved = f.context(logicalId).files.map((file) => file.path);
+      expect(saved, logicalId).toEqual(expect.arrayContaining(["CULTURE.md", "RIG-NOTES.md", "openrig-seat-skills.md"]));
+      expect(f.context(logicalId).actions).toContain("rig hello");
+    }
+    f.db.close();
   });
 });

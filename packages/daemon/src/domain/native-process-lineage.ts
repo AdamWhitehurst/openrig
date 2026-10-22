@@ -217,6 +217,36 @@ export function codexCommandResumeToken(command: string): string | null | undefi
 
 type ClaudeArgvIds = { resume: string | null; "session-id": string | null };
 
+// OPR.0.7.0.9: a seat's launch additions, read the same way by both selectors. The options OpenRig already emitted
+// (`--model`, `--effort`, `--name`, `--permission-mode`, `--settings`) keep each selector's earlier handling exactly.
+// Returns the index of the option's last value token; null when its value is missing or malformed (no positive proof);
+// undefined when the argument isn't `--agent` or `--append-system-prompt-file`. `--agent` takes one registered-name
+// token. `ps` joins argv with spaces, so the prompt file's path runs to the next `--` option; OpenRig launches only a
+// path that reads back that way (`claudePathBounds`), so a value token opening with `--` or a settings-like `{` ends it.
+const CLAUDE_AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const opensSpan = (token: string): boolean => token.startsWith("--") || /^["']?\{/.test(token);
+function claudeAdditionValueEnd(args: string[], index: number): number | null | undefined {
+  const arg = args[index]!;
+  const inline = arg.match(/^(--agent|--append-system-prompt-file)=([\s\S]*)$/);
+  const flag = inline ? inline[1]! : arg;
+  if (flag !== "--agent" && flag !== "--append-system-prompt-file") return undefined;
+  const value = inline ? inline[2]! : args[index + 1];
+  if (!value || value.startsWith("-")) return null;
+  if (flag === "--agent" && !CLAUDE_AGENT_NAME.test(value)) return null;
+  let end = inline ? index : index + 1;
+  if (flag === "--append-system-prompt-file") {
+    while (end + 1 < args.length && !opensSpan(args[end + 1]!)) end += 1;
+  }
+  return end;
+}
+
+/** Whether a path passed as `--append-system-prompt-file` reads back from `ps` as exactly that one value: its tokens
+ *  don't open with `-`/`--` or a settings-like `{`, so both identity selectors find where it ends. The launch-time check. */
+export function claudePathBounds(path: string): boolean {
+  const parts = tokens(path);
+  return parts.length > 0 && parts.join(" ") === path.trim() && !parts[0]!.startsWith("-") && !parts.some(opensSpan);
+}
+
 /** The conversation a parsed Claude argv names. A fork's --resume names its parent, so with
  *  --fork-session only the fork's own --session-id names it, and both must be present. Without
  *  --fork-session one identity names it and two prove nothing. undefined: no positive proof. */
@@ -233,8 +263,13 @@ function claudeSessionToken(args: string[]): string | null {
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
     if (index === 0 && /^\(\d+\.\d+\.\d+[^)]*\)$/.test(arg)) continue;
-    if (arg === "--settings") {
+    if (arg === "--settings" || arg === "--advisor") {
       const value = args[++index];
+      if (!value || value.startsWith("-")) return null;
+      continue;
+    }
+    if (arg.startsWith("--advisor=")) {
+      const value = arg.slice("--advisor=".length);
       if (!value || value.startsWith("-")) return null;
       continue;
     }
@@ -245,6 +280,9 @@ function claudeSessionToken(args: string[]): string | null {
     if (["--permission-mode", "--model", "--name", "--effort"].includes(arg)) { index += 1; continue; }
     if (/^--(?:permission-mode|model|name|settings|effort)=/.test(arg)
       || arg.startsWith("--remote-control=") || arg === "--dangerously-skip-permissions") continue;
+    const additionEnd = claudeAdditionValueEnd(args, index);
+    if (additionEnd === null) return null;
+    if (additionEnd !== undefined) { index = additionEnd; continue; }
     if (arg === "--fork-session") { fork = true; continue; }
     const identity = arg.match(/^--(session-id|resume)(?:=(.*))?$/);
     if (!identity) return null; // Unknown argv is not positive identity proof.
@@ -266,8 +304,13 @@ function claudeSessionIdentity(args: string[]): string | null | { unparsed: true
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
     if (index === 0 && /^\(\d+\.\d+\.\d+[^)]*\)$/.test(arg)) continue;
-    if (["--permission-mode", "--model", "--name", "--settings", "--effort"].includes(arg)) {
+    if (["--permission-mode", "--model", "--name", "--settings", "--effort", "--advisor"].includes(arg)) {
       const value = args[++index];
+      if (!value || value.startsWith("-")) return unparsed;
+      continue;
+    }
+    if (arg.startsWith("--advisor=")) {
+      const value = arg.slice("--advisor=".length);
       if (!value || value.startsWith("-")) return unparsed;
       continue;
     }
@@ -277,6 +320,9 @@ function claudeSessionIdentity(args: string[]): string | null | { unparsed: true
     }
     if (/^--(?:permission-mode|model|name|settings|effort)=/.test(arg)
       || arg.startsWith("--remote-control=") || arg === "--dangerously-skip-permissions") continue;
+    const additionEnd = claudeAdditionValueEnd(args, index);
+    if (additionEnd === null) return unparsed;
+    if (additionEnd !== undefined) { index = additionEnd; continue; }
     if (arg === "--fork-session") { fork = true; continue; }
     const identity = arg.match(/^--(session-id|resume)(?:=(.*))?$/);
     if (!identity) return unparsed; // Unknown argv is not positive identity proof.
@@ -439,22 +485,28 @@ function mayBeClaudeRuntime(row: NativeProcessRow): boolean {
 
 /** The same OS observation serves menu input, restore proof and periodic identity.
  * Older callers may carry only pid/ppid/command; that is insufficient positive Codex proof. */
-export async function listNativeProcesses(options: { claudeLaunchPaths?: boolean } = {}): Promise<NativeProcessRow[]> {
+export async function listNativeProcesses(opts: NativeProcessListOptions = {}): Promise<NativeProcessRow[]> {
   try {
     // Copies: the table is shared with concurrent readers, and executable paths are added below.
     const rows: NativeProcessRow[] = (await runAsyncSite("codex.runtime.list_processes", readProcessTable)).map((row) => ({ ...row }));
     // `claudeLaunchPaths`: the caller is proving a launch through a `#!` script, which needs the OS path of the
     // foreground path-named Claude too. Every other listing skips that read (on macOS it starts a helper process).
-    const candidates = rows.filter(row => needsClaudeExecutablePath(row) || (options.claudeLaunchPaths === true && mayBeClaudeAfterScript(row)));
+    const candidates = rows.filter(row => needsClaudeExecutablePath(row) || (opts.claudeLaunchPaths === true && mayBeClaudeAfterScript(row)));
     if (candidates.length > 0) {
-      const paths = await readNativeExecutablePaths(candidates.map(row => row.pid));
+      const pids = candidates.map(row => row.pid);
+      const onTimeout = opts?.onPathReadTimeout;
+      const paths = await (onTimeout ? readNativeExecutablePaths(pids, { onTimeout }) : readNativeExecutablePaths(pids));
       for (const row of candidates) row.executablePath = paths.get(row.pid);
     }
     return rows;
   } catch { return []; }
 }
 
-export type NativeProcessLister = () => NativeProcessRow[] | Promise<NativeProcessRow[]>;
+/** `claudeLaunchPaths`: also read the OS path of a foreground path-named Claude (a `#!` script launch).
+ *  `onPathReadTimeout` (#86): told when the OS path read actually timed out. */
+export interface NativeProcessListOptions { claudeLaunchPaths?: boolean; onPathReadTimeout?: () => void }
+
+export type NativeProcessLister = (opts?: NativeProcessListOptions) => NativeProcessRow[] | Promise<NativeProcessRow[]>;
 
 /** One OS process, by pid and `ps` start time: a reused pid has another start time. */
 export interface ClaudeLaunchedProcess { pid: number; startedAt: string }
@@ -725,6 +777,30 @@ export async function verifyClaudePaneRuntime(input: Parameters<typeof observeCl
   if (!first) return null;
   const second = await observeClaudePaneRuntime(input);
   return second?.fingerprint === first.fingerprint ? second : null;
+}
+
+const NATIVE_VERSION_LABEL = /^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/;
+
+/** One wait's record that the optional path witness timed out, so the rest of that wait skips it. */
+export interface VersionLabelWitnessWait { pathReadTimedOut: boolean }
+
+/** #86: the native installer names Claude's process, and so the pane label, after its versioned file. Whether that
+ * label may stand for `claude`: only when the pane's one stable foreground Claude is the version-named process
+ * itself, witnessed by its OS executable path (`claudeProcess`: argv0 claude, the installer's versions layout, a
+ * basename equal to the OS name), and the pane's pid is unchanged. The label alone is never identity, and a path
+ * read that fails or times out is no witness. Like a `claude` label, this says nothing about the conversation.
+ * Within one `wait`, once a path read actually times out, the witness isn't tried again; a new wait starts fresh. */
+export async function witnessedClaudeVersionLabel(paneCommand: string | null,
+  input: Omit<Parameters<typeof observeClaudePaneRuntime>[0], "selectedExecutable">, wait?: VersionLabelWitnessWait): Promise<boolean> {
+  const label = paneCommand?.trim() ?? "";
+  if (!NATIVE_VERSION_LABEL.test(label) || wait?.pathReadTimedOut) return false;
+  const lister = input.listProcesses ?? listNativeProcesses;
+  const onPathReadTimeout = () => { if (wait) wait.pathReadTimedOut = true; };
+  const native = await verifyClaudePaneRuntime({ ...input, listProcesses: () => lister({ onPathReadTimeout }) });
+  // argv0 `claude` keeps the OS path the deciding evidence: a versioned argv0 matches the OS name without it.
+  if (!native || executableName(tokens(native.process.command)[0] ?? "") !== "claude"
+    || native.process.executableName !== label || !native.process.executablePath) return false;
+  return await input.tmux.getPanePid(input.target).catch(() => null) === native.panePid;
 }
 
 /** The `ps` start time (lstart, local time) of the one stable Claude foreground

@@ -280,6 +280,7 @@ decisions, and posts its own replies.
   and the machine checks it when it has `OPENRIG_AUTH_BEARER_TOKEN` set.
 - **What the receiving machine trusts:** a relayed event comes from whoever holds that machine's
   daemon token (or, with no token set, anything that can reach its daemon), not from Slack directly, and nothing checks Slack's own signature on it. The
+  credential issued by `rig host pair` is the daemon API bearer, not a relay-only credential; it also authorizes the other daemon write APIs that use that bearer. The
   machine still looks up the sender in its own list of people, but on a relayed event that's no
   proof a person just typed or clicked it in Slack: it trusts the caller for where the event came
   from.
@@ -297,15 +298,43 @@ decisions, and posts its own replies.
   that's down costs one attempt per retry: its other relays wait for the next one. A relay the
   machine keeps refusing is kept and retried with no limit, because dropping it would lose a
   person's message.
+- **Changing forwarding entries is not a drain or cancellation:** relays already retained keep
+  their original host and remain visible in `rig slack status`, even after the last entry is
+  removed. An enabled connector retries them; disabling it pauses retry without deleting them.
+  Let relays finish before removing a forward entry. A zero dead-letter backlog alone does not
+  prove they have drained: it does not count relay HTTP requests still in flight.
 - **Who answered:** every post ends `from <seat> on <machine>`, using the machine's host id (set
   it with `host.name`).
 - **The hub's own channels** are handled on the hub, as before. A channel can be relayed to one
   machine only, and never the hub's own default channel.
+  Messages that match neither forwarding nor an existing thread or channel route fall back locally
+  to `inboundDestination`; `rig slack status` names that policy and destination. These lists do not
+  establish exclusive channel ownership: two machines can still both handle a channel.
 - **Missed messages:** each machine recovers the channels it owns: the hub its own channels, and
   every other machine its default channel and its channel map's (the hub never recovers a channel
   it relays). See [Reconnect recovery and status](#reconnect-recovery-and-status).
 - **Not covered yet:** `rig slack verify` on the hub doesn't check the app's membership in relayed
   channels.
+
+## Quiet hours for a person (optional)
+
+Quiet hours hold a person's routine asks while they're on, and post them once they end.
+
+- **Set them** with `rig gateway human quiet set <entityId> --daily 22:00-07:00` (every day) or `--until 07:00` (from now
+  until then), with `--tz` for the person's zone. `show` reports whether they're on, `end` ends tonight's early ("I'm back";
+  a daily rule stays for tomorrow), and `clear` removes the rule. A person's mode can set them too (`rig gateway human
+  mode save … --quiet`).
+- **While quiet is on,** an ask that would post to the person isn't posted and doesn't mention them, whatever their delivery
+  class: it's held, and its row records the hold.
+- **Not held:** an urgent ask, meaning one tagged `escalation` or `wake-escalation` that isn't an update, and the operator's
+  wake-ladder alerts. These reach the person exactly as they would outside quiet. An ask below the posting level is only
+  logged, as at any time.
+- **When quiet ends,** each held ask that never started posts once, on its own, with no mention. One that no longer applies
+  isn't posted, and its row says why: it closed, a newer notification replaced it, its recipient changed, or it's now below
+  the posting level.
+- **A post that may already be in Slack**, confirmed or only partly sent, isn't held: it finishes as itself, in its own
+  thread.
+- **If quiet hours can't be read,** nothing is posted to that person until they can.
 
 ## Reconnect recovery and status
 
@@ -372,9 +401,27 @@ channel, a thread line (tracked, scanned, waiting and why any are backing off or
 retry time and accepted/dead-lettered recovery counts since the connector last
 started, including threads that have since left the window (they reset when it is enabled or disabled, and when the daemon restarts).
 It also reports the durable dead-letter backlog: the retained records for inbound messages,
-reactions and click answers that await retry, counted from both dead-letter files so the number
-survives a restart, and shown as unknown with a reason (and no count) when a file cannot be read.
+reactions and click answers that await retry, including retained relays, counted across all three
+dead-letter files so the number survives a restart. Retry is paused while the connector is disabled.
+If a file cannot be read, status shows unknown with a reason and no count.
 Human-readable coverage and pending bounds use ISO timestamps; JSON keeps Slack timestamps.
 The status read calls no Slack API and starts no scan. If the daemon cannot be
 observed, local configuration remains visible and live state is unknown. A
 connected socket or valid configuration alone does not prove end-to-end delivery.
+
+### Slack rejects a message with `invalid_blocks`
+
+`rig queue show <qitemId> --json` records the failure as
+`class=slack-invalid-blocks error=invalid_blocks` in the delivery transition.
+Slack rejected that message's blocks, so OpenRig retains the notification as
+undelivered and does not post the same payload again, including after a daemon
+restart. The rejection is tied to the rendered payload: corrected content can
+make a new attempt. Network failures, server errors and rate limits still retry
+as before; a timed-out request remains uncertain until reconciliation.
+
+The source seat gets a `slack-undeliverable` queue item explaining the failure.
+Check the evidence links and message content, then send a corrected ask as a new
+queue item. Close the original when you have handled it. If a long ask was split
+into several messages, earlier parts may already be in Slack; the notice says
+when only part of the ask was posted. A failed part never counts as delivery of
+the whole ask.

@@ -267,7 +267,7 @@ describe("BootstrapOrchestrator", () => {
       return { sourceRef, sourceKind: "rig_bundle" };
     }
 
-    async function realLaunch(fault?: { removal: "confirmed" | "unconfirmed" | "throw"; createFailure?: boolean }) {
+    async function realLaunch(fault?: { removal: "confirmed" | "unconfirmed" | "throw"; createFailure?: boolean; attention?: boolean }) {
       const { RigRepository } = await import("../src/domain/rig-repository.js");
       const { SessionRegistry } = await import("../src/domain/session-registry.js");
       const { EventBus } = await import("../src/domain/event-bus.js");
@@ -310,7 +310,10 @@ describe("BootstrapOrchestrator", () => {
       const adapter = (runtime: string) => ({ runtime,
         listInstalled: vi.fn(async () => []), project: vi.fn(async () => ({ projected: [], skipped: [], failed: [] })),
         deliverStartup: vi.fn(async () => ({ delivered: 0, failed: [] })), checkReady: vi.fn(async () => ({ ready: true })),
-        launchHarness: vi.fn(async () => ({ ok: true })),
+        // A startup gate (such as a first-launch trust prompt) leaves the seat running and waiting for a person.
+        launchHarness: vi.fn(async () => fault?.attention
+          ? { ok: false, error: "fixture startup gate", recovery: "attention_required", evidence: "Do you trust the files in this folder?" }
+          : { ok: true }),
       });
       const podInstantiator = new PodRigInstantiator({ db, rigRepo, podRepo: new PodRepository(db), sessionRegistry, eventBus,
         nodeLauncher, startupOrchestrator: new StartupOrchestrator({ db, sessionRegistry, eventBus, tmuxAdapter: tmux }),
@@ -329,15 +332,31 @@ describe("BootstrapOrchestrator", () => {
       expect(tmux.createSession).toHaveBeenCalledTimes(2);
       for (const call of vi.mocked(tmux.createSession).mock.calls) {
         expect(call[2]).toMatchObject(envOverride);
-        expect(call[2]?.OPENRIG_SEAT_ENV_KEYS).toBe("DOCSDESK_ENV_PROBE");
+        // The one-off key, plus, for a Claude seat, its own skill plugin's directory (OPR.0.7.0.13), which is not saved either.
+        expect(call[2]?.OPENRIG_SEAT_ENV_KEYS?.split(",").filter((key) => key !== "CLAUDE_CODE_PLUGIN_DIRS")).toEqual(["DOCSDESK_ENV_PROBE"]);
         expect(tmux.unsetSessionEnv).toHaveBeenCalledWith(call[0], "DOCSDESK_ENV_PROBE");
       }
       expect(rigRepo.getRig(result.rigId!)!.nodes.every((node) => !node.env)).toBe(true);
     });
 
-    describe.each([true, false])("cleanup failure accounting, single seat=%s", (singleSeat) => {
-      it.each(["confirmed", "unconfirmed", "throw"] as const)("reports the stopped launch and retained effects when removal is %s", async (removal) => {
-        const { orch, tmux, rigRepo, started, live } = await realLaunch({ removal });
+    it("rig up --name: launches under rigName, with every seat session named for it", async () => {
+      const { orch, tmux, rigRepo } = await realLaunch();
+      const result = await orch.bootstrap({ mode: "apply", ...await source(), rigName: "alpha" });
+      expect(result.status, JSON.stringify(result)).toBe("completed");
+      expect(rigRepo.getRig(result.rigId!)!.rig.name).toBe("alpha");
+      const sessions = vi.mocked(tmux.createSession).mock.calls.map(([session]) => session as string);
+      expect(sessions).toHaveLength(2);
+      for (const session of sessions) {
+        expect(session).toContain("alpha");
+        expect(session).not.toContain("test-rig");
+      }
+    });
+
+    describe.each([true, false])("a one-off that stays in the session, single seat=%s", (singleSeat) => {
+      // Only an agent seat can stop at a startup gate; a terminal seat's launch never waits for a person.
+      it.each(format === "pod agent spec" ? ["running", "at a startup gate"] : ["running"])("keeps every launched seat %s and reports the leftover by name with its remedy", async (state) => {
+        const gate = state === "at a startup gate";
+        const { orch, tmux, rigRepo, started, live } = await realLaunch({ removal: "confirmed", attention: gate });
         const input = await source(singleSeat);
         const { createTestApp } = await import("./helpers/test-app.js");
         const { app } = createTestApp(db, { tmux, appDeps: { bootstrapOrchestrator: orch }, upRouterFsOps: {
@@ -377,53 +396,26 @@ describe("BootstrapOrchestrator", () => {
         const human = await render();
         projectOnly = true; // JSON renders the same retained HTTP response; it does not launch again.
         const json = await render(true);
-        const baseline = process.env.EXPECT_ENV_CLEANUP_BASELINE === "1";
-        const effects = { started, surviving: [...live].map(([session, env]) => ({ session, hasProbe: "DOCSDESK_ENV_PROBE" in env })), killCalls: vi.mocked(tmux.killSession).mock.calls.map(c => c[0]), boundSessions: db.prepare("SELECT tmux_session FROM bindings").all(), rigs: rigRepo.listRigs().length };
-        console.info("LEGACY_ENV_CLEANUP_OBSERVATION=" + JSON.stringify({ format, singleSeat, removal, baseline, http: observed?.status, status: observed?.data.status, human, jsonExit: json.exit, effects }));
+        // Every first pane started with the one-off. Its cleanup failed, and the seats keep running: nothing is killed or
+        // rolled back, and the leftover is reported by name with how to put it back, never by value.
         expect(started).toHaveLength(singleSeat ? 1 : 2);
-        expect(started.every(s => s.hasProbe === !baseline)).toBe(true);
-        if (baseline) {
+        expect(started.every(s => s.hasProbe)).toBe(true);
+        if (!gate) {
           expect(observed?.status).toBe(201);
           expect(observed?.data.status).toBe("completed");
+          expect(observed?.data.code).toBeUndefined();
           expect([human.exit, json.exit]).toEqual([0, 0]);
-          expect(human.text).toContain("Status: completed");
-          expect(tmux.killSession).not.toHaveBeenCalled();
-          expect(live.size).toBe(singleSeat ? 1 : 2);
-        } else {
-          expect(observed?.status).toBe(singleSeat ? 500 : 200);
-          expect(observed?.data.status).toBe(singleSeat ? "failed" : "partial");
-          expect(observed?.data.code).toBe("seat_env_cleanup_failed");
-          expect([human.exit, json.exit]).toEqual(singleSeat ? [2, 2] : [1, 1]);
-          expect(human.text).toContain("DOCSDESK_ENV_PROBE");
-          expect(human.text).toContain(started.find(s => isDevSession(s.session))!.session);
-          expect(human.text).toContain(removal === "confirmed" ? "session was removed" : "check it and remove it");
-          const errors = JSON.stringify(observed?.data.errors);
-          if (singleSeat) {
-            expect(rigRepo.listRigs()).toHaveLength(0);
-            if (removal === "confirmed") expect(human.text).toContain("Run it again.");
-            expect(human.text).not.toContain("To relaunch only");
-          } else {
-            const retained = rigRepo.listRigs();
-            expect(retained).toHaveLength(1);
-            const command = `rig launch '${retained[0]!.id}' '${failedSeat}'`;
-            const remove = `rig down '${retained[0]!.id}' --delete`;
-            for (const rendered of [human.text, errors, json.text]) {
-              expect(rendered).toContain(command);
-              expect(rendered).toContain("does not reapply the unsaved --env values");
-              expect(rendered).toContain(remove);
-              expect(rendered).toContain("removes the team this launch just created");
-              expect(rendered).toContain("original rig up command with --env");
-              expect(rendered).not.toContain("Run it again.");
-              expect(rendered).not.toContain(`${command} --env`);
-            }
-            expect(rigRepo.getRig(retained[0]!.id)!.nodes.every(node => !node.env)).toBe(true);
-          }
-          expect(human.text).not.toContain("synthetic-private-value");
-          expect(human.text).not.toContain("private unset fault");
-          expect(JSON.stringify(observed?.data.errors)).toContain("DOCSDESK_ENV_PROBE");
-          expect(tmux.killSession).toHaveBeenCalledTimes(1);
-          expect(live.size).toBe((singleSeat ? 0 : 1) + (removal === "confirmed" ? 0 : 1));
-          expect([...live].some(([session, env]) => isDevSession(session) && "DOCSDESK_ENV_PROBE" in env)).toBe(removal !== "confirmed");
+        }
+        expect(tmux.killSession).not.toHaveBeenCalled();
+        expect(live.size).toBe(singleSeat ? 1 : 2);
+        expect(rigRepo.listRigs()).toHaveLength(1);
+        const devSession = started.find(s => isDevSession(s.session))!.session;
+        const warnings = JSON.stringify(observed?.data.warnings);
+        for (const rendered of [human.text, warnings]) {
+          expect(rendered).toContain("DOCSDESK_ENV_PROBE");
+          expect(rendered).toContain(`tmux set-environment -t ${devSession} -u DOCSDESK_ENV_PROBE`);
+          expect(rendered).not.toContain("synthetic-private-value");
+          expect(rendered).not.toContain("private unset fault");
         }
       });
     });
@@ -1511,7 +1503,10 @@ exports:
     expect(run.source_kind).toBe("rig_spec");
   });
 
-  it("rejects service-backed pod-bundle launch with honest error before instantiate", async () => {
+  it.each([
+    ["service-backed pod-bundle launch with honest error", undefined, "services_unsupported", "Service-backed rigs cannot be launched from .rigbundle"],
+    ["--name for a pod bundle whose spec sets services.project_name", "alpha", "rig_name_compose_project", "services.project_name"],
+  ] as const)("rejects %s before instantiate, and removes the extracted bundle", async (_label, rigName, code, message) => {
     const { pack } = await import("../src/domain/bundle-archive.js");
     const { computeIntegrity } = await import("../src/domain/bundle-integrity.js");
     const { PodBundleSourceResolver } = await import("../src/domain/bundle-source-resolver.js");
@@ -1527,7 +1522,7 @@ summary: A service-backed rig in a bundle
 services:
   kind: compose
   compose_file: svc.compose.yaml
-  wait_for:
+${rigName ? "  project_name: shared-db\n" : ""}  wait_for:
     - url: http://127.0.0.1:8200/health
 pods:
   - id: dev
@@ -1600,13 +1595,13 @@ ${integrityYaml}
       podInstantiator: mockPodInstantiator as any,
     });
 
-    const result = await orch.bootstrap({ mode: "apply", sourceRef: bundlePath, sourceKind: "rig_bundle" });
+    const result = await orch.bootstrap({ mode: "apply", sourceRef: bundlePath, sourceKind: "rig_bundle", rigName });
 
     expect(result.status).toBe("failed");
-    expect(result.errors.some((e: string) => e.includes("Service-backed rigs cannot be launched from .rigbundle"))).toBe(true);
+    expect(result.errors.some((e: string) => e.includes(message))).toBe(true);
     const resolveStage = result.stages.find((s) => s.stage === "resolve_spec" && s.status === "failed");
     expect(resolveStage).toBeDefined();
-    expect((resolveStage!.detail as Record<string, unknown>)["code"]).toBe("services_unsupported");
+    expect((resolveStage!.detail as Record<string, unknown>)["code"]).toBe(code);
     // Must NOT have called instantiate
     expect(mockPodInstantiator.instantiate).not.toHaveBeenCalled();
     // Temp dir must be cleaned up even on rejection — only check dirs created during this test

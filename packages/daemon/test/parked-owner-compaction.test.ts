@@ -91,7 +91,7 @@ async function fixture() {
   };
 }
 
-it("defers the parked row from submission through boundary/restore/audit without reserving its wake, then wakes it once", async () => {
+it("defers the parked row from submission through boundary/restore/audit without reserving its wake, then waits for a change after recorded success", async () => {
   const f = await fixture();
   await f.compact();
   for (const stage of ["compacting", "compacted", "restoring"]) {

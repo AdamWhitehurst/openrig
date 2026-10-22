@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import type { AgentActivityStore } from "../domain/agent-activity-store.js";
+import { hookEventState, isRunnerExit } from "../domain/agent-activity-store.js";
 import type { SessionRegistry } from "../domain/session-registry.js";
 import type { EventBus } from "../domain/event-bus.js";
 import { verifyStartupProof } from "../domain/startup-proof.js";
@@ -41,6 +42,8 @@ export function evidenceFromHookActivity(input: {
     sourceId: `${input.runtime ?? "unknown-runtime"}:hooks`,
     seq: input.seq,
     observedAt: input.activity.eventAt ?? input.activity.sampledAt,
+    ...(input.activity.sourceSequence ? { sourceSequence: input.activity.sourceSequence } : {}),
+    ...(input.activity.livenessSeconds ? { livenessSeconds: input.activity.livenessSeconds } : {}),
     ...(input.route ? { route: input.route } : {}),
   };
   if (input.activity.reason === "permission_request_pending") {
@@ -49,6 +52,10 @@ export function evidenceFromHookActivity(input: {
   if (input.runtime === "claude-code" && input.activity.rawEvent === "Notification"
       && input.activity.reason === "permission_prompt") {
     return { ...base, permissionRequest: { id: "claude-permission-prompt" }, needsInput: { count: 1, reason: "permission_prompt" } };
+  }
+  // A runner's exit report clears what its last turn said: the seat is no longer at a prompt or mid-turn.
+  if (input.activity.rawEvent === "Stop" && isRunnerExit(input.activity.rawSubtype, input.runtime)) {
+    return { ...base, activity: "unknown", needsInput: { count: 0, reason: null } };
   }
   switch (input.activity.state) {
     case "running":
@@ -61,6 +68,22 @@ export function evidenceFromHookActivity(input: {
     default:
       return null; // unknown = noise, never evidence
   }
+}
+
+/** A runner seat's last recorded hook as oracle evidence, for restoring after a daemon restart. Only the store's own
+ *  checks pass it: the seat's current session, and an occupant generation resolved as the live one. Past the store's
+ *  freshness window it means what its retained raw event means, as for the wake ladder: a runner's boundary holds. */
+export function restoredRunnerHookEvidence(
+  store: Pick<AgentActivityStore, "getLatestForNode">,
+  seat: { seatNodeId: string; sessionName: string },
+  runtime: string,
+): ActivityEvidence | null {
+  const latest = store.getLatestForNode({ nodeId: seat.seatNodeId, sessionName: seat.sessionName, order: "source" });
+  if (!latest || latest.evidenceSource !== "runtime_hook" || latest.generationProvenance !== "resolved") return null;
+  const state = !latest.stale ? latest.state
+    : latest.reason === "stale_runtime_hook" ? hookEventState(latest.rawEvent, latest.rawSubtype, runtime) : "unknown";
+  return evidenceFromHookActivity({ seatNodeId: seat.seatNodeId, sessionName: seat.sessionName, runtime,
+    activity: { ...latest, state }, seq: 0 });
 }
 
 /** The relay route a hook post names: "plugin" or "managed". An untagged post (an older relay) stays untagged; any
@@ -424,6 +447,9 @@ activityRoutes.post("/hooks", async (c) => {
     // (sound per-path absence; never false-fresh).
     generation: stringOrNull(body.generation),
     turnId: stringOrNull(body.turnId),
+    sourceSequence: typeof body.sequence === "number" && Number.isSafeInteger(body.sequence) && body.sequence > 0 ? body.sequence : null,
+    livenessSeconds: typeof body.livenessSeconds === "number" && Number.isSafeInteger(body.livenessSeconds)
+      && body.livenessSeconds > 0 && body.livenessSeconds <= 3600 ? body.livenessSeconds : null,
   });
 
   if (!result.ok) {
