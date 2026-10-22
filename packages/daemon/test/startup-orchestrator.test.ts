@@ -460,6 +460,7 @@ describe("StartupOrchestrator", () => {
     expect(tmux.sendText).toHaveBeenCalledTimes(1);
     expect(tmux.sendText).toHaveBeenCalledWith("r01-impl", expect.stringContaining("rig queue list --destination r01-impl --state pending,in-progress,blocked"));
     expect(tmux.sendText).toHaveBeenCalledWith("r01-impl", expect.stringContaining(makeIdentityAction().value));
+    expect(vi.mocked(tmux.sendText).mock.calls[0]?.[1]).not.toContain("readiness for an assignment");
   });
 
   it("persists the authored context before a native gate and exposes only the matching continuation", async () => {
@@ -1008,6 +1009,8 @@ describe("StartupOrchestrator", () => {
     expect(firstPrompt).toContain("dev-impl@test-rig");
     expect(firstPrompt).toContain("OpenRig session identity:");
     expect(firstPrompt).toContain("Role instructions go here.");
+    expect(firstPrompt).toContain("OpenRig-generated identity context (not a project task):");
+    expect(firstPrompt).not.toContain("readiness for an assignment");
     expect(sendText).toHaveBeenNthCalledWith(2, "r01-impl", "/rename impl");
     expect(deliverStartup).toHaveBeenCalledTimes(1);
   });
@@ -1136,6 +1139,7 @@ describe("StartupOrchestrator", () => {
       "r01-impl",
       expect.stringContaining("dev-impl@test-rig"),
     );
+    expect(sendText.mock.calls[0]?.[1]).not.toContain("readiness for an assignment");
     expect(sendText).toHaveBeenNthCalledWith(2, "r01-impl", "/rename impl");
   });
 
@@ -1154,6 +1158,7 @@ describe("StartupOrchestrator", () => {
     expect(deriveOriented(db, seed.nodeId)).toBe("missing");
     // The challenge instruction is embedded in the first delivered prompt.
     expect(sendText.mock.calls[0]?.[1]).toContain("startup orientation challenge");
+    expect(sendText.mock.calls[0]?.[1]).not.toContain("readiness for an assignment");
   });
 
   // Claude shows the long startup paste as pasted content and won't act on an instruction found only
@@ -1226,7 +1231,7 @@ describe("StartupOrchestrator", () => {
     expect(deriveOriented(db, seed.nodeId)).toBe("n-a");
   });
 
-  it.each([false, true])("omission delivers authored identity with files=%s and adds no exercise", async (withFiles) => {
+  it.each([false, true])("identity-only startup asks for readiness with guidance files=%s and adds no proof exercise", async (withFiles) => {
     const seed = seedSession();
     const adapter = mockAdapter();
     const result = await createOrchestrator().startNode(makeInput(seed, {
@@ -1237,7 +1242,10 @@ describe("StartupOrchestrator", () => {
     expect(result).toMatchObject({ ok: true, startupStatus: "ready" });
     expect(adapter.project).toHaveBeenCalledOnce();
     expect(adapter.checkReady).toHaveBeenCalledTimes(2);
-    expect(tmux.sendText).toHaveBeenCalledExactlyOnceWith("r01-impl", makeIdentityAction().value);
+    expect(tmux.sendText).toHaveBeenCalledExactlyOnceWith("r01-impl", expect.stringContaining(makeIdentityAction().value));
+    const prompt = vi.mocked(tmux.sendText).mock.calls[0]?.[1];
+    expect(prompt).toContain("OpenRig-generated identity context (not a project task):");
+    expect(prompt).toContain("run rig whoami --json and reply with your identity and readiness for an assignment");
     expect(deriveOriented(db, seed.nodeId)).toBe("n-a");
     const row = db.prepare("SELECT payload FROM events WHERE type='node.startup_pending'").get() as { payload: string };
     expect(JSON.parse(row.payload).startupProof).toEqual({ mode: "none", source: "default" });
