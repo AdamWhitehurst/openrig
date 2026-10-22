@@ -1,4 +1,5 @@
 import { PROMPT_ALERT_TAG, readWakeLadderBackstop } from "./queue-wake-ladder.js";
+import { withUrgentLine } from "./urgent-line.js";
 import { quietCustodyBackstop, quietHoldCustody } from "./quiet-hold-custody.js";
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
@@ -84,6 +85,14 @@ export function hasLiveHumanGate(item: {
 }
 
 const AUTO_UNPARK_WAKE_TAG = "queue:auto-unpark:blocker";
+/** A durable wake OpenRig's own scheduling triggered (an auto-unpark, a row OpenRig creates), not an agent's create or
+ *  handoff: it keeps that source when it's replayed later. Send, broadcast, queue create and the cross-host forward never
+ *  set it from a request; the trusted local outbox recorder (/api/queue/outbox/record) accepts caller tags by design. */
+const WAKE_TRIGGER_OPENRIG_TAG = "queue:wake-trigger:openrig";
+
+/** Who triggered a wake, which is its source at the seat's interruption level: an agent's create or handoff nudge, or
+ *  OpenRig's own scheduling on an agent's row (ladder retries, an auto-unpark, boot recovery, health re-presentation). */
+export type WakeTrigger = "agent" | "openrig";
 const AUTO_UNPARK_BLOCKER_TAG_PREFIX = "queue:auto-unpark:blocker-ref:";
 
 /** The actor on the transition routeToFallback writes; the row's own history is how a later reroute finds the line it wrote. */
@@ -297,7 +306,7 @@ interface QueueItemRow {
  */
 export interface QueueNudgeTransport {
   deliveryTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
-  retentionTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
+  retentionTarget?(session: string, input?: import("./seat-delivery-guard.js").AdmissionInput): import("./seat-delivery-guard.js").GuardTarget | null;
   draftAwareTarget?(session: string): import("./seat-delivery-guard.js").GuardTarget | null;
   configureGuardedWakes?(applicable: (entries: readonly QueueWakeFacts[]) => boolean): void;
   send(
@@ -316,6 +325,9 @@ type WakeAttemptOutcome = {
 };
 
 export interface QueueCreateInput {
+  /** Internal: a row OpenRig creates itself (a sweep finding, a health notice, a mode-end notice) wakes as OpenRig's own
+   *  message at the destination's interruption level. Queue create and the cross-host forward never take it from a request. */
+  wakeTrigger?: WakeTrigger;
   qitemId?: string;
   sourceSession: string;
   destinationSession: string;
@@ -999,9 +1011,20 @@ export class QueueRepository {
     return expected === latest?.transition_id;
   }
 
+  /** A wake's source and urgency at the seat's level: the trigger decides the source; the row's priority (urgent or
+   *  critical) makes it urgent, marked by whoever created the row. */
+  private wakeAdmission(qitemId: string, trigger: WakeTrigger): import("./seat-delivery-guard.js").AdmissionInput & { urgentBy?: string } {
+    const row = this.getById(qitemId);
+    const urgent = row?.priority === "urgent" || row?.priority === "critical";
+    // OpenRig's own row is marked urgent by OpenRig, not by the person whose obligation it's about.
+    return { source: trigger, urgent, ...(urgent && row ? { urgentBy: trigger === "openrig" ? "OpenRig" : row.sourceSession } : {}) };
+  }
+
   private classifyWakeResult(res: Awaited<ReturnType<QueueNudgeTransport["send"]>>): WakeAttemptOutcome {
-    if (res.outcome === "retained") return { classified: "retained", nudgeResult: res.reason?.startsWith("draft_")
-      ? "retained:draft_aware" : "retained:typing_guard" };
+    // Held by the seat's hold or interruption level (on purpose; a retry is held again) is the typing guard's; any other
+    // retention is the draft-aware delivery's (a draft, an unreadable input, a native prompt), which can clear.
+    if (res.outcome === "retained") return { classified: "retained", nudgeResult: res.reason === "typing_guard_enabled"
+      ? "retained:typing_guard" : "retained:draft_aware" };
     if (res.ok) return res.verified ? { classified: "verified", nudgeResult: "verified" } : { classified: "indeterminate", nudgeResult: "delivered-ack-pending" };
     const detail = res.error ?? res.reason ?? "unknown";
     // Input evidence survives receipt removal: an issued paste or uncertain Enter is never an unsent failure.
@@ -1088,6 +1111,7 @@ export class QueueRepository {
     toSession: string,
     identityProvenance: string | null,
     nudge: boolean | undefined,
+    trigger: WakeTrigger = "agent",
   ): void {
     // No wake intended (nudge:false) ⇒ no durable intent to make durable. The
     // W1-c guard is nudge-aware for the same reason: absence of an intent is a
@@ -1103,7 +1127,9 @@ export class QueueRepository {
       toSession,
       identityProvenance,
       bareBody: renderQueueHandoffNudge(successorQitemId, successor?.summary),
-      tags: successor?.handedOffFrom ? [`queue:return:${successor.handedOffFrom}`] : undefined,
+      tags: successor?.handedOffFrom || trigger === "openrig"
+        ? [...(successor?.handedOffFrom ? [`queue:return:${successor.handedOffFrom}`] : []), ...(trigger === "openrig" ? [WAKE_TRIGGER_OPENRIG_TAG] : [])]
+        : undefined,
     });
   }
 
@@ -1127,11 +1153,15 @@ export class QueueRepository {
       input.bareBody,
       { stampISO, genUuid },
     );
+    const admission = this.wakeAdmission(input.auditPointer, input.tags?.includes(WAKE_TRIGGER_OPENRIG_TAG) ? "openrig" : "agent");
+    // An urgent wake's frozen body carries the line naming who marked it, so a person reading it held sees it too; the
+    // transport won't add it a second time when it's delivered.
     const record = {
       outboxId: input.outboxId, senderSession: input.fromSession, destinationSession: input.toSession,
-      body: frozenEnvelope, tags: input.tags, auditPointer: input.auditPointer, identityProvenance: input.identityProvenance,
+      body: admission.urgentBy ? withUrgentLine(frozenEnvelope, admission.urgentBy) : frozenEnvelope, tags: input.tags, auditPointer: input.auditPointer, identityProvenance: input.identityProvenance,
+      ...(admission.urgent ? { urgency: "urgent" } : {}),
     };
-    const target = this.transport?.retentionTarget?.(input.toSession);
+    const target = this.transport?.retentionTarget?.(input.toSession, admission);
     if (target) this.outbox.retain(record, target);
     else {
       // Draft-aware wakes remain pending until the transport owns their bounded
@@ -1161,7 +1191,7 @@ export class QueueRepository {
       toSession: input.destinationSession,
       identityProvenance: input.identityProvenance,
       bareBody: `Blocker ${input.blockerQitemId} resolved; parked qitem ${input.qitemId} is pending. Resume the recorded continuation and update the row.`,
-      tags: [AUTO_UNPARK_WAKE_TAG, `${AUTO_UNPARK_BLOCKER_TAG_PREFIX}${input.blockerQitemId}`, `queue:return:${input.blockerQitemId}`],
+      tags: [AUTO_UNPARK_WAKE_TAG, WAKE_TRIGGER_OPENRIG_TAG, `${AUTO_UNPARK_BLOCKER_TAG_PREFIX}${input.blockerQitemId}`, `queue:return:${input.blockerQitemId}`],
     });
   }
 
@@ -1259,6 +1289,16 @@ export class QueueRepository {
       const first = candidate; // Keep each member's pre-claim uncertainty.
       const intents = [first];
       const correlation = first.tags?.find(tag => tag.startsWith("queue:return:"));
+      // Group by outcome at the seat's current level: each member is admitted with its own source and urgency, and only
+      // members with the first one's outcome (typed or held) go together. With no level (off, draft-aware), everything is
+      // admitted, so a returned result and its resume still go as one send. At a level, a routine wake never rides in on
+      // an urgent one, nor an urgent one under a routine one's hold; any other member waits for its own delivery.
+      const outcome = (entry: OutboxEntry) => {
+        const trigger: WakeTrigger = entry.tags?.includes(WAKE_TRIGGER_OPENRIG_TAG) ? "openrig" : "agent";
+        const admission = entry.auditPointer ? this.wakeAdmission(entry.auditPointer, trigger) : { source: trigger, urgent: false };
+        return this.transport?.retentionTarget?.(entry.destinationSession, { source: admission.source, urgent: admission.urgent }) ? "held" : "typed";
+      };
+      const firstOutcome = outcome(first);
       if (correlation) {
         const peers = this.db.prepare(`SELECT outbox_id FROM outbox_entries
           WHERE delivery_state IN ('pending','failed','indeterminate') AND destination_session = ? AND substr(outbox_id, 1, ?) = ?
@@ -1266,6 +1306,7 @@ export class QueueRepository {
           ORDER BY outbox_id`).all(first.destinationSession, WAKE_INTENT_PREFIX.length, WAKE_INTENT_PREFIX, correlation) as Array<{ outbox_id: string }>;
         for (const peer of peers) {
           const entry = this.outbox!.getById(peer.outbox_id)!;
+          if (outcome(entry) !== firstOutcome) continue;
           if (actionable(entry) && claim(entry)) intents.push(entry);
         }
       }
@@ -1284,8 +1325,12 @@ export class QueueRepository {
     const qitemId = intent.auditPointer ?? outboxId;
     // Preserve the original envelope/source generation; add context without rewriting its stored bytes.
     const recoveryNotice = recovering ? "Recovered queue notification: delivery may repeat after an earlier unconfirmed attempt.\n" : "";
+    // The group was formed on the first member's outcome, so its own source and urgency reach that same outcome at the
+    // send; the other members' bodies keep their own frozen urgent lines.
+    const trigger: WakeTrigger = group[0]!.tags?.includes(WAKE_TRIGGER_OPENRIG_TAG) ? "openrig" : "agent";
     const outcome = await this.performWakeSend(
       qitemId, intent.destinationSession, intent.senderSession, undefined, recoveryNotice + group.map(entry => entry.body).join("\n"), group.map(entry => entry.outboxId),
+      trigger,
     );
     let reportedState: "delivered" | "indeterminate" | "failed" | "retained" = outcome.classified === "verified" ? "delivered" : outcome.classified;
     for (const intent of group) {
@@ -1424,10 +1469,11 @@ export class QueueRepository {
     nudgeOpt: boolean | undefined,
     sourceSession?: string,
     bodyOverride?: string,
+    trigger: WakeTrigger = "agent",
   ): Promise<void> {
     if (nudgeOpt === false) return;
     if (!this.transport) return;
-    const outcome = await this.performWakeSend(qitemId, destinationSession, sourceSession, bodyOverride);
+    const outcome = await this.performWakeSend(qitemId, destinationSession, sourceSession, bodyOverride, undefined, undefined, trigger);
     this.recordNudgeAttempt(qitemId, outcome.nudgeResult);
   }
 
@@ -1436,7 +1482,8 @@ export class QueueRepository {
   async recoverLostNudge(qitemId: string, destinationSession: string, sourceSession?: string): Promise<void> {
     const outboxId = `${WAKE_INTENT_PREFIX}${qitemId}`;
     if (this.outbox?.getById(outboxId) && this.getById(qitemId)?.state === "pending") return;
-    await this.maybeNudge(qitemId, destinationSession, undefined, sourceSession);
+    // Boot recovery is OpenRig's own scheduling, whoever created the row.
+    await this.maybeNudge(qitemId, destinationSession, undefined, sourceSession, undefined, "openrig");
   }
 
   /**
@@ -1459,6 +1506,7 @@ export class QueueRepository {
     bodyOverride?: string,
     prebuiltText?: string,
     committedOutboxIds?: string[],
+    trigger: WakeTrigger = "agent",
   ): Promise<WakeAttemptOutcome> {
     // DEFECT FIX qitem-20260827065907-b9ae334c (S1-class, 3 live specimens): a virtual
     // @external destination has NO pane — the queue row ITSELF is the gateway
@@ -1518,7 +1566,10 @@ export class QueueRepository {
       text = held.body;
     }
     try {
-      const res = await this.transport!.send(destinationSession, text, { verify: true, stampISO, actorSession: sourceSession, committedOutboxIds, deliveryId: committedOutboxIds ? undefined : deliveryId, auditPointer: qitemId, queueWake: true });
+      const admission = this.wakeAdmission(qitemId, trigger);
+      const res = await this.transport!.send(destinationSession, text, { verify: true, stampISO, actorSession: sourceSession, committedOutboxIds,
+        deliveryId: committedOutboxIds ? undefined : deliveryId, auditPointer: qitemId, queueWake: true,
+        ...(trigger === "openrig" ? { openrigNotice: true as const } : {}), ...(admission.urgentBy ? { urgent: { by: admission.urgentBy } } : {}) });
       // OPR.0.3.2.21.FR-4(c) — wording rename: the prior literal
       // "sent-unverified" read as a failure even in the common case
       // (delivery confirmed but the synchronous ack window expired,
@@ -1561,7 +1612,7 @@ export class QueueRepository {
         try {
           // A savepoint removes any partial intent when staging fails, while
           // preserving ordinary create's existing acceptance of the task.
-          this.db.transaction(() => this.stageWakeIntent(created.qitemId, input.sourceSession, input.destinationSession, input.identityProvenance ?? null, input.nudge))();
+          this.db.transaction(() => this.stageWakeIntent(created.qitemId, input.sourceSession, input.destinationSession, input.identityProvenance ?? null, input.nudge, input.wakeTrigger))();
           wakeStaged = true;
         } catch (err) {
           this.recordNudgeAttempt(created.qitemId, `failed:wake not retained: ${err instanceof Error ? err.message : String(err)}`);
@@ -1624,7 +1675,7 @@ export class QueueRepository {
     if (this.outbox) {
       if (wakeStaged) this.deliverWakeIntentAfterCommit(`${WAKE_INTENT_PREFIX}${id}`);
     } else {
-      await this.maybeNudge(id, input.destinationSession, input.nudge, input.sourceSession);
+      await this.maybeNudge(id, input.destinationSession, input.nudge, input.sourceSession, undefined, input.wakeTrigger);
     }
     return this.getByIdOrThrow(id);
   }
@@ -4439,6 +4490,12 @@ export class QueueRepository {
       if (recovery) {
         if (!awaitingHuman) view.laterBackstop = { ...view.nextBackstop, note: "Conditional safety net; current delivery/recovery ownership is evaluated first." };
         view.nextBackstop = recovery;
+      } else if (!awaitingHuman && view.state === "pending" && (this.db.prepare("SELECT last_nudge_result FROM queue_items WHERE qitem_id = ?")
+        .get(qitemId) as { last_nudge_result: string | null } | undefined)?.last_nudge_result === "retained:typing_guard") {
+        // Held at the seat on purpose: not stuck, and not picked up. Nothing replays it; reading or delivering it is a
+        // deliberate step.
+        view.nextBackstop = { owner: view.owner, mechanism: "held by the seat's typing guard", dueAt: null, intervalSeconds: null, held: true,
+          note: `Nothing was typed into ${view.owner}. Read it with rig seat held-messages ${view.owner}; changing the seat's level doesn't replay it.` };
       }
     }
     if (view?.state === "blocked") {

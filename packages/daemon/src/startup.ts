@@ -1290,15 +1290,11 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       });
     });
   }
-  const { SeatAttentionReconciler } = await import("./domain/seat-attention-reconciler.js");
+  const { SeatAttentionReconciler, attentionProbeSend } = await import("./domain/seat-attention-reconciler.js");
   const seatAttentionReconciler = new SeatAttentionReconciler({
     sessionRegistry, eventBus, agentActivityStore, db, tmux: tmuxAdapter,
     reconcileRestoreOutcome: (rigId, nodeId) => restoreOrchestrator.reconcileNodeRuntimeTruth(rigId, nodeId),
-    sendVerify: async (session, text, opts) => {
-      const transport = deps.sessionTransport;
-      if (!transport) return { ok: false, outcome: "failed" };
-      return transport.send(session, text, { verify: opts?.verify });
-    },
+    sendVerify: attentionProbeSend(() => deps.sessionTransport),
     capture: async (session, opts) => {
       const transport = deps.sessionTransport;
       if (!transport) return { ok: false, sessionName: session, error: "transport_unavailable" };
@@ -2367,7 +2363,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
           try {
             const previous = deliveryId ? outboxHandlerInstance.getById(deliveryId) : null;
             const payload = previous?.guardBinding ? previous.body : message;
-            const result = await sessionTransport.send(target, payload, { deliveryId, actorSession: "model-monitor@system", auditPointer: deliveryId });
+            const result = await sessionTransport.send(target, payload, { deliveryId, actorSession: "model-monitor@system", openrigNotice: true, auditPointer: deliveryId });
             return result.ok ? { ok: true, outcome: result.outcome } : { ok: false, error: result.error };
           } catch (err) {
             return { ok: false, error: err instanceof Error ? err.message : String(err) };
