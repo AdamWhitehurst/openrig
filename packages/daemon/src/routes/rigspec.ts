@@ -30,7 +30,7 @@ function getDeps(c: { get: (key: string) => unknown }) {
 // GET /api/rigs/:rigId/spec -> YAML
 export function handleExportYaml(c: Context): Response {
   const rigId = c.req.param("rigId")!;
-  const { exporter } = getDeps(c);
+  const { exporter, rigRepo } = getDeps(c);
 
   try {
     const spec = exporter.exportRig(rigId);
@@ -43,9 +43,14 @@ export function handleExportYaml(c: Context): Response {
     const notCarried = exporter.launchAdditionsNotCarried(rigId)
       .map((seat) => `# Not carried: ${seat}'s launch additions (agent_file, append_system_prompt_file, plugin_dirs); add them back by hand.\n`);
     const yaml = notCarried.join("") + serialized;
+    const startupLayers = rigRepo.getRigStartupLayers(rigId);
+    const headers: Record<string, string> = { "Content-Type": "text/yaml" };
+    if (startupLayers?.root) {
+      headers["X-Rig-Root"] = encodeURIComponent(startupLayers.root);
+    }
     return new Response(yaml, {
       status: 200,
-      headers: { "Content-Type": "text/yaml" },
+      headers,
     });
   } catch (err) {
     if (err instanceof RigNotFoundError) {
