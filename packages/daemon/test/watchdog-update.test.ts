@@ -225,8 +225,9 @@ describe("watchdog update", () => {
       expect(isDue(after, Date.parse(delivered.lastEvaluationAt!) + 900_000)).toBe(true);
       expect((await engine.evaluate(after)).outcome).toMatchObject({ action: "skip", reason: "queue_wait_already_presented" });
       expect(deliveries).toHaveLength(1);
-      // And backoff carries on from the new interval, not the old one.
-      expect(jobs.getByIdOrThrow(jobId).intervalSeconds).toBe(1800);
+      // Backoff carries on from the new interval: its ceiling moved up to it, so it neither falls back to the
+      // wait's old 240s ceiling nor doubles past what the caller asked for.
+      expect(jobs.getByIdOrThrow(jobId).intervalSeconds).toBe(900);
     });
 
     it("refuses a spec or message change: the queue owns that spec", async () => {

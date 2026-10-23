@@ -158,7 +158,7 @@ export class WatchdogJobsError extends Error {
 }
 
 /** Preserve optional cadence conversion while rejecting an uncomputable scan. */
-function validateCadences(input: RegisterWatchdogJobInput): void {
+export function validateCadences(input: Pick<RegisterWatchdogJobInput, "intervalSeconds" | "scanIntervalSeconds">): void {
   if (!Number.isInteger(input.intervalSeconds) || input.intervalSeconds <= 0) {
     throw new WatchdogJobsError("interval_invalid", `interval_seconds must be a positive integer (got ${String(input.intervalSeconds)})`,
       { field: "interval_seconds", intervalSeconds: input.intervalSeconds });
