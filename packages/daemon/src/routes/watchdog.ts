@@ -234,7 +234,10 @@ export function watchdogRoutes(): Hono {
   // Only these three can change; naming anything else is refused rather than quietly ignored.
   app.post("/:job_id/update", async (c) => {
     const jobId = c.req.param("job_id");
-    const body = await c.req.json<Record<string, unknown>>().catch(() => ({} as Record<string, unknown>));
+    const body = await c.req.json<unknown>().catch(() => ({}));
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      return c.json({ error: "body must be a JSON object" }, 400);
+    }
     try {
       const fixed = Object.keys(body).filter((key) => !["intervalSeconds", "message", "specYaml"].includes(key));
       if (fixed.length > 0) {
@@ -244,7 +247,7 @@ export function watchdogRoutes(): Hono {
           { fields: fixed },
         );
       }
-      const result = updateWatchdogJob(getJobsRepo(c), jobId, body);
+      const result = updateWatchdogJob(getJobsRepo(c), jobId, body as Record<string, unknown>);
       if (result.changed.length > 0) {
         getEventBus(c).emit({ type: "watchdog.job_updated", jobId, changed: result.changed });
       }

@@ -20,6 +20,9 @@ const UPDATABLE_POLICIES = new Set([
   "context-usage-threshold",
 ]);
 
+/** The session the daemon registers its own jobs as (continuity and auto idle-gate watchdogs). */
+const DAEMON_REGISTRANT = "daemon@kernel";
+
 export interface WatchdogJobUpdate {
   intervalSeconds?: unknown;
   message?: unknown;
@@ -89,7 +92,7 @@ function explainInterval(job: WatchdogJob, dueMs: number | null, nowMs: number):
 
 /**
  * Change an active watchdog job's interval, spec or message in place. The job is rewritten through the existing
- * schedule writer with its stored last evaluation passed back unchanged, so nothing about when it last ran is
+ * schedule writer (`updateInPlace`) with its stored last evaluation passed back unchanged, so nothing about when it last ran is
  * invented or lost. Every refusal happens before any write.
  */
 export function updateWatchdogJob(
@@ -112,6 +115,13 @@ export function updateWatchdogJob(
   const { intervalSeconds, message, specYaml } = input;
   if (intervalSeconds === undefined && message === undefined && specYaml === undefined) {
     throw new WatchdogJobsError("nothing_to_update", "give at least one of intervalSeconds, message or specYaml");
+  }
+  if (job.registeredBySession === DAEMON_REGISTRANT) {
+    throw new WatchdogJobsError(
+      "policy_not_updatable",
+      `watchdog job ${jobId} was registered by the daemon, which overwrites or replaces its own jobs, so an edit would be lost or change the id`,
+      { jobId, registeredBySession: job.registeredBySession },
+    );
   }
   if (!UPDATABLE_POLICIES.has(job.policy)) {
     throw new WatchdogJobsError(
@@ -175,11 +185,15 @@ export function updateWatchdogJob(
   }
   if (queueWait && intervalSeconds !== undefined) newSpec = retuneQueueWait(newSpec, newInterval);
 
+  // A wait's retuned settings live in its spec, so an interval it already has can still change what is stored.
+  const retuned = queueWait && intervalSeconds !== undefined && newSpec !== job.specYaml;
   const changed = [
-    ...(newInterval !== job.intervalSeconds ? ["intervalSeconds"] : []),
+    ...(newInterval !== job.intervalSeconds || retuned ? ["intervalSeconds"] : []),
     ...((message !== undefined || specYaml !== undefined) && newSpec !== job.specYaml ? ["specYaml"] : []),
   ];
-  if (changed.length > 0) jobs.updateSchedule(jobId, newSpec, newInterval, job.lastEvaluationAt);
+  if (newInterval !== job.intervalSeconds || newSpec !== job.specYaml) {
+    jobs.updateInPlace(jobId, newSpec, newInterval, job.lastEvaluationAt);
+  }
   const updated = jobs.getByIdOrThrow(jobId);
   const nowMs = now().getTime();
   const dueMs = nextDueAt(updated);
