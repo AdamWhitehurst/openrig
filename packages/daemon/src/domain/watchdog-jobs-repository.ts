@@ -688,7 +688,10 @@ export class WatchdogJobsRepository {
 
   /** Preserve job identity while its owner adjusts a durable reminder schedule. */
   updateSchedule(jobId: string, specYaml: string, intervalSeconds: number, lastEvaluationAt: string | null): void {
-    this.updatedFrom.delete(jobId);
+    // A rewrite that stores what is already there reschedules nothing, so it keeps what an update replaced.
+    const current = this.getById(jobId);
+    if (!current || current.specYaml !== specYaml || current.intervalSeconds !== intervalSeconds
+      || current.lastEvaluationAt !== lastEvaluationAt) this.updatedFrom.delete(jobId);
     this.writeSchedule(jobId, specYaml, intervalSeconds, lastEvaluationAt);
   }
 
@@ -696,7 +699,7 @@ export class WatchdogJobsRepository {
    * A caller's update of an active job in place (`rig watchdog update`). It writes through the same schedule
    * writer, and remembers the spec and interval it replaced: a delivery that began under them and finishes after
    * the update is the same wake, not a rescheduled one, so its receipt still counts (see `scheduleUnchanged`).
-   * Any other reschedule of the job forgets them.
+   * Any other reschedule of the job that changes something forgets them.
    */
   updateInPlace(jobId: string, specYaml: string, intervalSeconds: number, lastEvaluationAt: string | null): void {
     const before = this.getByIdOrThrow(jobId);
