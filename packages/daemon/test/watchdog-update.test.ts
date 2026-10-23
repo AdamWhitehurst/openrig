@@ -308,8 +308,34 @@ describe("watchdog update", () => {
       expect(deliveries).toHaveLength(1);
     });
 
-    it.each([60, 3600])("a plain reminder updated to %is is not due again at once", async (seconds) => {
-      const job = register();
+    it("a wait is not told the same thing twice when the owner re-parks unchanged after the update", async () => {
+      const row = await queue.create({ sourceSession: "orch@rig", destinationSession: OWNER, body: "work", nudge: false });
+      const park = (seconds: number) => queue.update({
+        qitemId: row.qitemId, actorSession: OWNER, state: "blocked", blockedOn: "external:vendor-window",
+        transitionNote: "continuation: resume when the window opens", wakeAfterSeconds: seconds, wakeMaxSeconds: 240,
+      } as never);
+      park(60);
+      const jobId = queue.getParkWakeStatus(row.qitemId)!.ref;
+      const deliveries: Array<{ targetSession: string; message: string }> = [];
+      const { engine, release } = heldEngine(deliveries, true);
+
+      const first = engine.evaluate(jobs.getByIdOrThrow(jobId));
+      await settle();
+      expect((await update(jobId, { intervalSeconds: 30 })).status).toBe(200);
+      const stored = jobs.getByIdOrThrow(jobId);
+      park(30); // the same park again: it rewrites the schedule with the values already stored
+      expect(jobs.getByIdOrThrow(jobId)).toMatchObject({ specYaml: stored.specYaml, intervalSeconds: 30, lastEvaluationAt: stored.lastEvaluationAt });
+      release();
+      await first;
+
+      const after = jobs.getByIdOrThrow(jobId);
+      expect(JSON.parse(after.specYaml).context.queue_wait.notice).toMatchObject({ deliveryStatus: "ok" });
+      expect((await engine.evaluate(after)).outcome).toMatchObject({ action: "skip", reason: "queue_wait_already_presented" });
+      expect(deliveries).toHaveLength(1);
+    });
+
+    it.each([60, 3600])("a plain reminder (registered at 600s) updated to %is is not due again at once", async (seconds) => {
+      const job = register({ intervalSeconds: 600 });
       jobs.recordEvaluation(job.jobId, agoIso(4000), false);
       const deliveries: Array<{ targetSession: string; message: string }> = [];
       const { engine, release } = heldEngine(deliveries, false);
