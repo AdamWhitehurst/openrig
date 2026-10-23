@@ -230,6 +230,22 @@ describe("watchdog update", () => {
       expect(jobs.getByIdOrThrow(jobId).intervalSeconds).toBe(900);
     });
 
+    it("an update to the interval the wait already has still retunes its own settings", async () => {
+      const row = await queue.create({ sourceSession: "orch@rig", destinationSession: OWNER, body: "work", nudge: false });
+      queue.update({
+        qitemId: row.qitemId, actorSession: OWNER, state: "blocked", blockedOn: "external:ci",
+        transitionNote: "continuation: check CI", wakeAfterSeconds: 60, wakeMaxSeconds: 240,
+      } as never);
+      const jobId = queue.getParkWakeStatus(row.qitemId)!.ref;
+      jobs.updateSchedule(jobId, jobs.getByIdOrThrow(jobId).specYaml, 120, jobs.getByIdOrThrow(jobId).lastEvaluationAt); // backed off
+
+      const res = await update(jobId, { intervalSeconds: 120 });
+
+      expect(res.status).toBe(200);
+      expect(res.body.changed).toEqual(["intervalSeconds"]);
+      expect(JSON.parse(jobs.getByIdOrThrow(jobId).specYaml).context.queue_wait).toMatchObject({ initialSeconds: 120, maxSeconds: 240 });
+    });
+
     it("refuses a spec or message change: the queue owns that spec", async () => {
       const row = await queue.create({ sourceSession: "orch@rig", destinationSession: OWNER, body: "work", nudge: false });
       queue.update({
@@ -243,6 +259,72 @@ describe("watchdog update", () => {
         expect(res).toMatchObject({ status: 409, body: { error: "spec_not_updatable" } });
       }
       expect(jobs.getByIdOrThrow(jobId)).toEqual(before);
+    });
+  });
+
+  describe("an update that lands while the job's delivery is in flight", () => {
+    /** An engine whose first delivery stays open until the test releases it. */
+    function heldEngine(deliveries: Array<{ targetSession: string; message: string }>, withQueue: boolean) {
+      let release!: () => void;
+      let held = true;
+      const engine = new WatchdogPolicyEngine({
+        jobsRepo: jobs, historyLog: history, eventBus: bus,
+        ...(withQueue ? {
+          resolveQueueWait: (input: { jobId: string }) => queue.evaluateWaitReminder(input),
+          resolvePreDeliveryTerminalReason: ({ jobId }: { jobId: string }) => queue.resolveWatchdogPreDeliveryTerminalReason(jobId),
+          onWakeAttempt: ({ jobId, deliveryStatus }: { jobId: string; deliveryStatus: string }) => queue.recordWatchdogWakeAttempt(jobId, deliveryStatus),
+        } : {}),
+        deliver: async (request) => {
+          deliveries.push(request);
+          if (held) { held = false; await new Promise<void>((r) => { release = r; }); }
+          return { status: "ok" };
+        },
+      });
+      return { engine, release: () => release() };
+    }
+    const settle = () => new Promise((r) => setTimeout(r, 20));
+
+    it("a wait is not told the same thing twice", async () => {
+      const row = await queue.create({ sourceSession: "orch@rig", destinationSession: OWNER, body: "work", nudge: false });
+      queue.update({
+        qitemId: row.qitemId, actorSession: OWNER, state: "blocked", blockedOn: "external:vendor-window",
+        transitionNote: "continuation: resume when the window opens", wakeAfterSeconds: 60, wakeMaxSeconds: 240,
+      } as never);
+      const jobId = queue.getParkWakeStatus(row.qitemId)!.ref;
+      const deliveries: Array<{ targetSession: string; message: string }> = [];
+      const { engine, release } = heldEngine(deliveries, true);
+
+      const first = engine.evaluate(jobs.getByIdOrThrow(jobId));
+      await settle();
+      expect(deliveries).toHaveLength(1);
+      expect((await update(jobId, { intervalSeconds: 30 })).status).toBe(200);
+      release();
+      await first;
+
+      const after = jobs.getByIdOrThrow(jobId);
+      expect(JSON.parse(after.specYaml).context.queue_wait.notice).toMatchObject({ deliveryStatus: "ok" });
+      expect(after.lastFireAt).not.toBeNull();
+      expect((await engine.evaluate(after)).outcome).toMatchObject({ action: "skip", reason: "queue_wait_already_presented" });
+      expect(deliveries).toHaveLength(1);
+    });
+
+    it.each([60, 3600])("a plain reminder updated to %is is not due again at once", async (seconds) => {
+      const job = register();
+      jobs.recordEvaluation(job.jobId, agoIso(4000), false);
+      const deliveries: Array<{ targetSession: string; message: string }> = [];
+      const { engine, release } = heldEngine(deliveries, false);
+
+      const first = engine.evaluate(jobs.getByIdOrThrow(job.jobId));
+      await settle();
+      expect((await update(job.jobId, { intervalSeconds: seconds })).status).toBe(200);
+      release();
+      await first;
+
+      const after = jobs.getByIdOrThrow(job.jobId);
+      expect(deliveries).toHaveLength(1);
+      expect(after.lastFireAt).not.toBeNull();
+      expect(after.lastEvaluationAt).toBe(after.lastFireAt);
+      expect(isDue(after, Date.now())).toBe(false);
     });
   });
 
@@ -290,6 +372,21 @@ describe("watchdog update", () => {
       ["scanIntervalSeconds", 5],
     ])("a field that is not updatable: %s", async (field, value) => {
       await refused(register().jobId, { intervalSeconds: 600, [field]: value }, 400, "field_not_updatable");
+    });
+
+    it("a job the daemon registered for itself, which it would overwrite or replace", async () => {
+      const job = register({ registeredBySession: "daemon@kernel" });
+      await refused(job.jobId, { intervalSeconds: 600 }, 409, "policy_not_updatable");
+      await refused(job.jobId, { message: "mine" }, 409, "policy_not_updatable");
+    });
+
+    it.each(["null", "[]", "\"text\""])("a body that is not an object: %s", async (raw) => {
+      const before = jobs.listAll();
+      const res = await app.request(`/api/watchdog/${register().jobId}/update`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: raw,
+      });
+      expect(res.status).toBe(400);
+      expect(jobs.listAll()).toHaveLength(before.length + 1);
     });
 
     it("a job whose cadence is its scan interval", async () => {
